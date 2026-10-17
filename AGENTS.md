@@ -2,450 +2,338 @@
 
 > 读者：未来的 AI 助手，以及用户本人。
 > 目标：开新对话时先读这一页，就能直接干活，不用重新摸一遍。
-> 本文所有命令、路径、配置键名，**都在 2026-10-18（首次 git 提交时）逐条核对过源码**。
-> 若你发现某条与代码不一致，说明代码已经变了 —— 请以代码为准，并顺手改掉这一行。
+> 本文所有命令、路径、配置键名在 **2026-10-18 重构（v0.1.0）时逐条核对过源码**。
 >
-> **关于行号（重要）**：本文里出现的行号一律是**辅助信息**，会随编辑漂移。
-> 查找依据**以语义锚点为准** —— 配置键名（如 `notify.wxpusher.app_token`）、
-> 函数名（如 `faces._shift_row()`）、段名（如 `record:` 段）、
-> 或 README 的条目名（如「文件说明表中 `test_gallery.py` 那一行」）。
-> 行号一律写成「当前约在第 N 行」的形式，看到与锚点对不上时，信锚点。
+> **关于引用**：一律用**语义锚点**（配置键名、函数名、段名、命令名）定位，
+> 不写行号。行号会随编辑漂移，曾导致整段引用失效；写「在 `cli.py` 的 `COMMANDS` 表里」
+> 比写「第 96 行」可靠得多。
 
 ---
 
 ## A. 项目定位与数据流
 
-**一句话**：电脑摄像头盯着房间，YOLO 确认「有人进来了」就抓一张带时间戳的照片、同时录一段 mp4、
-本机语音播报、再推一条微信消息。全部在本机跑，视频不出机器。
+**一句话**：摄像头盯着房间，YOLO 确认「有人进来了」就抓一张带时间戳的照片、
+同时录一段 mp4、本机语音播报、再推一条微信消息。全部在本机跑，视频不出机器。
 
-### 主链路（每一步后面的括号是出处；行号只是辅助，以键名/函数名为准）
+### 主链路（括号里是出处，用键名/函数名定位）
 
 ```
-摄像头
-  camera.index / camera.backend=dshow / 1280x720 / 10fps
-      → config.yaml 的 camera: 段（当前约 6-11 行）
-    ↓
-YOLO 人形检测
-  yolov8n.pt，detector.conf=0.55，detector.imgsz=640
-      → config.yaml 的 detector: 段（当前约 13-16 行）
-    ↓
-连续帧确认「真的有人」
-  detector.trigger_frames=3 帧连续命中才算进入
-      → config.yaml 的 detector.trigger_frames（当前约 17 行）
-      → logic.py 顶部的 ACTION_NONE/START/BEST/FIRE 常量定义（当前约 16-21 行）
-    ↓
-挑最好的一帧
-  再看 detector.capture_window=8 帧，按 frame_score() 取最大最居中
-      → config.yaml 的 detector.capture_window（当前约 18 行）
-      → logic.py 的 frame_score() 函数（当前约 125 行）
-    ↓
-落盘 + 开录
-  captures/日期/HHMMSS.jpg（画框+时间戳）
-  同名 .mp4，record.codec=avc1(H.264)，record.pre_roll_seconds=8 秒预录
-      → config.yaml 的 snapshot: 段与 record: 段（当前约 21-56 行）
-    ↓
-人脸检测（在 YOLO 框内找脸）
-  YuNet ONNX，face.every_n_frames=3，face.score_threshold=0.7，返回 15 维行（含关键点）
-      → config.yaml 的 face: 段（当前约 78-87 行）
-      → faces.py 的 _detect_yunet()（当前约 161-179 行）
-    ↓
-人脸识别（是不是本人）
-  SFace 提 128 维特征，与 identity.owner_file（identity/owner.npz）比余弦，
-  identity.threshold=0.45，连续 identity.confirm_frames=2 帧才算数
-      → config.yaml 的 identity: 段（当前约 89-107 行）
-      → identity.py 中调用 alignCrop() 的那一行（当前约 182 行）
-    ↓
-分流
-  本人 → identity.on_owner=skip（不抓拍/不录像/不播报/不推送）
-  他人或认不出 → identity.unknown_policy=alert（照常告警）
-      → config.yaml 的 identity: 段尾部（当前约 109-117 行）
-    ↓
-现场播报 + 远程通知
-  语音：SAPI5 离线合成，voice.require_face=true（要看清脸才出声），voice.cooldown_seconds=60
-      → config.yaml 的 voice: 段（当前约 119-127 行）
-  推送：notify.channel，支持 wxpusher / serverchan / wecom_bot / none
-      → config.yaml 的 notify: 段（当前约 184-208 行，以 notify.* 键名为准）
-    ↓
-本地相册
-  gallery.py，gallery.py 的 --host/--port 默认 127.0.0.1:8765，jpg 当封面、点开播 mp4
-      → gallery.py 的 main() 里 argparse 定义处（当前约 326-330 行）
-    ↓
-归档清理
-  snapshot.keep_days=30（按天）+ storage.max_total_gb=20（按体积）
-      → config.yaml 的 snapshot.keep_days（当前约 23 行）
-      → config.yaml 的 storage: 段（当前约 158-169 行）
+摄像头        camera.index / backend=dshow / 1280x720 / 10fps      （config.yaml 的 camera: 段）
+   ↓
+YOLO 人形检测  yolov8n.pt / detector.conf / detector.imgsz          （config.yaml 的 detector: 段）
+   ↓
+连续帧确认    detector.trigger_frames 帧连续命中 → ACTION_START     （rules.py 的 TriggerState）
+   ↓
+挑最好一帧    detector.capture_window 帧内按 frame_score() 取最大最居中（rules.py 的 frame_score）
+   ↓
+落盘 + 开录   data/captures/日期/HHMMSS.jpg + 同名 .mp4
+              record.codec=avc1 / record.pre_roll_seconds=8        （recorder.py）
+   ↓
+人脸检测      YuNet ONNX，在 YOLO 框内找脸，返回 15 维行（含关键点）  （detector.py）
+   ↓
+人脸识别      SFace 128 维特征 + 余弦；identity.threshold=0.45
+              identity.confirm_frames=2 帧确认                      （identity.py）
+   ↓
+分流          本人 → on_owner=skip（不抓拍不录像不播报）
+              他人/认不出 → unknown_policy=alert（照常告警）
+   ↓
+播报 + 推送    SAPI5 离线合成（voice.require_face=true）
+              notify.channel = wxpusher / serverchan / wecom_bot / none
+   ↓
+本地相册      gallery.py，127.0.0.1:8765，jpg 当封面、点开播 mp4
+   ↓
+归档清理      snapshot.keep_days=30 + storage.max_total_gb=20
 ```
 
-### 模块职责（改代码前先看这里，别放错地方）
+### 模块职责
 
 | 文件 | 职责 | 备注 |
 |---|---|---|
-| `watcher.py` | 主程序 + 命令行入口 | 采集/检测/抓拍/录像/语音/推送/清理 |
-| `logic.py` | **纯逻辑层**：连续帧确认、挑帧、冷却、录像收尾策略、归档清理 | 不依赖摄像头和网络，是本项目单测覆盖率最高的部分，新增逻辑优先放这里 |
-| `recorder.py` | 环形 JPEG 预录 + 后台线程写 H.264 | |
-| `guardian.py` | 外部守护进程，watcher 死了把它拉起来 | |
-| `gallery.py` | 本地相册 HTTP 服务 | 只用标准库，自实现 HTTP Range |
-| `faces.py` / `identity.py` | YuNet 人脸检测 / SFace 人脸识别 | |
-| `speaker.py` / `loudness.py` / `audio_device.py` | SAPI5 语音 / 响度处理 / 系统音量读写保底 | |
-| `notifier.py` / `setup_push.py` | 推送渠道 / 推送配置引导 | |
-| `audio_recorder.py` | 录音，收尾后 ffmpeg 并音轨 | |
+| `roomwatch/watcher.py` | 主循环 + 命令行入口 | 采集/检测/抓拍/录像/语音/推送/清理 |
+| `roomwatch/rules.py` | **纯逻辑层**：连续帧、挑帧、冷却、录像收尾、清理 | 不依赖摄像头和网络，单测覆盖率最高，新逻辑优先放这里 |
+| `roomwatch/recorder.py` | 环形 JPEG 预录 + 后台线程写 H.264 | |
+| `roomwatch/audio_recorder.py` | 录音 + ffmpeg 并音轨 | |
+| `roomwatch/audio_device.py` | 系统音量读写（pycaw） | |
+| `roomwatch/detector.py` | 人脸检测（YuNet，Haar 兜底） | 原 `faces.py` |
+| `roomwatch/identity.py` | 人脸识别（SFace）+ 多帧投票 | |
+| `roomwatch/speaker.py` / `loudness.py` | SAPI5 语音 / 响度增益 | |
+| `roomwatch/notifier.py` | 推送渠道 | |
+| `roomwatch/gallery.py` | 本地相册 HTTP | 只用标准库，自实现 Range |
+| `roomwatch/guardian.py` | 守护进程（判活/退避/单实例锁） | |
+| `roomwatch/setup_push.py` | 推送配置引导 | |
+| `roomwatch/gui.py` | 桌面界面 | 独立进程，不 import cv2 |
+| `roomwatch/cli.py` | 全局命令表与参数翻译 | 新增命令先改这里 |
+| `roomwatch/paths.py` | 项目根 / 运行时目录 / 解释器发现 | 路径基准的唯一来源 |
 
 ---
 
-## B. 常用命令
+## B. 环境与解释器（最容易踩的一条）
 
-### B.0 先说解释器（最容易踩的一条）
-
-**本项目能跑的解释器不是系统 Python**，而是：
+### B.1 主环境（跑监控）
 
 ```
 C:\Users/user\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 ```
 
-- 版本 Python 3.13.14；已装 cv2 5.0.0 / numpy 2.5.4 / ultralytics 8.4.178 / PyYAML 6.0.3 /
-  pyttsx3 / sounddevice / psutil / pycaw。
-- 在 git-bash 里写作 `/c/Users/user/.workbuddy/binaries/python/envs/default/Scripts/python`。
-- 本机 PATH 上还有**另外三个**解释器，全都跑不了本项目（cv2 缺失），
-  直接 `python watcher.py` 会得到 `ModuleNotFoundError: No module named 'cv2'`：
+Python 3.13.14，已装 cv2 5.0.0 / numpy 2.5.4 / ultralytics 8.4.178 / PyYAML / pyttsx3 /
+sounddevice / psutil / pycaw。
 
-  | 解释器 | 版本 | cv2 | numpy | ultralytics | yaml |
-  |---|---|---|---|---|---|
-  | `C:\Users/user\.workbuddy\binaries\python\versions\3.13.12\python.exe` | 3.13.14（目录名是 3.13.12，以实际版本为准） | ✗ | ✗ | ✗ | ✗ |
-  | `C:\Users/user\AppData\Local\Programs\Python\Python313\python.exe` | 3.13.13 | ✗ | ✓ 2.4.6 | ✗ | ✓ 6.0.3 |
-  | `C:\Users/user\AppData\Local\Python\bin\python.exe` | **3.14.5** | ✗ | ✗ | ✗ | ✗ |
+本机 PATH 上还有**另外三个** python，全都跑不了本项目（缺 cv2）：
 
-  第一个是 git-bash 里敲 `python` 时默认解析到的那个，最常踩。
-  第三个在 PATH 里且版本最新（3.14.5），误用时报的错和另外两个一样，
-  排查时容易多绕一圈 —— **看到 3.14.5 就知道选错了**。
-- 换机器或重装后重新确认的办法：`python -c "import cv2, numpy, yaml; print(cv2.__version__)"`，
-  哪个能跑用哪个。四个都试一遍再下结论。
+| 解释器 | 版本 | 用途 |
+|---|---|---|
+| `...\binaries\python\versions\3.13.12\python.exe` | 3.13.14（目录名是 3.13.12） | git-bash 敲 `python` 默认解析到它，最常踩 |
+| `...\AppData\Local\Programs\Python\Python313\python.exe` | 3.13.13 | **有 tkinter 8.6，没 cv2**：桌面界面与打包用它 |
+| `...\AppData\Local\Python\bin\python.exe` | **3.14.5** | 看到 3.14.5 就知道选错了 |
 
-下面命令表里的 `python` 一律指上面那个能跑的解释器。
+验证：`rw doctor`（会打印解释器、依赖、模型、目录、端口、钩子）。
 
-### B.1 watcher.py（出处：`watcher.py` 的 `main()` 里 argparse 定义处，当前约 940-958 行）
+### B.2 界面环境（打 exe）
 
-| 目的 | 命令 |
-|---|---|
-| 看画面角度，拍一张 `preview.jpg` 就退出 | `python watcher.py --probe` |
-| 试跑：只存档不推送，验证误报率 | `python watcher.py --dry-run` |
-| 正式运行（前台常驻） | `python watcher.py` |
-| 同时把日志写进文件 | `python watcher.py --log watcher.log` |
-| 看监控是否还活着 | `python watcher.py --status` |
-| 注册本人人脸（正对镜头自动采 12 张） | `python watcher.py --enroll` |
-| 用一张已有照片注册 | `python watcher.py --enroll-from 某张正脸.jpg` |
-| 辨认某张图里的人是不是本人 | `python watcher.py --whoami captures/2026-10-17/230913.jpg` |
-| 试听处理后的语音（并打印增益报告） | `python watcher.py --say` |
-| 试听未处理的原始语音 | `python watcher.py --say-raw` |
-| A/B 对比：先原始、再处理 | `python watcher.py --ab` |
-| 音量诊断：主音量 / 默认输出设备 / 各应用音量 | `python watcher.py --volume-check` |
-| 直接把系统主音量设成 70% | `python watcher.py --volume-set 70` |
-| 磁盘占用、容量上限、最旧/最新文件 | `python watcher.py --storage` |
-| 用另一份配置启动 | `python watcher.py --config config.local.yaml` |
+`scripts\build-exe.ps1` 用系统 Python 3.13.13 建 `.venv-gui`（自带 tkinter），
+只装 Pillow + PyInstaller。产物 `dist\room-watch.exe`（单文件，内嵌 tkinter）。
+**不要试图用主环境打 GUI**：它没有 tkinter，PyInstaller 会失败。
 
-### B.2 guardian.py（出处：`guardian.py` 的 `main()` 里 argparse 定义处，当前约 438-441 行）
+### B.3 `rw` 如何选解释器
 
-| 目的 | 命令 |
-|---|---|
-| 常驻守护（每 `guardian.check_seconds` 秒查一次） | `python guardian.py` |
-| 看守护状态、累计重启次数、最近动作 | `python guardian.py --status` |
-| 只检查一次就退出（幂等，给计划任务用） | `python guardian.py --once` |
-| 只报告该做什么，不真的重启 | `python guardian.py --dry-run` |
-| 指定配置 | `python guardian.py --config config.yaml` |
-
-### B.3 gallery.py（出处：`gallery.py` 的 `main()` 里 argparse 定义处，当前约 326-330 行）
-
-| 目的 | 命令 |
-|---|---|
-| 起本地相册（默认 127.0.0.1:8765） | `python gallery.py` |
-| 换端口 / 换目录 / 换状态文件 / 换判死阈值 | `python gallery.py --port 8765 --captures captures --status-file status.json --stale-after 120` |
-
-### B.4 setup_push.py（出处：`setup_push.py` 的 `main()` 里 argparse 定义处，当前约 142-147 行；
-`--channel` 的合法取值在文件顶部的 `CHANNELS` 常量，当前约 28 行）
-
-| 目的 | 命令 |
-|---|---|
-| 交互式配置推送 | `python setup_push.py` |
-| 非交互：直接写 wxpusher | `python setup_push.py --channel wxpusher --token AT_xxx --uid UID_xxx` |
-| 非交互：直接写企业微信机器人 | `python setup_push.py --channel wecom_bot --webhook "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"` |
-| 只写配置不发测试消息 | 追加 `--no-test` |
-
-`--channel` 的合法取值只有：`wxpusher`、`serverchan`、`wecom_bot`（外加 config.yaml 里的 `none`）。
-
-### B.5 启动脚本
-
-- `start-room-watch.bat` —— 单独拉起 watcher。
-- `start-with-guardian.bat` —— 守护 + 监控一起管起来。
-- `install-autostart.ps1` —— 配置开机自启（需要你亲手执行）。
+`paths.find_python()` 顺序：`ROOMWATCH_PYTHON` →（frozen 时）已知路径 → 当前解释器 → `python`。
+`rw.cmd` 在 Windows 上先试 `%USERPROFILE%\.workbuddy\...\envs\default`，
+所以双击和命令行都不需要配 PATH。
 
 ---
 
-## C. 怎么跑测试
+## C. 全局命令
 
-八个测试文件全部自带 `if __name__ == "__main__": unittest.main()`，**不需要 `-m unittest`**，直接跑文件即可。
+统一入口 `rw`（Windows 用根目录 `rw.cmd`，bash 用根目录 `rw`，等价 `python -m roomwatch`）。
+命令表在 `cli.py` 的 `COMMANDS`，**新增功能先在那里登记**，否则 `rw --help` 里看不到。
+
+| 目的 | 命令 |
+|---|---|
+| 环境自检 | `rw doctor` |
+| 拍预览图 | `rw probe` |
+| 试跑（不推送） | `rw dry-run` |
+| 正式运行 | `rw start` |
+| 看是否在线 | `rw status` |
+| 注册人脸 | `rw enroll` / `rw enroll --from IMG` |
+| 验证识别 | `rw whoami IMG` |
+| 试听语音 | `rw say` / `rw say-raw` / `rw ab` |
+| 音量 | `rw volume-check` / `rw volume-set 70` |
+| 磁盘占用 | `rw storage` |
+| 相册 | `rw gallery [--port 9000]` |
+| 守护 | `rw guard [--once\|--status\|--dry-run]` |
+| 推送配置 | `rw push` |
+| 测试 | `rw test [--fast]` |
+| 版本 | `rw version`（带 git 短哈希） |
+| 桌面界面 | `rw gui` |
+
+每个子命令都支持追加原模块参数（`--config config.local.yaml` 等）。
+`cli.py` **只做翻译**，参数校验仍由各模块 argparse 负责；取值缺失时抛 `UsageError`（退出码 2）。
+
+启动脚本：`scripts/start-watcher.bat`（只起监控）、`scripts/start-guardian.bat`（守护+监控）、
+`scripts/install-autostart.ps1`（计划任务，需本人执行）、`scripts/install-shortcut.ps1`（桌面快捷方式）。
+
+---
+
+## D. 目录与路径约定
+
+### D.1 三条放置规则
+
+1. 只有 `roomwatch/` 放源码；仓库根只留 `rw` / `rw.cmd` / 配置 / 元数据 / 资产。
+2. `data/` 放隐私数据（抓拍、录像、人脸模板），`var/` 放可重建产物（日志、状态、缓存、预览图）。
+   判断标准：删掉会不会丢用户数据。
+3. 配置里的相对路径一律**相对项目根**，经 `paths.resolve()` 解析；
+   不要在业务代码里用 `dirname(__file__)` 拼数据路径。
+
+### D.2 为什么第 3 条是硬规则
+
+包化前 `detector.py` / `identity.py` 用 `dirname(__file__)` 找 `models/`，
+模块一挪就找不到模型，而**检测器只是静默不工作，不报错**。
+`guardian.py` 也曾用 `HERE + "watcher.py"` 拉起子进程，包化后直接失效。
+现在统一走 `paths.resolve()`，并由 `tests/test_paths.py` 钉住。
+
+### D.3 运行时目录一览
+
+| 目录 | 内容 | 是否入库 |
+|---|---|---|
+| `data/captures/<日期>/` | 抓拍 jpg、录像 mp4、音频 wav | 否（隐私） |
+| `data/identity/owner.npz` | 本人人脸特征 | 否（生物特征） |
+| `var/logs/` | watcher / gallery / probe / gui-selftest | 否 |
+| `var/state/` | status.json / guardian_state.json / guardian.lock | 否 |
+| `var/db/events.db` | 事件库 | 否 |
+| `var/media/` | preview.jpg 等临时产物 | 否 |
+| `var/cache/voice/` | 语音缓存（可重建） | 否 |
+| `models/` + `yolov8n.pt` | 权重 | **是**（下载极慢，属稀缺资产） |
+
+---
+
+## E. 测试
+
+11 个文件、261 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
 
 | 文件 | 用例数 | 命令 | 需要什么 |
 |---|---:|---|---|
-| `test_logic.py` | 56 | `python test_logic.py` | 纯标准库，任何 python 都能跑 |
-| `test_loudness.py` | 32 | `python test_loudness.py` | numpy，纯数学 |
-| `test_recorder.py` | 19 | `python test_recorder.py` | cv2，**会真写视频**（约 3 秒，顺便打印 720p 预录 JPEG 编码实测 ms/帧） |
-| `test_gallery.py` | 18 | `python test_gallery.py` | cv2，**真起 HTTP 服务**（约 17 秒），验证 Range 206 与目录穿越防护 |
-| `test_guardian.py` | 31 | `python test_guardian.py` | yaml + psutil，不真重启进程 |
-| `test_identity.py` | 31 | `python test_identity.py` | cv2 + 合成图像，不需要真实摄像头 |
-| `test_audio_storage.py` | 24 | `python test_audio_storage.py` | 临时文件，不需要麦克风 |
-| `test_integration.py` | 6 | `python test_integration.py` | **假摄像头 + 假 YOLO**，不需要真实摄像头，但耗时最长（约 56 秒） |
+| `test_logic.py` | 56 | `python tests/test_logic.py` | 纯标准库 |
+| `test_loudness.py` | 32 | `python tests/test_loudness.py` | numpy |
+| `test_recorder.py` | 19 | `python tests/test_recorder.py` | cv2，真写视频（约 3 秒） |
+| `test_gallery.py` | 18 | `python tests/test_gallery.py` | cv2，真起 HTTP（约 17 秒，占 8765） |
+| `test_guardian.py` | 31 | `python tests/test_guardian.py` | yaml + psutil，不真重启 |
+| `test_identity.py` | 31 | `python tests/test_identity.py` | cv2 + 合成图（2 项按设计跳过） |
+| `test_audio_storage.py` | 24 | `python tests/test_audio_storage.py` | 临时文件 |
+| `test_integration.py` | 6 | `python tests/test_integration.py` | 假摄像头 + 假 YOLO（约 55 秒） |
+| `test_cli.py` | 18 | `python tests/test_cli.py` | 纯逻辑，不启进程 |
+| `test_paths.py` | 11 | `python tests/test_paths.py` | 纯逻辑 |
+| `test_gui_state.py` | 15 | `python tests/test_gui_state.py` | 临时状态库，不建窗口 |
 
-合计 **217 项**。2026-10-18 实测：八个文件全部 `OK`。
+全量：`rw test`（约 90 秒）；`rw test --fast` 跳过集成测试。
 
-全量跑：
-
-```bash
-cd C:/Users/user/WorkBuddy/2026-10-16-14-53-33/room-watch
-PY=/c/Users/user/.workbuddy/binaries/python/envs/default/Scripts/python
-for f in test_logic.py test_loudness.py test_recorder.py test_gallery.py \
-         test_guardian.py test_identity.py test_audio_storage.py test_integration.py; do
-  echo "===== $f ====="; "$PY" "$f" 2>&1 | tail -4
-done
-```
-
-八项测试都不联网、不发推送、不读真实摄像头。唯一会占用资源的是 `test_gallery.py` 起的 HTTP 服务
-（若 8765 已被正式 gallery 占用，先停掉正式的，或换个端口）。
+> 2026-10-18 v0.1.0 实测：11 个文件全部 `OK`，共 261 项。
 
 ---
 
-## D. 踩过的坑 / 硬约束
+## F. 踩过的坑 / 硬约束
 
-以下每一条都是本项目真实发生过的事故，按「现象 → 原因 → 正解」记录。
+每条都是真实事故，按「现象 → 原因 → 正解」记录。
 
-### D.1 摄像头同时只能被一个进程占用；改完代码必须重启
+### F.1 摄像头同时只能被一个进程占用；改完代码必须重启
 
-- **现象**：第二份 `watcher.py` 打不开摄像头；改完 `config.yaml` 后运行中的进程行为不变。
-- **原因**：摄像头设备独占；配置只在 `Watcher.__init__` 里读一次
-  （`watcher.py` 的 `class Watcher` 及其 `__init__`，当前约 139-175 行），运行中不热加载。
-- **正解**：改完代码或配置，**必须重启 watcher 和 gallery 两个进程**才生效。不要靠「再开一份」来验证。
+- **现象**：第二份监控打不开摄像头；改完 `config.yaml` 后运行中的进程行为不变。
+- **原因**：设备独占；配置只在 `Watcher.__init__` 里读一次，不热加载。
+- **正解**：改完代码或配置，必须重启监控与相册。不要靠「再开一份」验证。
+- **另**：**禁止同时跑两组实例**（2026-10-18 实测出现过两个 guardian + 两个 watcher
+  同时存在的局面，互相抢摄像头）。发现重复实例先 `rw status` 看 PID，再确认后终止。
 
-### D.2 判断 watcher 是否活着，必须看 `status.json` 的 `last_frame_at` 距今
+### F.2 判断是否活着必须重算心跳
 
-- **现象**：进程被强杀后，读 `status.json` 里的 `stale` 字段永远是 `false`，会把死掉的程序报成在线。
-- **原因**：进程被杀前来不及再写一次状态，磁盘上留下的最后一份快照里 `stale`/`camera_ok` 都还是「正常」。
-- **正解**：在**读取的那一刻**重算：`now - last_frame_at > heartbeat.stale_after_seconds`（默认 120 秒）即判定停摆。
-  代码里就是这么做的，见 `watcher.py` 的 `print_status()` 里重算 stale 的那几行
-  （当前约 1045-1050 行；搜「绝不能信文件里存的 stale 字段」这句注释即可定位）。
-  结论：**不要自己解析 `stale` 字段，用 `python watcher.py --status`**。
+- **现象**：进程被强杀后，`status.json` 里的 `stale` 仍是 `false`，把死的报成在线。
+- **原因**：进程被杀前来不及再写状态。
+- **正解**：在读取那一刻重算 `now - last_frame_at > heartbeat.stale_after_seconds`。
+  `rw status`、相册页、桌面界面都按这个规则实现（`gui.read_state()`）。
 
-### D.3 本机 `Start-Process`（PowerShell）无法启动进程
+### F.3 本机 `Start-Process`（PowerShell）无法启动进程
 
-- **现象**：`Start-Process` 报「已添加项。字典中的关键字:'Path'所添加的关键字:'PATH'」，进程起不来。
-- **原因**：环境里 `Path` 与 `PATH` 重复键，.NET 的进程启动环境字典抛异常。
-- **正解**：启动后台进程**一律用 bash 后台方式**（`cmd //c start` 与 WMI 也都被本机安全规则拦过），绕开 `Start-Process`。
+- **现象**：报「已添加项。字典中的关键字:'Path'所添加的关键字:'PATH'」。
+- **正解**：启动后台进程一律用 bash 后台方式，或 `subprocess.Popen` +
+  `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`（guardian 与 GUI 都这么做）。
 
-### D.4 录像必须用 avc1(H.264)；`Failed to load OpenH264 library` 可忽略
+### F.4 录像必须用 avc1(H.264)
 
-- **现象**：日志里刷 `Failed to load OpenH264 library`。
-- **原因**：本机 OpenCV 5.0 只有 avc1(H.264) 和 mp4v 能写；浏览器基本只认 H.264。报错来自 FFmpeg 后端，
-  实际由 Media Foundation 接手成功编码。
-- **正解**：`record.codec` 保持 `avc1`；那条 stderr 报错是噪音，不用管。mp4v 只在兜底时用，网页放不了。
-  出处：`config.yaml` 的 `record.codec` 及其上方注释（当前约 33-36 行）；
-  `recorder.py` 文件顶部关于 avc1/mp4v 的 codec 候选表（当前约 36-40 行）。
+- **现象**：日志刷 `Failed to load OpenH264 library`。
+- **原因**：本机 OpenCV 5.0 只有 avc1 与 mp4v 能写；浏览器基本只认 H.264。报错来自
+  FFmpeg 后端，实际由 Media Foundation 接手成功编码。
+- **正解**：`record.codec` 保持 `avc1`；那条 stderr 是噪音。mp4v 只在兜底时用，网页放不了。
 
-### D.5 H.264 编码 11~18ms/帧，必须后台线程写盘
+### F.5 H.264 编码 11~18ms/帧，必须后台线程写盘
 
-- **现象**：把编码放进主循环会让检测帧率掉下来。
-- **原因**：10fps 主循环每帧预算 100ms，H.264 单帧 11~18ms 看似够，但叠加预录与磁盘抖动后会拖慢检测。
-- **正解**：后台线程写盘；`record.queue_size`（默认 120）满时**宁可丢帧也不许拖慢检测主循环**。
-  出处：`config.yaml` 的 `record.queue_size` 及其注释（当前约 55 行）；
-  `recorder.py` 的后台写盘线程实现。
+- **正解**：`record.queue_size`（默认 120）满时宁可丢帧，也不许拖慢检测主循环。
 
-### D.6 录像有 8 秒预录，合并音轨要用 ffmpeg `adelay` 补等长静音
+### F.6 录像有 8 秒预录，合并音轨要 `adelay`
 
-- **现象**：并好音轨后，声音整段晚 8 秒，对不上画面。
-- **原因**：预录的 8 秒画面发生在「开始录音」之前，音轨长度天然比视频短。
-- **正解**：合并时给音轨补等长静音：`-af adelay=<预录毫秒>:all=1`（视频流 copy，不重编码）。
-  出处：`config.yaml` 的 `record.audio` 段上方关于 adelay 的注释（当前约 62-64 行）；
-  `audio_recorder.py` 文件顶部说明（当前约 14 行）与拼接 `-af adelay=...` 的那行（当前约 50 行）；
-  `test_audio_storage.py` 中断言 `adelay=8000:all=1` 的用例（当前约 35 行）。
+- **现象**：并好音轨后声音整段晚 8 秒。
+- **原因**：预录画面发生在开始录音之前，音轨天然比视频短。
+- **正解**：`-af adelay=<预录毫秒>:all=1`，视频流 copy 不重编码
+  （`audio_recorder.py` 拼参数处；`test_audio_storage.py` 有断言）。
 
-### D.7 `alignCrop()` 要传**原图**和**原图坐标系**的关键点
+### F.7 `alignCrop()` 必须传原图与原图坐标系的关键点
 
 - **现象**：人脸识别认错人，但不报任何错。
-- **原因**：YuNet 是在 YOLO 人形框的裁剪图上跑的，它返回的 15 维行是**裁剪图坐标**。
-  直接交给 `alignCrop()` 会把脸摆歪、特征全废 —— 而这个错误是**静默**的。
-- **正解**：必须把关键点补回人形框偏移量再传下去。已有实现是 `faces.py` 的 `_shift_row()`
-  （`def _shift_row` 当前约 145-158 行），调用点在 `faces.py` 里搜「必须补回偏移」那句注释
-  （当前约 124-126 行）。任何新增的人脸相关调用都要走同一条路。
-  出处：
-  - `faces.py` 的类/文件头注释里关于「原图坐标」的说明（当前约 38 行）
-  - `faces.py` 的偏移量补回处（当前约 124-126 行）与 `_detect_yunet()` 里带出关键点的注释（当前约 176-178 行）
-  - `identity.py` 文件头关于 `alignCrop()` 需要原图坐标的说明（当前约 21 行）与 `alignCrop` 调用点（当前约 182 行）
+- **原因**：YuNet 在 YOLO 人形框的裁剪图上跑，返回的是裁剪图坐标；直接交给
+  `alignCrop()` 会把脸摆歪、特征全废。
+- **正解**：用 `detector.py` 的 `_shift_row()` 补回偏移。任何新增的人脸相关调用都走同一条路。
 
-### D.8 编辑 `config.yaml` 时极易把相邻行合并、吞掉某个键
+### F.8 编辑 `config.yaml` 用最小增量并复读
 
-- **现象**：`behavior.idle_threshold_seconds` 曾经被吞进上一行的注释里，配置项静默失效。
-- **原因**：增量编辑时覆写了相邻行。
-- **正解**：对 `config.yaml` 一律**最小增量修改**，改完立刻复读确认该键还在、缩进没变。
-  不要顺手重排或重写整个文件。
+- **现象**：`behavior.idle_threshold_seconds` 曾被吞进上一行注释里，配置项静默失效。
+- **正解**：只改目标行，改完立刻 grep 该键确认还在、缩进没变。不要顺手重排整个文件。
 
-### D.9 `events_today` 是内存计数，重启归零
+### F.9 `events_today` 是内存计数，重启归零
 
-- **现象**：重启 watcher 后 `--status` 显示今日事件数为 0，但今天明明有事件。
-- **原因**：`events_today` 只在进程内存里累加，不落盘。
-- **正解**：真实事件数查 `events.db`（SQLite，`storage.database`）。判断「今天有没有人进来」不要只看 `events_today`。
+- **正解**：真实事件数查 `var/db/events.db`（`storage.database`）。
 
-### D.10 四个 Python 里只有一个能跑（本条为本次建库时新增确认）
+### F.10 桌面界面没有 tkinter 可用时不要让用户自己猜
 
-- **现象**：`python watcher.py` 报 `ModuleNotFoundError: No module named 'cv2'`。
-- **原因**：git-bash 的 PATH 把 `python` 解析到了没有项目依赖的解释器。
-- **正解**：用 B.0 里那个 `envs/default` 解释器，或设置 `ROOMWATCH_PYTHON` 环境变量。
-  验证命令：`python -c "import cv2, numpy, yaml; print(cv2.__version__)"`。
+- **现象**：主环境 `import tkinter` 报 `ModuleNotFoundError`。
+- **正解**：`gui._relaunch_with_tk()` 自动换成有 tkinter 的解释器重启自己；
+  打包后的 exe 内嵌 tkinter，不受影响。
 
----
+### F.11 打包参数里的相对路径按 spec 目录解析
 
-## E. Git 与隐私约定
+- **现象**：`--add-data VERSION;.` 与 `--icon assets\x.ico` 在配合 `--specpath build` 时
+  报「找不到文件」。
+- **正解**：这两个参数用**绝对路径**（`scripts/build-exe.ps1` 已这么写）。
 
-### E.1 什么入库、什么不入库
+### F.12 窗口程序没有控制台，排障靠追踪日志
 
-完整清单见 `.gitignore`（每条都写了原因）。摘要：
-
-- **入库**：全部 `*.py`（含 8 个测试）、`config.yaml`、`README.md`、`AGENTS.md`、`requirements.txt`、
-  `models/*.onnx`（YuNet 230KB + SFace 37MB）、`yolov8n.pt`（6.5MB）、
-  `start-*.bat`、`install-autostart.ps1`、`.githooks/`、`.gitignore`、`.gitattributes`。
-  > `models/` 与 `yolov8n.pt` **必须入库**：这台机器下载该模型实测只有 20KB/s，37MB 要半小时，属于稀缺资产。
-- **不入库**：`captures/`（约 1.9GB 抓拍与录像，强隐私）、`identity/owner.npz`（生物特征）、
-  `voice_cache/`（可自动重建）、`events.db`、`status.json`、`guardian_state.json`、`guardian.lock`、
-  `*.log`、`__pycache__/`、`preview.jpg`、`demo_recording.mp4`、`tts_test.mp3`、`.workbuddy/`。
-
-### E.2 `config.yaml` 入库，但凭据必须是占位串
-
-`config.yaml` 里有四个凭据键，入库时**必须**是占位串：
-
-| 键 | 占位串 |
-|---|---|
-| `notify.wxpusher.app_token` | `AT_xxx_replace_me` |
-| `notify.wxpusher.uid` | `UID_xxx_replace_me` |
-| `notify.serverchan.sendkey` | `SCTxxx_replace_me` |
-| `notify.wecom_bot.webhook` | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_ME` |
-
-**凭据泄漏风险靠提交前钩子拦截，不靠忽略文件。**
-
-### E.3 钩子
-
-- 位置：`.githooks/check_secrets.py`（判定逻辑）+ `.githooks/pre-commit`（薄壳）。
-- 生效方式：`git config core.hooksPath .githooks`。
-  **不要手工改 `.git/hooks/`**（那个目录不在版本控制里，换机器就没了）。
-- **启用钩子有现成脚本：`setup-hooks.bat`（幂等，双击即可）**。
-  它会执行 `git config core.hooksPath .githooks`、**回读并回显验证结果**（打印出
-  `hooksPath : .githooks`，让人看到不是空白），再跑一次 `check_secrets.py` 告诉你当前
-  `config.yaml` 是「通过」还是「被拦」；钩子文件缺失或检查未通过时退出码非 0。
-  它只管钩子，**不会启动 watcher / gallery**。
-  未来的 AI：**不要手敲 `git config`，直接用这个脚本。**
-- `core.hooksPath` 是**本地配置，不随仓库分发**：每次新克隆都要重新启用一次
-  （跑 `setup-hooks.bat`，或手动执行上面那条命令）。这是已知的固有缺口，
-  已在 `README.md` 快速开始的最前面列为第 0 步。
-- 单独运行 / 自测：
-  ```bash
-  python .githooks/check_secrets.py --self-test          # 内置正例+负例自测，含端到端笺证
-  python .githooks/check_secrets.py --no-git             # 只查 config.yaml
-  python .githooks/check_secrets.py --config 某文件.yaml --no-git
-  ```
-- 两条检查线：① `config.yaml` 里四个凭据是否填了真值；② 暂存区里是否混进了
-  `captures/**`、`identity/**`、`voice_cache/**`、`.workbuddy/**`、`*.db`、`*.log`、`*.npz`。
-- 判定是**确定性**的（文本前缀 + 正则 + 路径通配），不做「看起来像密钥」的推断。
-- 命中时会打印**具体行号、命中的值、风险说明、以及三种修法**，照做即可。
-
-### E.4 想在本机长期保留真实凭据，三条路（后果已写明）
-
-1. **改回占位串再提交**（推荐，也是钩子放行的唯一方式）。
-2. **复制一份 `config.local.yaml` 填真值**（已被 `.gitignore` 忽略），
-   启动时用 `--config config.local.yaml` 指定 —— 这个 flag 在 `watcher.py` 与 `guardian.py`
-   的 argparse 定义处都真实存在（分别当前约 940 行与 438 行）。
-   `gallery.py` 没有 `--config`，它只读 `status.json`。
-   gallery.py 没有 `--config`，它只读 `status.json`。
-3. **`git update-index --skip-worktree config.yaml`**：
-   只对你这台机器生效；**执行后你对 `config.yaml` 的所有修改 git 完全看不见**（`git status` 不显示、也提交不了）。
-   要恢复必须执行 `git update-index --no-skip-worktree config.yaml`。
-   用了它就必须自己记住，否则将来会困惑于「我改了配置怎么提交不上去」。
-
-### E.5 换行与中文路径
-
-- `.gitattributes` 已规定：`*.bat`/`*.ps1`/`*.cmd` → CRLF；`*.py`/`*.md`/`*.yaml` 等 → LF；
-  图片/音视频/`*.npz`/`*.pt`/`*.onnx`/`*.db` → 二进制（禁止任何换行转换）。
-- 本机 git 全局 `core.autocrlf=true`，靠 `.gitattributes` 覆盖它。
-- 仓库本地已设 `core.quotepath=false`，`git status` 不会把中文路径转义成 `\344\275\240` 这种形式。
-- `.githooks/pre-commit` 被单独规定为 LF：CRLF 的 shebang 会让 Git for Windows 的 sh 找不到解释器，钩子会静默失效。
-- **三个 `.bat`（`setup-hooks.bat` / `start-room-watch.bat` / `start-with-guardian.bat`）必须带 UTF-8 BOM（`EF BB BF`），
-  并且开头必须是两行：`@echo off 2>nul` 紧接 `@echo off`**。原因是两个独立的坑：
-  1. 无 BOM 时 cmd.exe 用机器代码页（本机 936/GBK）解码文件字节，中文 `echo` 行会被从中间劈开，
-     后半段被当成命令执行，报 `'...' is not recognized as an internal or external command`。
-  2. 有 BOM 时 cmd.exe **也不是每次都识别**（实测：新会话里第一次启动的 cmd 不识别，可重复）。
-     一旦不识别，BOM 三个字节会粘到第 1 行开头，`@echo off` 就不再算行首 token，
-     结果是整个文件回显全开 + 报 `'@echo' is not recognized`。
-     加 `2>nul` 让第 1 行静默失败，第 2 行无论如何都能关掉回显。
-  **改动 `.bat` 时不要丢掉 BOM、不要删掉这两行、也不要存成 ANSI/GBK**；注释行保持 ASCII 作为额外保险。
-- **未处理项（已知，不在本次范围）**：`install-autostart.ps1` 有 24 行中文且**无 BOM**。PowerShell 5.1
-  对无 BOM 的 `.ps1` 按 ANSI 解码，中文会显示成乱码（不会像 cmd 那样劈行，严重性低一档）。
-  修法与上面相同（加 BOM），但本次未改，等确认后再动。
+- **现象**：exe 双击没反应，看不出卡在哪。
+- **正解**：设 `ROOMWATCH_GUI_TRACE=1` 后启动，阶段写入 `var/logs/gui-trace.log`；
+  `dist\room-watch.exe --selftest` 会建窗→刷新→销毁并写 `var/logs/gui-selftest.log`。
+  曾靠它发现 `gui.main()` 没读 `sys.argv`、导致 `--selftest` 被忽略的 bug。
 
 ---
 
-## F. 给 AI 的行为约定
+## G. Git、隐私与钩子
 
-以下是对未来 AI 助手的硬性要求，用户明确要求写在这里。
+### G.1 什么入库
 
-1. **动手前先读两份东西**：本文件 `AGENTS.md`，以及 `.workbuddy/memory/` 下最近的工作日志
-   （逐小时活动流水，里面有进程 PID、抓拍内容判断、当天已做过什么）。
-2. **拿到一份新克隆后的第一件事是跑 `setup-hooks.bat`**，确认回显是
-   `hooksPath : .githooks` 再开始干活。不要手敲 `git config core.hooksPath`
-   （脚本还顺带做了「钩子文件是否在」和「当前 config.yaml 是否干净」两项检查）。
-   不启用的话，凭据与隐私文件可以无声无息地进 Git 历史且删不掉。
-3. **未经批准不得杀死正在运行的 watcher / gallery 进程**。
-   它们可能正在录像，硬杀会损坏当前 mp4 段。确需重启，先确认 `status.json` 里 `recording` 为 `false`
-   （读法：`python watcher.py --status`，或直接看 status.json）。
-4. **不要同时启动两份实例**。摄像头独占，第二份起不来，还会让第一份的判活逻辑失真。
-5. **修改 `config.yaml` 用最小增量，改完复读确认**。不要顺手重排、重写整个文件（见 D.8）。
-6. **代码风格跟随现有代码**：中文注释、类型注解、纯函数优先便于单测。
-   `logic.py` 是纯逻辑层的范本：不依赖摄像头和网络，新逻辑优先放这里而不是塞进 `watcher.py`。
-7. **任何新功能都要配可离线运行的单测**，并且要能在本机跑通（参考 C 节的八个测试文件）。
-8. **不要编造命令**。本文件没写的命令，先 `--help` 或读源码确认存在再用。
-9. **提交前不要绕过钩子**。若钩子阻断，按它打印的修改方法处理，不要用 `--no-verify`。
-10. **不要 `git add -f` 隐私文件**，也不要删除磁盘上的 `captures/`（约 1.9GB，是用户的数据）。
-11. **凡是改动了 `config.yaml` / `README.md` 的行结构（增删行），必须回头同步本文件（AGENTS.md）
-    全文里对该文件的行号引用**。
-    同理，**引用尽量用语义锚点**（配置键名、函数名、段名、README 条目名），行号只作辅助。
-    这条是硬规则，不是建议：`fa7f7a4` 只给 config.yaml 插了一行注释，
-    本文件里写作 `config.yaml:183-207` 的那处（**当时的值，现已漂到 184-208**）就整段失效；
-    `3230f00` 给 README 补了 15 行，写作 `README.md:473` 的那处（**当时的值，现已漂到 502**）也失效。
-    **写下时准确不等于现在准确**，改完请复读一遍。
-    （本段两处行号是**历史值示例**，不是当前引用，不要照着去查。）
+- **入库**：`roomwatch/**`、`tests/**`、`scripts/**`、`docs/**`、`rw`、`rw.cmd`、
+  `config.yaml`、`README.md`、`AGENTS.md`、`CHANGELOG.md`、`VERSION`、`pyproject.toml`、
+  `requirements.txt`、`models/*.onnx`、`yolov8n.pt`、`assets/*.ico`、`.githooks/`。
+- **不入库**：`data/`、`var/`、`config.local.yaml`、`.workbuddy/`、`dist/`、`build/`、
+  `.venv-gui/`、`__pycache__/`。
+
+### G.2 凭据
+
+`config.yaml` 里四个凭据键入库时必须是占位串：
+`notify.wxpusher.app_token` / `notify.wxpusher.uid` / `notify.serverchan.sendkey` /
+`notify.wecom_bot.webhook`。
+
+**泄漏风险靠提交前钩子拦，不靠忽略文件。** 钩子：`.githooks/check_secrets.py`（判定）
++ `.githooks/pre-commit`（薄壳）。启用：`scripts\setup-hooks.bat`（幂等，会回读回显
+`hooksPath : .githooks`）。`core.hooksPath` 是本地配置，**不随仓库分发**，新克隆必须重跑。
+
+自测：`python .githooks/check_secrets.py --self-test`（23 项）。
+
+### G.3 换行与 BOM
+
+- `.gitattributes`：`*.bat/*.ps1/*.cmd` = CRLF；`*.py/*.md/*.yaml` = LF；`rw` = LF；
+  图片/音视频/npz/pt/onnx/db = binary。
+- **三个 `.bat` 必须带 UTF-8 BOM，且前两行是 `@echo off 2>nul` 紧接 `@echo off`**：
+  无 BOM 时 cmd 按 936 代码页解码，括号块里的中文会被劈开当命令执行；
+  有 BOM 时 cmd 也不是每次都认，BOM 会粘到第 1 行，导致 echo 没关掉。
+  两者叠加的解法就是这两行 + BOM。
+- `.bat` 的 `rem` 注释保持 ASCII；中文 `echo` 行可以，但不要放进 `( )` 块。
+- `.ps1`（`build-exe.ps1` / `install-shortcut.ps1` / `install-autostart.ps1`）带 BOM，
+  否则 PowerShell 5.1 按 ANSI 解码，中文乱码。
 
 ---
 
-## G. 当前已知待办（含为何暂缓）
+## H. 给 AI 的行为约定
 
-按「要么现在做完、要么写明为何暂缓」的要求列出。本次任务范围是建 Git 基建与写约定文档，
-因此下面这些**不在本次范围**，逐条写明原因。
+1. **动手前先读两份**：本文件 + `.workbuddy/memory/` 下最近的工作日志。
+2. **新克隆第一件事跑 `scripts\setup-hooks.bat`**，确认回显 `hooksPath : .githooks`。
+3. **未经批准不得杀死正在运行的 watcher / gallery**。确需重启，先看
+   `rw status` 的 `recording` 是否为 false（硬杀会让当前 mp4 不可播放）。
+4. **不要同时启动两份实例**（摄像头独占）。
+5. **改 `config.yaml` 用最小增量并复读**（F.8）。
+6. **代码风格跟随现有代码**：中文注释、类型注解、纯函数优先。
+   新逻辑优先放 `rules.py`，不要塞进 `watcher.py`。
+7. **任何新功能都要配可离线运行的单测**，并保证 `rw test` 全绿。
+8. **不要编造命令**。本文件没写的，先 `rw --help` / `--help` 或读源码确认。
+9. **提交前不要绕过钩子**，不要用 `--no-verify`；钩子阻断时按它打印的方法改。
+10. **不要 `git add -f` 隐私文件**，不要删除 `data/captures/`（用户的数据）。
+11. **引用用语义锚点，不写行号**；改完文档复读一遍，确认路径与命令与代码一致。
+12. **版本号只改 `VERSION`**，同步在 `CHANGELOG.md` 顶部加一节；`bump` 后跑 `rw version` 验证。
 
-**2026-10-18 已解决、已从清单移除的两项**（保留记录以免有人重复做）：
-- README「文件说明」表中 `test_gallery.py` 那一行的用例数「16 项」已改为「18 项」
-  （commit `e5455cf`，diff 为 +1/-1；该行当前约在 README.md 第 502 行，行号会漂移，
-  以「文件说明表 test_gallery.py 那一行」为准）。
-- `start-room-watch.bat` / `start-with-guardian.bat` / `install-autostart.ps1` 的磁盘换行已转成 CRLF。
-  转换前后做了哈希等价性验证（CRLF 全换回 LF 后 sha256 一致），内容零变化。
-  **注意：这次转换没有产生新的 commit，也不需要** —— `.gitattributes` 的 `text eol=crlf`
-  让 CRLF 的工作区文件规范化后与 HEAD 中的 blob 完全同一对象（`git hash-object` 与
-  `git rev-parse HEAD:<file>` 结果相同），`git diff` 为空，无可提交内容。
+---
 
-**2026-10-18 第 2 轮 QA 回归修复的一项**（同样保留记录）：
-- 三个 `.bat`（`setup-hooks.bat` / `start-room-watch.bat` / `start-with-guardian.bat`）已加 UTF-8 BOM。
-  修复前实测：`setup-hooks.bat` 的失败分支会把「钩子本身已启用成功，这一步只是告诉你当前
-  config.yaml 的状态。」这句从「，」处劈开，后半段被当命令执行，输出
-  `'这一步只是告诉你当前' is not recognized as an internal or external command`。
-  加 BOM 后两句提示都能完整打印，退出码仍为 1。详见 E.5。
+## I. 已知待办（含为何暂缓）
 
-1. **gallery 的长期守护方案未定** —— 后台任务方式会被系统回收（2026-10-17 23:22 前后实测发生过，
-   进程死亡、8765 无监听）。`guardian.py` 目前只守护 watcher，不管 gallery。
-   候选方案：Windows 计划任务 / 改 `start-room-watch.bat` 同时拉起两个服务 / 开机自启。
-   **暂缓原因**：需要用户在机器上确认安全策略（WMI 与 `Start-Process` 都被本机拦截，见 D.3），不是代码问题。
-2. **录像在用户本人坐在电脑前时仍会录** —— `behavior.skip_when_user_active` 只抑制推送，不抑制录像。
-   实测 14 分钟产出 4 段 mp4 共 653MB（约 46MB/分钟），长期会吃满磁盘。
-   **暂缓原因**：这是产品决策（是否接受把自己也录下来），需用户拍板；改完还需重启 watcher。
-3. **`.gitignore` 里的 `config.local.yaml` 是一个约定而非现存文件** —— 目前磁盘上没有它。
-   它是为 E.4 第 2 条方案预留的位置，只有当你真的要用「本机真凭据」方案时才创建。
+1. **gallery 的长期守护方案未定** —— 后台任务方式会被系统回收；`guardian.py` 目前只守护监控。
+   候选：Windows 计划任务 / 让 `start-guardian.bat` 同时拉起两个服务。
+   **暂缓原因**：需要用户确认机器安全策略（WMI 与 `Start-Process` 都被拦）。
+2. **录像在本人坐在电脑前时仍会录** —— `behavior.skip_when_user_active` 只抑制推送。
+   实测约 65.6 MB/分钟，长期会吃满盘。**暂缓原因**：这是产品决策，需用户拍板。
+3. **桌面的「停止监控」不优雅** —— 用 `taskkill /F`，不保证 mp4 收尾。
+   可改成向进程发关闭信号并等待收尾（`watcher` 已有 KeyboardInterrupt 收尾路径）。
+4. **~~`install-autostart.ps1` 硬编码绝对路径~~（已在 v0.1.0 修掉）** ——
+   现在用 `$PSScriptRoot` 推导项目根，参数改为 `-m roomwatch guard --once`，并补了 BOM。
+   保留这条记录，避免有人再「优化」回硬编码。

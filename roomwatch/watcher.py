@@ -1,9 +1,9 @@
 """房间进入检测主程序。
 
 用法：
-    python watcher.py                 # 正式运行
-    python watcher.py --dry-run       # 只抓拍存档，不推送（先跑这个验证画面）
-    python watcher.py --probe         # 打开摄像头拍一张 preview.jpg 然后退出
+    rw start                          # 正式运行
+    rw dry-run                        # 只抓拍存档，不推送（先跑这个验证画面）
+    rw probe                          # 打开摄像头拍一张预览图然后退出
 """
 
 from __future__ import annotations
@@ -876,7 +876,7 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
     if not idn.save_owner(feats):
         return 4
     print(f"注册完成：{idn.owner_file}（{len(feats)} 个样本，阈值 {idn.threshold}）")
-    print("接下来可以验证一下：python watcher.py --whoami <某张你自己的截图>")
+    print("接下来可以验证一下：rw whoami <某张你自己的截图>")
     return 0
 
 
@@ -884,7 +884,7 @@ def whoami(cfg: dict, image_path: str) -> int:
     """测试识别：这张图里的人是不是你。"""
     idn = Identity(cfg.get("identity") or {})
     if not idn.usable:
-        print("识别不可用：模型缺失，或还没注册本人（先跑 python watcher.py --enroll）")
+        print("识别不可用：模型缺失，或还没注册本人（先跑 rw enroll）")
         return 2
 
     img = cv2.imread(image_path)

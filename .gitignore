@@ -82,3 +82,5 @@ desktop.ini
 /build/
 /dist/
 *.spec
+# 界面打包用的独立虚拟环境（由系统 Python 创建，含 tkinter）
+/.venv-gui/

@@ -1,9 +1,9 @@
 """推送配置引导：一条命令配好，并立刻发一条测试消息验证。
 
-    python setup_push.py              # 交互式
-    python setup_push.py --channel wxpusher --token AT_xxx --uid UID_xxx
-    python setup_push.py --channel serverchan --sendkey SCTxxx
-    python setup_push.py --channel wecom_bot --webhook https://qyapi.weixin.qq.com/...
+    rw push                           # 交互式
+    rw push --channel wxpusher --token AT_xxx --uid UID_xxx
+    rw push --channel serverchan --sendkey SCTxxx
+    rw push --channel wecom_bot --webhook https://qyapi.weixin.qq.com/...
 
 config.yaml 里全是中文注释，直接用 yaml 库重写会把注释全部抹掉，
 所以这里做的是**精准文本替换**：只替换占位符和 channel 那一行。

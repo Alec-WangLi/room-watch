@@ -73,18 +73,23 @@ _KNOWN_PYTHONS = (
 def find_python() -> str:
     """挑一个能跑本项目的解释器。
 
-    顺序：ROOMWATCH_PYTHON → 当前进程解释器 → 已知可用路径 → "python"。
-    这里只做路径存在性判断，不 import cv2 —— 每次起进程都探测会让
-    `rw status` 这类轻命令慢半秒。
+    顺序：ROOMWATCH_PYTHON →（打包成 exe 时）已知可用路径 → 当前进程解释器
+          → 已知可用路径 → "python"。
+    打包后的 exe 里 `sys.executable` 是 exe 自己，不能拿来跑监控，
+    所以 frozen 时必须先看已知路径。
     """
     explicit = os.environ.get("ROOMWATCH_PYTHON")
     if explicit and Path(explicit).exists():
         return explicit
 
+    frozen = bool(getattr(sys, "frozen", False))
+    if frozen:
+        for candidate in _KNOWN_PYTHONS:
+            if candidate.exists():
+                return str(candidate)
+
     current = sys.executable
-    if current and Path(current).exists():
-        # 当前解释器能 import 本包，说明至少 Python 版本合适；
-        # 但 cv2 是否存在由 `rw doctor` 负责检查，这里不代劳。
+    if current and Path(current).exists() and not frozen:
         return current
 
     for candidate in _KNOWN_PYTHONS:
@@ -92,6 +97,28 @@ def find_python() -> str:
             return str(candidate)
 
     return "python"
+
+
+def runtime_root() -> Path:
+    """界面（可能是打包后的 exe）该把哪个目录当作项目根。
+
+    - `ROOMWATCH_ROOT` 显式指定优先；
+    - 打包后：从 exe 所在目录向上找第一个含 `config.yaml` 的目录
+      （exe 通常放在 dist/，项目根在上一级）；
+    - 源码运行：就是 `PROJECT_ROOT`。
+    """
+    explicit = os.environ.get("ROOMWATCH_ROOT")
+    if explicit:
+        return Path(explicit).resolve()
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        for candidate in (exe_dir, *exe_dir.parents):
+            if (candidate / "config.yaml").is_file():
+                return candidate
+        return exe_dir
+
+    return PROJECT_ROOT
 
 
 def has_module(name: str, python: Optional[str] = None) -> bool:

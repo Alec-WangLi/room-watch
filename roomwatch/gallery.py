@@ -1,7 +1,7 @@
 """本地抓拍相册。只用标准库，不装任何额外依赖。
 
-    python gallery.py              # 只本机访问 http://127.0.0.1:8765
-    python gallery.py --port 9000
+    rw gallery                     # 只本机访问 http://127.0.0.1:8765
+    rw gallery --port 9000
 
 手机上看的话需要内网穿透（frp / cpolar / Tailscale 等），
 不要把 --host 暴露到公网：这是你房间的照片。
