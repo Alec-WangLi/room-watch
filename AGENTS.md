@@ -353,10 +353,13 @@ done
    **暂缓原因**：这是产品决策（是否接受把自己也录下来），需用户拍板；改完还需重启 watcher。
 3. **`README.md:473` 仍写着「test_gallery.py 16 项」，实际是 18 项**（2026-10-17 23:15 修裂图问题时加了两个用例）。
    **暂缓原因**：本次任务明确约定 `README.md` 只读，如需修正请交由用户确认后单独改。
-4. **`start-room-watch.bat` / `start-with-guardian.bat` / `install-autostart.ps1` 当前在磁盘上是 LF**，
-   `.gitattributes` 已规定它们应为 CRLF，但需要一次重新检出（或 `git add --renormalize` + 检出）才会在工作区生效。
-   **暂缓原因**：本次只做首次提交，不改动现有文件内容；首次提交时它们以 LF 进入版本库，
-   签出时会按 `.gitattributes` 转成 CRLF。首次提交后建议执行一次
-   `git rm --cached -r . && git add .`（只动索引，不动磁盘文件）让索引与属性一致 —— 该操作尚未执行，待用户确认。
+4. **`start-room-watch.bat` / `start-with-guardian.bat` / `install-autostart.ps1` 目前在磁盘上仍是 LF**。
+   版本库里存的已经是规范化后的 LF（`git ls-files --eol` 显示 `i/lf`，且 attr 列为 `text eol=crlf`），
+   所以**索引没有问题、不需要修**。差别只在工作区：这三个文件是首次提交前就存在的，git 还没往磁盘写过它们。
+   证据：`git add` 时 git 打印过
+   `warning: in the working copy of 'start-room-watch.bat', LF will be replaced by CRLF the next time Git touches it`。
+   下次任何一次检出（新克隆、`git checkout`、`git reset --hard`）它们就会变成 CRLF。
+   想在本机立刻生效：删掉这三个文件后 `git checkout -- start-room-watch.bat start-with-guardian.bat install-autostart.ps1`。
+   **暂缓原因**：本次任务约定不改动磁盘上已有文件的内容，故只在文档里写清楚，未擅自转换。
 5. **`.gitignore` 里的 `config.local.yaml` 是一个约定而非现存文件** —— 目前磁盘上没有它。
    它是为 E.4 第 2 条方案预留的位置，只有当你真的要用「本机真凭据」方案时才创建。
