@@ -478,14 +478,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     _trace("app built")
 
     if "--selftest" in argv:
-        # 不进入事件循环：建窗 → 跑一次刷新 → 销毁。用于构建后验证 exe 真的能起来。
+        # 不进入事件循环：建窗 → 校验关键控件 → 销毁。
+        # 用于构建后验证 exe 真的能起来，且版面没退化成空窗口。
         app.win.update()
+        problems: list[str] = []
+        if "●" not in app.status_label.cget("text"):
+            problems.append("状态标签没有渲染")
+        for name, btn in (("启动", app.btn_start), ("停止", app.btn_stop),
+                          ("相册", app.btn_gallery), ("预览", app.btn_probe)):
+            if not btn.winfo_exists():
+                problems.append(f"{name}按钮不存在")
+        if len(app.tree["columns"]) != 3:
+            problems.append("事件表列数不对")
+        width = app.win.winfo_width()
+        height = app.win.winfo_height()
         app.win.destroy()
+
         log = root / "var" / "logs" / "gui-selftest.log"
         log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text(f"ok {__version__} {datetime.now().isoformat(timespec='seconds')}\n",
-                       encoding="utf-8")
-        print(f"界面自检通过（{__version__}），记录：{log}")
+        stamp = datetime.now().isoformat(timespec="seconds")
+        if problems:
+            log.write_text(f"FAIL {__version__} {stamp} {'; '.join(problems)}\n", encoding="utf-8")
+            print(f"界面自检失败：{'; '.join(problems)}")
+            return 1
+        log.write_text(f"ok {__version__} {stamp} 窗口 {width}x{height} 控件齐全\n", encoding="utf-8")
+        print(f"界面自检通过（{__version__}），窗口 {width}x{height}，记录：{log}")
         return 0
 
     app.run()
