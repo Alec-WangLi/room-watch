@@ -19,6 +19,9 @@ captures/
 # 由 `python watcher.py --enroll` 生成，换台机器重新注册即可，不需要版本管理。
 identity/
 # 兜底：任何 .npz（人脸特征 / 嵌入向量）都不入库，防止将来在别处又产出一份
+# 保持全局匹配（不带前导 /）：人脸模板可能落在任何目录（如 models/new_model.npz）。
+# 若将来确实要提交某个 .npz 模型权重，用 git add -f 之前必须先确认它不是人脸特征模板
+# （生物特征数据，一旦入库无法从历史里真正删除）—— 钩子也会拦 identity/** 与 *.npz。
 *.npz
 
 # ---------- 3. 运行时状态与日志 ----------
@@ -26,12 +29,16 @@ identity/
 events.db
 # watcher 每轮刷新的状态快照（pid / last_frame_at / recording ...），
 # 内容随时间变化，入库只会制造无意义的持续 diff
-status.json
+# 前导 / 表示只忽略仓库根的这一个文件，不误伤子目录里的同名文件（如 assets/status.json）
+/status.json
 # 守护进程的重启历史
 guardian_state.json
 # 守护进程的单实例锁
 guardian.lock
 # 日志：watcher.log / gallery.log / dryrun.log / stdout_watcher.log / stdout_gallery.log
+# 保持全局匹配（不带前导 /）：日志可能落在任何目录。
+# 若要提交某个 .log（例如 tests/fixtures/sample.log 这类测试夹具），
+# 用 git add -f 之前先确认它不是真实运行日志、不含隐私内容 —— 钩子仍会拦隐私路径。
 *.log
 
 # ---------- 4. 可自动重建的缓存 ----------
@@ -42,12 +49,14 @@ __pycache__/
 *.py[cod]
 
 # ---------- 5. 调试 / 演示产物 ----------
+# 以下三条都加前导 / ：它们只在仓库根产生，限定仓库根可避免误伤子目录里的同名文件
+# （例如以后新建 docs/preview.jpg、assets/demo_recording.mp4 不会被忽略）
 # --probe 拍的预览图
-preview.jpg
+/preview.jpg
 # 录像功能联调时的输出
-demo_recording.mp4
+/demo_recording.mp4
 # 语音合成试听产物
-tts_test.mp3
+/tts_test.mp3
 
 # ---------- 6. 本机真实凭据的约定存放处（不入库） ----------
 # config.yaml 入库且只放占位串。若要在本机长期保留真实推送凭据，

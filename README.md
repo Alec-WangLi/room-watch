@@ -495,7 +495,7 @@ python guardian.py --once
 | `config.yaml` | 全部可调参数 |
 | `AGENTS.md` | **项目约定与协作习惯，给 AI 助手和协作者看的。开新对话先读它** |
 | `.gitignore` | 哪些入库、哪些不入库（含每条规则的原因） |
-| `.githooks/` | 提交前检查：拦住推送凭据与隐私文件进版本库（`--self-test` 可自测） |
+| `.githooks/` | 提交前检查：`--self-test` 可自测。检查范围见下（不夸大） |
 | `test_logic.py` | 56 项单测，`python test_logic.py` |
 | `test_loudness.py` | 32 项单测，`python test_loudness.py`（纯数学，不需要声卡） |
 | `test_recorder.py` | 19 项，`python test_recorder.py`（真的写一段视频再读回来数帧；含数据库迁移） |
@@ -513,6 +513,25 @@ python guardian.py --once
 
 八个测试文件合计 **217 项**（56+32+19+18+31+31+24+6），全部可离线运行：
 不联网、不发推送、不占用真实摄像头。直接跑文件即可，不需要 `-m unittest`。
+
+### 提交前检查（`.githooks/`）到底查什么
+
+说清楚边界，避免误以为它能兜住一切。**它只查两样，且是确定性匹配（不是全仓库扫描）**：
+
+1. **`config.yaml` 里的四个推送凭据键**：`notify.wxpusher.app_token`、`notify.wxpusher.uid`、
+   `notify.serverchan.sendkey`、`notify.wecom_bot.webhook`。
+   判据是「值以 `AT_` / `UID_` / `SCT` 开头，或 URL 里 `key=` 的值不是 `REPLACE_ME`，且不等于占位串」。
+2. **暂存区里的隐私路径**：`captures/**`、`identity/**`、`voice_cache/**`、`.workbuddy/**`、
+   `*.db`、`*.log`、`*.npz`。
+
+**它不查的东西**（不要把凭据硬编码到这些地方指望被拦住）：
+
+- `config.yaml` **以外**任何文件里的凭据。例如在某个 `.py` 里写 `TOKEN = "AT_xxxx"` —— **不拦**。
+- 未进入暂存区（`git add` 之前）的文件。
+- 已经进过历史的内容。
+
+所以规矩是：**凭据只写在 `config.yaml` 的这四个键里，并且保持占位串**；
+真实凭据放 `config.local.yaml`（已被忽略），启动时用 `--config` 指定。
 
 ## 检测逻辑：为什么不是"一有人就拍"
 

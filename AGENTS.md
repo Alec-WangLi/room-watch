@@ -2,8 +2,14 @@
 
 > 读者：未来的 AI 助手，以及用户本人。
 > 目标：开新对话时先读这一页，就能直接干活，不用重新摸一遍。
-> 本文所有命令、路径、配置键名、行号，**都在 2026-10-18（首次 git 提交时）逐条核对过源码**。
+> 本文所有命令、路径、配置键名，**都在 2026-10-18（首次 git 提交时）逐条核对过源码**。
 > 若你发现某条与代码不一致，说明代码已经变了 —— 请以代码为准，并顺手改掉这一行。
+>
+> **关于行号（重要）**：本文里出现的行号一律是**辅助信息**，会随编辑漂移。
+> 查找依据**以语义锚点为准** —— 配置键名（如 `notify.wxpusher.app_token`）、
+> 函数名（如 `faces._shift_row()`）、段名（如 `record:` 段）、
+> 或 README 的条目名（如「文件说明表中 `test_gallery.py` 那一行」）。
+> 行号一律写成「当前约在第 N 行」的形式，看到与锚点对不上时，信锚点。
 
 ---
 
@@ -12,45 +18,62 @@
 **一句话**：电脑摄像头盯着房间，YOLO 确认「有人进来了」就抓一张带时间戳的照片、同时录一段 mp4、
 本机语音播报、再推一条微信消息。全部在本机跑，视频不出机器。
 
-### 主链路（每一步后面的括号是出处）
+### 主链路（每一步后面的括号是出处；行号只是辅助，以键名/函数名为准）
 
 ```
 摄像头
-  camera.index / camera.backend=dshow / 1280x720 / 10fps        config.yaml:6-11
+  camera.index / camera.backend=dshow / 1280x720 / 10fps
+      → config.yaml 的 camera: 段（当前约 6-11 行）
     ↓
 YOLO 人形检测
-  yolov8n.pt，conf=0.55，imgsz=640                              config.yaml:13-16
+  yolov8n.pt，detector.conf=0.55，detector.imgsz=640
+      → config.yaml 的 detector: 段（当前约 13-16 行）
     ↓
 连续帧确认「真的有人」
-  detector.trigger_frames=3 帧连续命中才算进入                  config.yaml:17, logic.py:16-21
+  detector.trigger_frames=3 帧连续命中才算进入
+      → config.yaml 的 detector.trigger_frames（当前约 17 行）
+      → logic.py 顶部的 ACTION_NONE/START/BEST/FIRE 常量定义（当前约 16-21 行）
     ↓
 挑最好的一帧
-  再看 detector.capture_window=8 帧，按 frame_score 取最大最居中  config.yaml:18, logic.py:125
+  再看 detector.capture_window=8 帧，按 frame_score() 取最大最居中
+      → config.yaml 的 detector.capture_window（当前约 18 行）
+      → logic.py 的 frame_score() 函数（当前约 125 行）
     ↓
 落盘 + 开录
   captures/日期/HHMMSS.jpg（画框+时间戳）
-  同名 .mp4，avc1(H.264)，带 8 秒预录                            config.yaml:21-56
+  同名 .mp4，record.codec=avc1(H.264)，record.pre_roll_seconds=8 秒预录
+      → config.yaml 的 snapshot: 段与 record: 段（当前约 21-56 行）
     ↓
 人脸检测（在 YOLO 框内找脸）
-  YuNet ONNX，每 3 帧一次，score≥0.7，返回 15 维行（含关键点）    config.yaml:78-87, faces.py:161-179
+  YuNet ONNX，face.every_n_frames=3，face.score_threshold=0.7，返回 15 维行（含关键点）
+      → config.yaml 的 face: 段（当前约 78-87 行）
+      → faces.py 的 _detect_yunet()（当前约 161-179 行）
     ↓
 人脸识别（是不是本人）
-  SFace 提 128 维特征，与 identity/owner.npz 比余弦，阈值 0.45，
-  连续 confirm_frames=2 帧才算数                                 config.yaml:89-107, identity.py:182
+  SFace 提 128 维特征，与 identity.owner_file（identity/owner.npz）比余弦，
+  identity.threshold=0.45，连续 identity.confirm_frames=2 帧才算数
+      → config.yaml 的 identity: 段（当前约 89-107 行）
+      → identity.py 中调用 alignCrop() 的那一行（当前约 182 行）
     ↓
 分流
   本人 → identity.on_owner=skip（不抓拍/不录像/不播报/不推送）
-  他人或认不出 → unknown_policy=alert（照常告警）                 config.yaml:109-117
+  他人或认不出 → identity.unknown_policy=alert（照常告警）
+      → config.yaml 的 identity: 段尾部（当前约 109-117 行）
     ↓
 现场播报 + 远程通知
-  语音：SAPI5 离线合成，require_face=true（要看清脸才出声），冷却 60s
-  推送：notify.channel，支持 wxpusher / serverchan / wecom_bot / none   config.yaml:119-127, 183-207
+  语音：SAPI5 离线合成，voice.require_face=true（要看清脸才出声），voice.cooldown_seconds=60
+      → config.yaml 的 voice: 段（当前约 119-127 行）
+  推送：notify.channel，支持 wxpusher / serverchan / wecom_bot / none
+      → config.yaml 的 notify: 段（当前约 184-208 行，以 notify.* 键名为准）
     ↓
 本地相册
-  gallery.py，127.0.0.1:8765，jpg 当封面、点开播 mp4            gallery.py:326-330
+  gallery.py，gallery.py 的 --host/--port 默认 127.0.0.1:8765，jpg 当封面、点开播 mp4
+      → gallery.py 的 main() 里 argparse 定义处（当前约 326-330 行）
     ↓
 归档清理
-  snapshot.keep_days=30（按天）+ storage.max_total_gb=20（按体积）  config.yaml:23, 158-168
+  snapshot.keep_days=30（按天）+ storage.max_total_gb=20（按体积）
+      → config.yaml 的 snapshot.keep_days（当前约 23 行）
+      → config.yaml 的 storage: 段（当前约 158-169 行）
 ```
 
 ### 模块职责（改代码前先看这里，别放错地方）
@@ -79,16 +102,27 @@ YOLO 人形检测
 C:\Users/user\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 ```
 
-- 版本 Python 3.13.14；已装 cv2 5.0.0 / numpy 2.5.4 / ultralytics 8.4.178 / pyttsx3 / sounddevice / psutil / pycaw / PyYAML。
+- 版本 Python 3.13.14；已装 cv2 5.0.0 / numpy 2.5.4 / ultralytics 8.4.178 / PyYAML 6.0.3 /
+  pyttsx3 / sounddevice / psutil / pycaw。
 - 在 git-bash 里写作 `/c/Users/user/.workbuddy/binaries/python/envs/default/Scripts/python`。
-- 另有两个「装了 Python 但没有项目依赖」的解释器，直接 `python watcher.py` 会 `ModuleNotFoundError: No module named 'cv2'`：
-  - `C:\Users/user\.workbuddy\binaries\python\versions\3.13.12\python.exe`（git-bash 里 `python` 默认解析到它）
-  - `C:\Users/user\AppData\Local\Programs\Python\Python313\python.exe`（只有 numpy 和 yaml）
-- 换机器或重装后重新确认的办法：`python -c "import cv2, numpy, yaml; print(cv2.__version__)"`，哪个能跑用哪个。
+- 本机 PATH 上还有**另外三个**解释器，全都跑不了本项目（cv2 缺失），
+  直接 `python watcher.py` 会得到 `ModuleNotFoundError: No module named 'cv2'`：
+
+  | 解释器 | 版本 | cv2 | numpy | ultralytics | yaml |
+  |---|---|---|---|---|---|
+  | `C:\Users/user\.workbuddy\binaries\python\versions\3.13.12\python.exe` | 3.13.14（目录名是 3.13.12，以实际版本为准） | ✗ | ✗ | ✗ | ✗ |
+  | `C:\Users/user\AppData\Local\Programs\Python\Python313\python.exe` | 3.13.13 | ✗ | ✓ 2.4.6 | ✗ | ✓ 6.0.3 |
+  | `C:\Users/user\AppData\Local\Python\bin\python.exe` | **3.14.5** | ✗ | ✗ | ✗ | ✗ |
+
+  第一个是 git-bash 里敲 `python` 时默认解析到的那个，最常踩。
+  第三个在 PATH 里且版本最新（3.14.5），误用时报的错和另外两个一样，
+  排查时容易多绕一圈 —— **看到 3.14.5 就知道选错了**。
+- 换机器或重装后重新确认的办法：`python -c "import cv2, numpy, yaml; print(cv2.__version__)"`，
+  哪个能跑用哪个。四个都试一遍再下结论。
 
 下面命令表里的 `python` 一律指上面那个能跑的解释器。
 
-### B.1 watcher.py（出处：watcher.py:940-958）
+### B.1 watcher.py（出处：`watcher.py` 的 `main()` 里 argparse 定义处，当前约 940-958 行）
 
 | 目的 | 命令 |
 |---|---|
@@ -108,7 +142,7 @@ C:\Users/user\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 | 磁盘占用、容量上限、最旧/最新文件 | `python watcher.py --storage` |
 | 用另一份配置启动 | `python watcher.py --config config.local.yaml` |
 
-### B.2 guardian.py（出处：guardian.py:438-441）
+### B.2 guardian.py（出处：`guardian.py` 的 `main()` 里 argparse 定义处，当前约 438-441 行）
 
 | 目的 | 命令 |
 |---|---|
@@ -118,14 +152,15 @@ C:\Users/user\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 | 只报告该做什么，不真的重启 | `python guardian.py --dry-run` |
 | 指定配置 | `python guardian.py --config config.yaml` |
 
-### B.3 gallery.py（出处：gallery.py:326-330）
+### B.3 gallery.py（出处：`gallery.py` 的 `main()` 里 argparse 定义处，当前约 326-330 行）
 
 | 目的 | 命令 |
 |---|---|
 | 起本地相册（默认 127.0.0.1:8765） | `python gallery.py` |
 | 换端口 / 换目录 / 换状态文件 / 换判死阈值 | `python gallery.py --port 8765 --captures captures --status-file status.json --stale-after 120` |
 
-### B.4 setup_push.py（出处：setup_push.py:142-147）
+### B.4 setup_push.py（出处：`setup_push.py` 的 `main()` 里 argparse 定义处，当前约 142-147 行；
+`--channel` 的合法取值在文件顶部的 `CHANNELS` 常量，当前约 28 行）
 
 | 目的 | 命令 |
 |---|---|
@@ -184,7 +219,8 @@ done
 ### D.1 摄像头同时只能被一个进程占用；改完代码必须重启
 
 - **现象**：第二份 `watcher.py` 打不开摄像头；改完 `config.yaml` 后运行中的进程行为不变。
-- **原因**：摄像头设备独占；配置只在 `Watcher.__init__` 里读一次（watcher.py:139-175），运行中不热加载。
+- **原因**：摄像头设备独占；配置只在 `Watcher.__init__` 里读一次
+  （`watcher.py` 的 `class Watcher` 及其 `__init__`，当前约 139-175 行），运行中不热加载。
 - **正解**：改完代码或配置，**必须重启 watcher 和 gallery 两个进程**才生效。不要靠「再开一份」来验证。
 
 ### D.2 判断 watcher 是否活着，必须看 `status.json` 的 `last_frame_at` 距今
@@ -192,7 +228,8 @@ done
 - **现象**：进程被强杀后，读 `status.json` 里的 `stale` 字段永远是 `false`，会把死掉的程序报成在线。
 - **原因**：进程被杀前来不及再写一次状态，磁盘上留下的最后一份快照里 `stale`/`camera_ok` 都还是「正常」。
 - **正解**：在**读取的那一刻**重算：`now - last_frame_at > heartbeat.stale_after_seconds`（默认 120 秒）即判定停摆。
-  代码里就是这么做的，见 watcher.py:1045-1050（`print_status` 里有明确注释：绝不能信文件里存的 stale 字段）。
+  代码里就是这么做的，见 `watcher.py` 的 `print_status()` 里重算 stale 的那几行
+  （当前约 1045-1050 行；搜「绝不能信文件里存的 stale 字段」这句注释即可定位）。
   结论：**不要自己解析 `stale` 字段，用 `python watcher.py --status`**。
 
 ### D.3 本机 `Start-Process`（PowerShell）无法启动进程
@@ -207,30 +244,38 @@ done
 - **原因**：本机 OpenCV 5.0 只有 avc1(H.264) 和 mp4v 能写；浏览器基本只认 H.264。报错来自 FFmpeg 后端，
   实际由 Media Foundation 接手成功编码。
 - **正解**：`record.codec` 保持 `avc1`；那条 stderr 报错是噪音，不用管。mp4v 只在兜底时用，网页放不了。
-  出处：config.yaml:33-36、recorder.py:36-40。
+  出处：`config.yaml` 的 `record.codec` 及其上方注释（当前约 33-36 行）；
+  `recorder.py` 文件顶部关于 avc1/mp4v 的 codec 候选表（当前约 36-40 行）。
 
 ### D.5 H.264 编码 11~18ms/帧，必须后台线程写盘
 
 - **现象**：把编码放进主循环会让检测帧率掉下来。
 - **原因**：10fps 主循环每帧预算 100ms，H.264 单帧 11~18ms 看似够，但叠加预录与磁盘抖动后会拖慢检测。
 - **正解**：后台线程写盘；`record.queue_size`（默认 120）满时**宁可丢帧也不许拖慢检测主循环**。
-  出处：config.yaml:55、recorder.py。
+  出处：`config.yaml` 的 `record.queue_size` 及其注释（当前约 55 行）；
+  `recorder.py` 的后台写盘线程实现。
 
 ### D.6 录像有 8 秒预录，合并音轨要用 ffmpeg `adelay` 补等长静音
 
 - **现象**：并好音轨后，声音整段晚 8 秒，对不上画面。
 - **原因**：预录的 8 秒画面发生在「开始录音」之前，音轨长度天然比视频短。
 - **正解**：合并时给音轨补等长静音：`-af adelay=<预录毫秒>:all=1`（视频流 copy，不重编码）。
-  出处：config.yaml:62-64、audio_recorder.py:14 与 :50、test_audio_storage.py:35（断言 `adelay=8000:all=1`）。
+  出处：`config.yaml` 的 `record.audio` 段上方关于 adelay 的注释（当前约 62-64 行）；
+  `audio_recorder.py` 文件顶部说明（当前约 14 行）与拼接 `-af adelay=...` 的那行（当前约 50 行）；
+  `test_audio_storage.py` 中断言 `adelay=8000:all=1` 的用例（当前约 35 行）。
 
 ### D.7 `alignCrop()` 要传**原图**和**原图坐标系**的关键点
 
 - **现象**：人脸识别认错人，但不报任何错。
 - **原因**：YuNet 是在 YOLO 人形框的裁剪图上跑的，它返回的 15 维行是**裁剪图坐标**。
   直接交给 `alignCrop()` 会把脸摆歪、特征全废 —— 而这个错误是**静默**的。
-- **正解**：必须把关键点补回人形框偏移量再传下去。已有实现 `faces.py:145-158` 的 `_shift_row()`，
-  调用点在 faces.py:124-126。任何新增的人脸相关调用都要走同一条路。
-  出处：faces.py:38、:124-126、:176-178；identity.py:21、:182。
+- **正解**：必须把关键点补回人形框偏移量再传下去。已有实现是 `faces.py` 的 `_shift_row()`
+  （`def _shift_row` 当前约 145-158 行），调用点在 `faces.py` 里搜「必须补回偏移」那句注释
+  （当前约 124-126 行）。任何新增的人脸相关调用都要走同一条路。
+  出处：
+  - `faces.py` 的类/文件头注释里关于「原图坐标」的说明（当前约 38 行）
+  - `faces.py` 的偏移量补回处（当前约 124-126 行）与 `_detect_yunet()` 里带出关键点的注释（当前约 176-178 行）
+  - `identity.py` 文件头关于 `alignCrop()` 需要原图坐标的说明（当前约 21 行）与 `alignCrop` 调用点（当前约 182 行）
 
 ### D.8 编辑 `config.yaml` 时极易把相邻行合并、吞掉某个键
 
@@ -310,7 +355,9 @@ done
 
 1. **改回占位串再提交**（推荐，也是钩子放行的唯一方式）。
 2. **复制一份 `config.local.yaml` 填真值**（已被 `.gitignore` 忽略），
-   启动时用 `--config config.local.yaml` 指定 —— 这个 flag 在 watcher.py:940 与 guardian.py:438 都真实存在。
+   启动时用 `--config config.local.yaml` 指定 —— 这个 flag 在 `watcher.py` 与 `guardian.py`
+   的 argparse 定义处都真实存在（分别当前约 940 行与 438 行）。
+   `gallery.py` 没有 `--config`，它只读 `status.json`。
    gallery.py 没有 `--config`，它只读 `status.json`。
 3. **`git update-index --skip-worktree config.yaml`**：
    只对你这台机器生效；**执行后你对 `config.yaml` 的所有修改 git 完全看不见**（`git status` 不显示、也提交不了）。
@@ -348,6 +395,12 @@ done
 8. **不要编造命令**。本文件没写的命令，先 `--help` 或读源码确认存在再用。
 9. **提交前不要绕过钩子**。若钩子阻断，按它打印的修改方法处理，不要用 `--no-verify`。
 10. **不要 `git add -f` 隐私文件**，也不要删除磁盘上的 `captures/`（约 1.9GB，是用户的数据）。
+11. **凡是改动了 `config.yaml` / `README.md` 的行结构（增删行），必须回头同步本文件（AGENTS.md）
+    全文里对该文件的行号引用**。
+    同理，**引用尽量用语义锚点**（配置键名、函数名、段名、README 条目名），行号只作辅助。
+    这条是硬规则，不是建议：`fa7f7a4` 只给 config.yaml 插了一行注释，
+    本文件里 `config.yaml:183-207` 就整段漂到 184-208；`3230f00` 给 README 补了 15 行，
+    `README.md:473` 漂到 502。**写下时准确不等于现在准确**，改完请复读一遍。
 
 ---
 
@@ -357,7 +410,9 @@ done
 因此下面这些**不在本次范围**，逐条写明原因。
 
 **2026-10-18 已解决、已从清单移除的两项**（保留记录以免有人重复做）：
-- `README.md:473` 的用例数「16 项」已改为「18 项」（commit `e5455cf`，diff 为 +1/-1）。
+- README「文件说明」表中 `test_gallery.py` 那一行的用例数「16 项」已改为「18 项」
+  （commit `e5455cf`，diff 为 +1/-1；该行当前约在 README.md 第 502 行，行号会漂移，
+  以「文件说明表 test_gallery.py 那一行」为准）。
 - `start-room-watch.bat` / `start-with-guardian.bat` / `install-autostart.ps1` 的磁盘换行已转成 CRLF。
   转换前后做了哈希等价性验证（CRLF 全换回 LF 后 sha256 一致），内容零变化。
   **注意：这次转换没有产生新的 commit，也不需要** —— `.gitattributes` 的 `text eol=crlf`
