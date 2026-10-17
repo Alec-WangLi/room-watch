@@ -1,0 +1,54 @@
+#!/bin/sh
+# room-watch 提交前检查 —— 薄壳
+#
+# 判定逻辑全在 check_secrets.py 里，本文件只负责「找一个能用的 python 并调用它」。
+# 这样设计是为了让检查逻辑能脱离 git 单独运行和自测：
+#
+#   python .githooks/check_secrets.py --self-test
+#   python .githooks/check_secrets.py --config config.yaml --no-git
+#
+# 启用方式（每个克隆都要执行一次，core.hooksPath 是本地配置，不随仓库分发）：
+#
+#   git config core.hooksPath .githooks
+#
+# 注意：本文件必须是 LF 换行（.gitattributes 已用 `.githooks/pre-commit text eol=lf` 强制），
+# CRLF 的 shebang 行会让 Git for Windows 的 sh 找不到解释器，钩子会静默失效。
+
+set -u
+
+HOOK_DIR=$(cd "$(dirname "$0")" && pwd)
+SCRIPT="$HOOK_DIR/check_secrets.py"
+
+if [ ! -f "$SCRIPT" ]; then
+    echo "[阻断] 找不到检查脚本：$SCRIPT" >&2
+    exit 1
+fi
+
+# 挑一个「真的能跑起来」的解释器。
+# 不能只看 command -v 存在与否：Windows 的 WindowsApps/python.exe 是个空壳，
+# 存在但执行不了，只看存在会让钩子静默失效（等于没检查）。
+if [ -n "${ROOMWATCH_PYTHON:-}" ] && "$ROOMWATCH_PYTHON" -c "import sys" >/dev/null 2>&1; then
+    set -- "$ROOMWATCH_PYTHON"
+elif command -v python >/dev/null 2>&1 && python -c "import sys" >/dev/null 2>&1; then
+    set -- python
+elif command -v python3 >/dev/null 2>&1 && python3 -c "import sys" >/dev/null 2>&1; then
+    set -- python3
+elif command -v py >/dev/null 2>&1 && py -3 -c "import sys" >/dev/null 2>&1; then
+    set -- py -3
+else
+    echo "[阻断] 找不到可用的 python，无法执行提交前检查。" >&2
+    echo "       请把解释器加入 PATH，或显式指定，例如：" >&2
+    echo "       ROOMWATCH_PYTHON=/c/Users/user/.workbuddy/binaries/python/envs/default/Scripts/python" >&2
+    echo "       自检命令：python .githooks/check_secrets.py --self-test" >&2
+    exit 1
+fi
+
+"$@" "$SCRIPT"
+status=$?
+
+if [ "$status" -ne 0 ]; then
+    echo "" >&2
+    echo "提交已取消。上面的每一条都写了修改方法，照做后重新 git commit 即可。" >&2
+fi
+
+exit "$status"

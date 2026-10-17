@@ -1,0 +1,49 @@
+# room-watch —— 换行与二进制属性
+#
+# 背景：本机 git 全局 core.autocrlf=true，默认会把所有文本文件签出成 CRLF。
+# 这里用 .gitattributes 显式接管，优先级高于 core.autocrlf。
+
+# ---------- Windows 脚本必须 CRLF ----------
+# .bat 用 LF 时，cmd.exe 解析多行语句块（括号块、goto 标签）会串行出错；
+# PowerShell 对 .ps1 的 LF 容忍度更高，但保持一致更安全。
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+# ---------- 源码与文本统一 LF ----------
+# 统一成 LF，避免同一次提交里混进整文件的 CRLF→LF 噪音 diff。
+*.py text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# ---------- Git 钩子脚本必须 LF ----------
+# pre-commit 由 Git for Windows 交给 sh 执行，CRLF 的 shebang 行会让 sh 找不到解释器。
+# 这条必须写，否则 core.autocrlf=true 会把它签出成 CRLF，钩子直接失效。
+.githooks/pre-commit text eol=lf
+*.sh text eol=lf
+
+# ---------- 二进制：禁止任何换行转换与 diff ----------
+# 一旦被当成文本做 CRLF/LF 转换，文件就会损坏且 git 的 diff 会刷屏。
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.mp4 binary
+*.mov binary
+*.mp3 binary
+*.wav binary
+*.npz binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.db binary
+*.pdf binary
+*.zip binary

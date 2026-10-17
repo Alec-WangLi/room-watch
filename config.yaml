@@ -1,0 +1,207 @@
+# 房间进入检测 —— 配置
+# 第一次跑建议先：python watcher.py --probe   看画面角度
+# 再跑：        python watcher.py --dry-run  只存档不推送，验证误报率
+# 确认没问题后：python watcher.py            正式运行
+
+camera:
+  index: 0          # 摄像头编号。0 通常是第一个；不对就试 1、2
+  backend: dshow    # Windows 用 dshow 最稳。打不开时换成 msmf 或 any
+  width: 1280
+  height: 720
+  fps: 10           # 检测帧率。房间这种慢场景 5~10 就够，省 CPU
+
+detector:
+  model: yolov8n.pt # n 是 nano，CPU 可跑。想要更准换 yolov8s.pt，会慢一些
+  conf: 0.55        # 置信度阈值。误报多就调高到 0.65，漏报多就调到 0.45
+  imgsz: 640
+  trigger_frames: 3     # 连续 3 帧检测到人才算「进入」，过滤单帧误检
+  capture_window: 8     # 确认进入后再看 8 帧，挑人最大最居中的那张
+  cooldown_seconds: 90  # 一次事件后 90 秒内不再报。保洁待 20 分钟也不会刷屏
+
+snapshot:
+  dir: captures     # 照片存这里，按日期分目录
+  keep_days: 30     # 超过 30 天自动清理。0 表示永不清理
+  jpeg_quality: 90
+  draw_boxes: true  # 在人身上画框 + 盖时间戳，留证更完整
+
+record:
+  # 事件录像：一张照片说不清「他进来干了什么」，所以确认有人就录一段 mp4。
+  # 文件落在 captures/日期/ 下，和抓拍同名（090310.jpg ↔ 090310.mp4），
+  # 相册页自动配对：照片当封面，点开就能播全过程。
+  enabled: true
+
+  # 编码器。本机实测只有 avc1(H.264) 和 mp4v 能写，而浏览器基本只认 H.264，
+  # 想让相册页直接播放就必须用 avc1。（跑 watcher.py 时刷的 openh264 报错可忽略，
+  # 那是 FFmpeg 后端在抱怨，实际由 Media Foundation 接手成功。）
+  codec: avc1
+
+  # 预录：把触发前几秒的画面也补进来，视频开头才是「推门走进来」那一刻，
+  # 而不是从人已经站定了开始。每帧 JPEG 压缩后缓存，
+  # 实测 720p 约 0.8ms/帧、10 秒约 10MB 内存。
+  pre_roll_seconds: 8
+  pre_roll_jpeg_quality: 80
+
+  # 什么时候收尾，四个值互相牵制：
+  #   min_seconds       地板：至少录这么久。YOLO 偶尔漏检一帧，
+  #                     没有这个地板会误判「人走了」而把录像掐断
+  #   idle_stop_seconds 人离开画面这么久就收尾，不对着空房间录像
+  #   max_seconds       单段上限。保洁待很久时会自动接下一段，不会就此截断
+  #   max_total_seconds 一次在场的总上限，到点即使人还在也停，防止写满磁盘
+  min_seconds: 20
+  idle_stop_seconds: 20
+  max_seconds: 300         # 单段 5 分钟，720p 约 50~60MB
+  max_total_seconds: 1800  # 一次在场最多录 30 分钟
+
+  queue_size: 120          # 编码跟不上时的缓冲。满了宁可丢帧，也不让主循环卡顿
+  draw_boxes: false        # 录像里画不画人形框。回看时跳动的框会挡住脸和手部动作
+
+  # —— 音轨 ——
+  # OpenCV 的 VideoWriter 写不了声音，所以单独用 sounddevice 录 WAV，
+  # 收尾后再用 ffmpeg 把音轨并进 mp4（视频流 copy，不重编码，几百毫秒完成）。
+  #
+  # 一个必须知道的细节：录像带 8 秒预录，视频开头是「人还没进门」，
+  # 但那时还没开始录音。所以合并时会给音轨补等长静音（adelay），
+  # 否则你听到的声音会整段晚 8 秒，对不上嘴型。
+  audio:
+    enabled: true
+    device: null            # null = 系统默认麦克风。也可以填设备名或索引
+    samplerate: 16000       # 人声 16k 足够，体积只有 44.1k 的 1/3
+    channels: 1             # 单声道：房间环境音不需要立体声
+    keep_wav: false         # 合并成功后删掉中间 wav。true 则保留一份原始音频
+    ffmpeg: ffmpeg          # ffmpeg 可执行文件。不在 PATH 就写绝对路径
+    merge_timeout_seconds: 60
+
+behavior:
+  skip_when_user_active: true   # 你本人在电脑前时，不推送
+  idle_threshold_seconds: 120   # 键鼠空闲超过 120 秒，才算「人不在电脑前」
+
+face:
+  # 人脸检测：只在 YOLO 已框出的人形区域里找脸，又快又准
+  # 检测器为 YuNet（DNN），模型在 models/ 目录，230KB，离线可用
+  enabled: true
+  model: models/face_detection_yunet_2023mar.onnx
+  every_n_frames: 3     # 隔 3 帧检测一次，省 CPU
+  score_threshold: 0.7  # 调高 = 更保守，宁可不出声也不误判
+  nms_threshold: 0.3
+  min_crop: 40          # 人形框小于这个尺寸就不找脸了
+  padding: 12           # 人形框外扩像素，避免脸被框切掉
+
+identity:
+  # 人脸识别：区分「你本人」和「其他人」。
+  #
+  # 为什么要它：人脸**检测**只回答「这里有没有脸」。你坐回电脑前，
+  # 检测器照样认为有脸，于是监控把你当访客抓拍、播报、推送。
+  # 实测一晚上 7 张抓拍里 6 张是自己在桌前。
+  #
+  # 模型是 SFace（OpenCV 自带，models/ 下 37MB），和 YuNet 天然配对：
+  # YuNet 给出 5 个关键点，SFace 按关键点把脸摆正再提 128 维特征。
+  enabled: true
+  model: models/face_recognition_sface_2021dec.onnx
+  owner_file: identity/owner.npz   # 注册后的「本人模板」存这里
+
+  # 余弦相似度阈值。官方建议 0.363，这里更严一点：
+  # 认错人的代价（把保洁当你、直接免报）比多认一次的代价大得多。
+  threshold: 0.45
+
+  # 连续多少帧判定为「本人」才真的算在场。单帧会抖（侧脸、逆光）。
+  confirm_frames: 2
+
+  # 有脸但认不出是谁时怎么办：
+  #   alert  = 当成他人照常告警（安全优先，宁可多报）
+  #   ignore = 当成本人静默（适合你常背对镜头、只想抓陌生人）
+  unknown_policy: alert
+
+  # 认定是本人时怎么做：
+  #   skip = 完全不抓拍、不录像、不播报、不推送（推荐，省磁盘也不打扰你）
+  #   log  = 照常录像但只写日志，不推送、不播报
+  on_owner: skip
+
+voice:
+  # 对现场的人播报语音提示。完全离线（Windows 自带 SAPI5），不联网、不需要 API key
+  enabled: true
+  text: "您已进入监控区域，请注意"
+  require_face: true        # 只在看清脸的时候才出声。false = 检测到人就出声
+  cooldown_seconds: 60      # 同一人 60 秒内只播一次，不循环轰炸
+  volume: 1.0               # 合成时的原始音量，1.0 已是上限——它调不动响度，见下面 loudness
+  rate: 170                 # 语速，默认 200 偏快
+  voice_contains: "Chinese" # 优先挑名字含这个词的语音
+
+  # —— 为什么声音小 ——
+  # 实测 SAPI5 在 volume=1.0 时输出峰值只有 -11.8 dBFS，
+  # 引擎自己浪费了约 12 dB。所以真正的响度在这一段处理：合成后重新做振幅。
+  preprocess: true          # 合成一次 → 处理后缓存 → 每次播缓存。关掉就退回实时合成（会变小声）
+  cache_dir: voice_cache    # 处理后的音频缓存目录，里面还留着增益报告，可核对
+
+  loudness:
+    target_peak_dbfs: -1.0  # 峰值目标。越接近 0 越响，超过 0 会削波
+    ceiling_dbfs: -0.5      # 限幅天花板，绝不越过
+    trim: true              # 切掉头尾静音，少了半秒的"按了没声音"
+    highpass_hz: 100        # 滤掉小喇叭放不出来的低频，等于让中频白捡一点响度
+    compress: true          # 压缩：把弱的音节抬上来。听着更响主要靠这个
+    threshold_dbfs: -24.0   # 压缩阈值
+    ratio: 3.0              # 压缩比。调大更响但会更"平"
+    lookahead_ms: 20        # 包络前瞻。没有它，音频开头的峰值会漏出压缩，白做
+    smooth_ms: 15           # 增益平滑，防止音量一跳一跳
+
+  # —— 系统音量保底 ——
+  # 代码里做到满刻度只解决一半：Windows 主音量如果只有 10%，下游又砍掉 20 dB。
+  # 实测你这台机器主音量就是 10%，所以这里保底到 70%，退出时自动还原。
+  ensure_system_volume: 70      # 0 = 不碰系统音量
+  restore_system_volume: true   # 退出时还原成启动前的音量
+
+heartbeat:
+  # 定时报平安。这是「监控还活着吗」最可靠的答案：
+  # 不是靠收到心跳，而是靠「该来的心跳没来」判断它挂了。
+  interval_minutes: 30      # 每 30 分钟推一条「监控在线」。0 表示关闭
+  stale_after_seconds: 120  # 超过 120 秒没读到画面，状态页就显示「已停止」
+
+storage:
+  database: events.db   # SQLite 事件日志
+  status: status.json   # 运行状态快照，给 --status 和相册页读取
+
+  # —— 容量上限 ——
+  # snapshot.keep_days 是按「天数」清理，管不住「今天有人来了一整天」这种情况：
+  # 一天之内照样能写出几十 GB。所以再加一道按体积的闸门。
+  max_total_gb: 20        # 抓拍+录像+音频总上限。超了按最旧优先删。0 = 不限
+  min_free_gb: 3          # 磁盘剩余低于这个值，就额外逼近清理到上限的一半
+  check_minutes: 10       # 多久检查一次容量
+  protect_seconds: 300    # 最近 5 分钟内写过的文件不删（可能正在录）
+
+guardian:
+  # 外部守护进程（guardian.py）：负责 watcher 进程死掉/卡死后把它拉起来。
+  # watcher 自己能处理读帧失败、摄像头掉线，但救不了「自己整个进程没了」。
+  check_seconds: 60       # 常驻模式下的检查间隔
+  stale_seconds: 300      # 心跳停这么久才算卡死。比 heartbeat 的 120 秒宽松，
+                          # 因为摄像头重连、模型下载都会让心跳短暂停顿
+  stall_confirmations: 2  # 连续判定卡死几次才真的杀掉重启（避免误杀正在自愈的进程）
+  max_backoff_seconds: 900  # 连续重启失败时的最长间隔，防止疯狂重启刷日志
+  watcher_log: watcher.log
+  state: guardian_state.json
+  lock: guardian.lock
+  python: null            # null = 用当前解释器
+
+notify:
+  # wxpusher | serverchan | wecom_bot | none
+  # none = 只写日志，不推送（调试用）
+  channel: wxpusher
+  title: 房间有人进入
+
+  # —— 渠道一：WxPusher（微信）——
+  # 1. 微信搜「WxPusher」公众号，或去 wxpusher.zjiecode.com 扫码登录
+  # 2. 创建一个应用，拿到 appToken（AT_ 开头）
+  # 3. 关注该应用后，在「用户」页面拿到你的 UID（UID_ 开头）
+  # 注意：只能发文字。照片留在本机，用 gallery.py 看
+  wxpusher:
+    app_token: "AT_xxx_replace_me"
+    uid: "UID_xxx_replace_me"
+
+  # —— 渠道二：Server酱（微信服务号）——
+  # sct.ftqq.com 登录，复制 SendKey（SCT 开头）
+  serverchan:
+    sendkey: "SCTxxx_replace_me"
+
+  # —— 渠道三：企业微信群机器人（唯一能把照片直接发到微信的）——
+  # 群设置 → 群机器人 → 添加，复制 Webhook 地址
+  # 图片走 base64，不需要公网图床，照片不出你的机器
+  wecom_bot:
+    webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_ME"

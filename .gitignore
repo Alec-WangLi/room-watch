@@ -1,0 +1,65 @@
+# room-watch —— Git 忽略规则
+#
+# 总原则：源码、配置、模型权重必须入库；运行时产物、隐私数据、可重建缓存一律不入库。
+# 下面每条都写了「为什么忽略」，避免后来的人（包括 AI 助手）误删规则或误加规则。
+#
+# ⚠ 绝对不要把下面三个加进忽略列表：
+#     config.yaml          —— 核心配置，注释详尽，它的调参历史是本项目最有价值的版本记录
+#     models/*.onnx        —— YuNet(230KB) + SFace(37MB)；本机下载实测仅 20KB/s，37MB 要半小时
+#     yolov8n.pt           —— 6.5MB 权重
+# config.yaml 的凭据泄漏风险不靠忽略文件解决，由 .githooks/check_secrets.py 在提交前拦截。
+
+# ---------- 1. 隐私：抓拍与录像（本项目最敏感的数据） ----------
+# captures/ 下按日期存放 jpg 抓拍 + mp4 录像，实测已 1.9GB。
+# 内容是房间内的人脸与行为记录，一旦入库就永远留在历史里（删文件也删不掉历史）。坚决不入库。
+captures/
+
+# ---------- 2. 隐私：本人人脸特征模板（生物特征数据） ----------
+# identity/owner.npz 是 SFace 提取的 128 维人脸特征。
+# 由 `python watcher.py --enroll` 生成，换台机器重新注册即可，不需要版本管理。
+identity/
+# 兜底：任何 .npz（人脸特征 / 嵌入向量）都不入库，防止将来在别处又产出一份
+*.npz
+
+# ---------- 3. 运行时状态与日志 ----------
+# SQLite 事件日志，持续增长，是数据不是代码
+events.db
+# watcher 每轮刷新的状态快照（pid / last_frame_at / recording ...），
+# 内容随时间变化，入库只会制造无意义的持续 diff
+status.json
+# 守护进程的重启历史
+guardian_state.json
+# 守护进程的单实例锁
+guardian.lock
+# 日志：watcher.log / gallery.log / dryrun.log / stdout_watcher.log / stdout_gallery.log
+*.log
+
+# ---------- 4. 可自动重建的缓存 ----------
+# voice_cache/ 存响度处理后的语音与增益报告，删掉后首次播报会自动重建
+voice_cache/
+# Python 字节码
+__pycache__/
+*.py[cod]
+
+# ---------- 5. 调试 / 演示产物 ----------
+# --probe 拍的预览图
+preview.jpg
+# 录像功能联调时的输出
+demo_recording.mp4
+# 语音合成试听产物
+tts_test.mp3
+
+# ---------- 6. 本机真实凭据的约定存放处（不入库） ----------
+# config.yaml 入库且只放占位串。若要在本机长期保留真实推送凭据，
+# 复制一份 config.local.yaml 填真值，启动时用 --config config.local.yaml 指定
+# （watcher.py:940 与 guardian.py:438 都支持 --config）。该文件永不入库。
+config.local.yaml
+
+# ---------- 7. WorkBuddy 工作区 ----------
+# 内含 AI 记忆日志：逐小时活动流水、进程 PID、抓拍内容判断，属隐私
+.workbuddy/
+
+# ---------- 8. 操作系统垃圾 ----------
+Thumbs.db
+desktop.ini
+.DS_Store
