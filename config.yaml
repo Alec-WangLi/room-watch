@@ -49,7 +49,7 @@ record:
   #   max_total_seconds 一次在场的总上限，到点即使人还在也停，防止写满磁盘
   min_seconds: 20
   idle_stop_seconds: 20
-  max_seconds: 300         # 单段 5 分钟，720p 约 50~60MB
+  max_seconds: 300         # 单段 5 分钟，720p 实测约 330MB（按 65.6 MB/分钟折算）
   max_total_seconds: 1800  # 一次在场最多录 30 分钟
 
   queue_size: 120          # 编码跟不上时的缓冲。满了宁可丢帧，也不让主循环卡顿
@@ -163,6 +163,7 @@ storage:
   # snapshot.keep_days 是按「天数」清理，管不住「今天有人来了一整天」这种情况：
   # 一天之内照样能写出几十 GB。所以再加一道按体积的闸门。
   max_total_gb: 20        # 抓拍+录像+音频总上限。超了按最旧优先删。0 = 不限
+                          # 按实测 65.6 MB/分钟折算，20GB 约等于 5 小时录像（约 305 分钟）
   min_free_gb: 3          # 磁盘剩余低于这个值，就额外逼近清理到上限的一半
   check_minutes: 10       # 多久检查一次容量
   protect_seconds: 300    # 最近 5 分钟内写过的文件不删（可能正在录）

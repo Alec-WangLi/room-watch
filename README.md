@@ -9,7 +9,8 @@
 在 Windows 上 Docker 跑在 WSL2 里，USB 摄像头无法直通（`usbipd-win` 对摄像头驱动支持很差）。
 
 而这里的需求其实很窄——「有人进来，拍一张，告诉我」。为它搬一整套 NVR，80% 的复杂度是白付的。
-所以本方案是**约 2400 行 Python + YOLO**（含语音播报、人脸检测、本地相册、响度处理），直接读本地摄像头。
+所以本方案是**约 4783 行 Python + YOLO**（含语音播报、人脸检测、本地相册、响度处理；
+不含测试，含 8 个测试文件共 7029 行），直接读本地摄像头。
 
 如果你的情况变化了（比如添了常开小主机或 RTSP 摄像头），再去上 Frigate，那是更合适的选择。
 
@@ -138,13 +139,17 @@ captures/2026-10-17/
 
 ### 磁盘占用
 
-720p / 10fps 实测约 **1.5 Mbps**，即 **每分钟约 11MB**：
+720p / 10fps 实测约 **8.75 Mbps**，即 **每分钟约 65.6 MB**。
+
+实测方法：读 `captures/` 下 8 段已收尾的录像，用文件字节数 ÷ 真实时长
+（帧数 ÷ 帧率）算得。8 段合计 1779.0 MB / 1626 秒，其中 7 段都是 65.9 MB/分钟，数值很稳。
+（本文档早期版本写的「1.5 Mbps / 每分钟约 11MB」偏低约 6 倍，已按实测更正。）
 
 | 场景 | 录像长度 | 占用 |
 |---|---|---|
-| 保洁进来转一圈 | 约 1~2 分钟 | 11~22 MB |
-| 保洁认真打扫 | 20 分钟（分 4 段） | 约 220 MB |
-| 一次在场上限 | 30 分钟 | 约 330 MB |
+| 保洁进来转一圈 | 约 1~2 分钟 | 66~131 MB |
+| 保洁认真打扫 | 20 分钟（分 4 段） | 约 1310 MB |
+| 一次在场上限 | 30 分钟 | 约 1970 MB |
 
 `snapshot.keep_days: 30` 是按天清理，但它管不住「今天有人来了一整天」——
 一天之内照样能写出几十 GB。所以还有第二道闸门，按**体积**算：
@@ -155,6 +160,10 @@ captures/2026-10-17/
 | `storage.min_free_gb` | 3 | 磁盘剩余低于这个值，额外逼近清理到上限的一半 |
 | `storage.check_minutes` | 10 | 多久检查一次 |
 | `storage.protect_seconds` | 300 | 最近 5 分钟内写过的文件不删（可能正在录） |
+
+> **按上面这个实测码率折算，心里要有个数**：`storage.max_total_gb: 20` 大约只装得下 **5 小时**
+> 录像（20 GB ÷ 65.6 MB/分钟 ≈ 305 分钟），不是按旧数字估出来的 30 小时。
+> 想留更久就调大 `storage.max_total_gb`，或者调小 `record.max_seconds` / `camera.fps`。
 
 查当前占用：
 
@@ -460,21 +469,35 @@ python guardian.py --once
 | `logic.py` | 纯逻辑：连续帧确认、挑最好的一张、冷却、心跳、录像收尾策略、归档清理 |
 | `recorder.py` | 事件录像：环形预录缓冲 + 后台线程写 H.264 |
 | `faces.py` | 人脸检测（YuNet，只在人形框里找） |
+| `identity.py` | 人脸识别（SFace）：区分「本人」和「其他人」，决定是静默还是告警 |
 | `speaker.py` | 语音提示（预处理 + 缓存 + 后台线程播放，离线） |
 | `loudness.py` | 响度处理：切静音、高通、压缩、归一化、限幅 |
 | `audio_device.py` | 系统输出音量：查、改、运行期保底与还原 |
+| `audio_recorder.py` | 录像音轨：sounddevice 录成 WAV，收尾后用 ffmpeg 并进 mp4 |
 | `notifier.py` | 推送渠道（微信 / Server酱 / 企业微信机器人） |
 | `setup_push.py` | 推送配置引导 + 测试消息 |
 | `gallery.py` | 本地相册 + 录像播放，纯标准库（自己实现了 Range 以支持拖动进度条） |
+| `guardian.py` | 外部守护进程：watcher 进程死掉或卡死后把它拉起来 |
 | `config.yaml` | 全部可调参数 |
+| `AGENTS.md` | **项目约定与协作习惯，给 AI 助手和协作者看的。开新对话先读它** |
+| `.gitignore` | 哪些入库、哪些不入库（含每条规则的原因） |
+| `.githooks/` | 提交前检查：拦住推送凭据与隐私文件进版本库（`--self-test` 可自测） |
 | `test_logic.py` | 56 项单测，`python test_logic.py` |
 | `test_loudness.py` | 32 项单测，`python test_loudness.py`（纯数学，不需要声卡） |
 | `test_recorder.py` | 19 项，`python test_recorder.py`（真的写一段视频再读回来数帧；含数据库迁移） |
 | `test_gallery.py` | 18 项，`python test_gallery.py`（真起 HTTP 服务验证 Range 206 与目录穿越防护） |
 | `test_integration.py` | 6 项，`python test_integration.py`（假摄像头 + 假 YOLO 跑完整主循环） |
+| `test_guardian.py` | 31 项，`python test_guardian.py`（不真重启进程） |
+| `test_identity.py` | 31 项，`python test_identity.py`（合成图像，不需要真实摄像头） |
+| `test_audio_storage.py` | 24 项，`python test_audio_storage.py`（临时文件，不需要麦克风） |
 | `start-room-watch.bat` | 双击独立启动，日志写到 `watcher.log` |
-| `models/` | YuNet 人脸检测模型（230KB） |
+| `start-with-guardian.bat` | 双击启动：守护进程 + 监控一起拉起来 |
+| `install-autostart.ps1` | 配置开机自启（需要你亲手执行） |
+| `models/` | YuNet 人脸检测模型（230KB）与 SFace 人脸识别模型（37MB），**必须入库**：本机下载实测仅 20KB/s |
 | `voice_cache/` | 处理后的语音 + 实测增益报告（可删，会自动重建） |
+
+八个测试文件合计 **217 项**（56+32+19+18+31+31+24+6），全部可离线运行：
+不联网、不发推送、不占用真实摄像头。直接跑文件即可，不需要 `-m unittest`。
 
 ## 检测逻辑：为什么不是"一有人就拍"
 
