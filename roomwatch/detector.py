@@ -21,7 +21,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from logic import Detection
+from .paths import resolve
+from .rules import Detection
 
 log = logging.getLogger("room-watch")
 
@@ -64,10 +65,9 @@ class FaceFinder:
         model_path = cfg.get("model")
         if not model_path:
             model_path = os.path.join(DEFAULT_MODEL_DIR, YUNET_NAME)
-        if not os.path.isabs(model_path):
-            model_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), model_path
-            )
+        # 相对路径按项目根解析，而不是按本文件所在目录 ——
+        # 包化后 __file__ 在 roomwatch/ 里，models/ 却在项目根。
+        model_path = resolve(model_path)
 
         if os.path.exists(model_path):
             try:

@@ -39,7 +39,7 @@ import threading
 import time
 from typing import Optional, Tuple
 
-import loudness
+from . import loudness
 
 log = logging.getLogger("room-watch")
 

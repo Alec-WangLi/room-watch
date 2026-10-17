@@ -17,12 +17,11 @@ import re
 import sys
 from urllib.parse import unquote, urlparse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from logic import gap_seconds
+from .paths import CAPTURES_DIR, STATE_DIR
+from .rules import gap_seconds
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -174,7 +173,7 @@ def render(
 ) -> str:
     days = collect(captures_dir)
     if not days:
-        body = '<p class="empty">还没有抓拍。先跑 <code>python watcher.py --dry-run</code> 看看。</p>'
+        body = '<p class="empty">还没有抓拍。先跑 <code>rw dry-run</code> 看看。</p>'
         count = 0
     else:
         count = sum(len(i) for _d, i in days)
@@ -321,14 +320,14 @@ class Handler(SimpleHTTPRequestHandler):
         pass
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="本地抓拍相册")
-    ap.add_argument("--captures", default="captures")
+    ap.add_argument("--captures", default=str(CAPTURES_DIR))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--status-file", default="status.json")
+    ap.add_argument("--status-file", default=str(STATE_DIR / "status.json"))
     ap.add_argument("--stale-after", type=float, default=120.0)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     Handler.captures_dir = os.path.abspath(args.captures)
     Handler.status_file = os.path.abspath(args.status_file)

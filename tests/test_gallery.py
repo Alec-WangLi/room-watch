@@ -9,6 +9,12 @@ Range 之所以值得专门测：标准库 SimpleHTTPRequestHandler 不支持 Ra
 
 from __future__ import annotations
 
+# 直接运行 tests/xxx.py 时把项目根加入 sys.path；`rw test` / `-m unittest` 不需要这一步。
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import os
 import shutil
 import tempfile
@@ -21,7 +27,7 @@ from http.server import ThreadingHTTPServer
 import cv2
 import numpy as np
 
-import gallery
+from roomwatch import gallery
 
 SIZE = (320, 180)
 FPS = 10.0

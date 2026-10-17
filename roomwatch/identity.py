@@ -48,10 +48,12 @@ from typing import Optional, Sequence
 
 import numpy as np
 
+from .paths import resolve
+
 log = logging.getLogger("room-watch")
 
 DEFAULT_MODEL = "models/face_recognition_sface_2021dec.onnx"
-DEFAULT_OWNER_FILE = "identity/owner.npz"
+DEFAULT_OWNER_FILE = "data/identity/owner.npz"
 FEATURE_DIM = 128
 
 # 身份标签
@@ -61,9 +63,8 @@ LABEL_UNKNOWN = "unknown"
 
 
 def _abs(path: str) -> str:
-    if os.path.isabs(path):
-        return path
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    """相对路径落到项目根下（不是本文件所在目录，见 paths.py 的说明）。"""
+    return resolve(path)
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

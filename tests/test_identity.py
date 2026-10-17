@@ -8,12 +8,18 @@
 
 from __future__ import annotations
 
+# 直接运行 tests/xxx.py 时把项目根加入 sys.path；`rw test` / `-m unittest` 不需要这一步。
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import os
 import unittest
 
 import numpy as np
 
-import identity as I
+from roomwatch import identity as I
 
 
 def unit(v):
@@ -161,7 +167,7 @@ class TestShiftRow(unittest.TestCase):
     """关键点坐标平移——这是最容易静默出错的一步。"""
 
     def test_box_and_points_shifted(self):
-        from faces import FaceFinder
+        from roomwatch.detector import FaceFinder
 
         row = np.array([10, 20, 30, 40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0.99], dtype=np.float32)
         out = FaceFinder._shift_row(row, 100, 200)
@@ -176,7 +182,7 @@ class TestShiftRow(unittest.TestCase):
         self.assertAlmostEqual(float(out[14]), 0.99)  # 置信度不动
 
     def test_original_row_untouched(self):
-        from faces import FaceFinder
+        from roomwatch.detector import FaceFinder
 
         row = np.array([1, 2, 3, 4] + [0] * 10 + [0.9], dtype=np.float32)
         before = row.copy()
@@ -208,7 +214,7 @@ class TestFindFullReturnsRow(unittest.TestCase):
     def setUp(self):
         import yaml
 
-        from faces import FaceFinder
+        from roomwatch.detector import FaceFinder
 
         self.cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
         self.ff = FaceFinder(self.cfg.get("face") or {})
@@ -219,7 +225,7 @@ class TestFindFullReturnsRow(unittest.TestCase):
     def test_row_present_and_full_width(self):
         import cv2
 
-        from logic import Detection
+        from roomwatch.rules import Detection
 
         img = cv2.imread(self.IMG)
         h, w = img.shape[:2]
@@ -244,7 +250,7 @@ class TestFindFullReturnsRow(unittest.TestCase):
         """光有关键点不够，alignCrop + feature 必须真能跑通。"""
         import cv2
 
-        from logic import Detection
+        from roomwatch.rules import Detection
 
         emb = I.FaceEmbedder(self.cfg.get("identity") or {})
         if not emb.enabled:

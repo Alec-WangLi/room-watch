@@ -10,6 +10,12 @@
 
 from __future__ import annotations
 
+# 直接运行 tests/xxx.py 时把项目根加入 sys.path；`rw test` / `-m unittest` 不需要这一步。
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import os
 import shutil
 import sqlite3
@@ -21,7 +27,7 @@ from datetime import datetime, timedelta
 import cv2
 import numpy as np
 
-from recorder import PreRollBuffer, Recorder, video_path_for
+from roomwatch.recorder import PreRollBuffer, Recorder, video_path_for
 
 SIZE = (640, 360)  # 测试用小尺寸，跑得快；真实环境是 1280x720
 FPS = 10.0
@@ -276,13 +282,13 @@ class TestEventStoreMigration(unittest.TestCase):
         return {r[1] for r in store.conn.execute("PRAGMA table_info(events)")}
 
     def test_video_column_added_to_legacy_db(self):
-        from watcher import EventStore
+        from roomwatch.watcher import EventStore
 
         store = EventStore(self._legacy_db())
         self.assertIn("video", self._columns(store))
 
     def test_can_write_video_on_legacy_db(self):
-        from watcher import EventStore
+        from roomwatch.watcher import EventStore
 
         store = EventStore(self._legacy_db())
         store.add(datetime(2026, 10, 17, 9, 3, 10), "090310.jpg", 0.93, True,
@@ -294,7 +300,7 @@ class TestEventStoreMigration(unittest.TestCase):
 
     def test_old_rows_survive_migration(self):
         """升级不能把历史记录弄丢。"""
-        from watcher import EventStore
+        from roomwatch.watcher import EventStore
 
         store = EventStore(self._legacy_db())
         total = store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
@@ -306,14 +312,14 @@ class TestEventStoreMigration(unittest.TestCase):
         self.assertIsNone(old[1], "迁移前的老行 video 应为空")
 
     def test_fresh_db_has_video_column(self):
-        from watcher import EventStore
+        from roomwatch.watcher import EventStore
 
         store = EventStore(os.path.join(self.tmp, "fresh.db"))
         self.assertIn("video", self._columns(store))
 
     def test_opening_twice_is_safe(self):
         """迁移必须可重复执行——每次启动都会跑一遍。"""
-        from watcher import EventStore
+        from roomwatch.watcher import EventStore
 
         db = self._legacy_db()
         EventStore(db)

@@ -23,6 +23,8 @@
 *.js text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
+# 仓库根的 bash 入口没有扩展名，单独规定 LF（CRLF 会让 shebang 失效）
+rw text eol=lf
 
 # ---------- Git 钩子脚本必须 LF ----------
 # pre-commit 由 Git for Windows 交给 sh 执行，CRLF 的 shebang 行会让 sh 找不到解释器。

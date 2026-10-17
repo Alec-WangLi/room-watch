@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# room-watch 全局命令（git-bash / WSL 版），与根目录 rw.cmd 等价。
+# 解释器优先级：ROOMWATCH_PYTHON → envs/default → PATH 上的 python。
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="${ROOMWATCH_PYTHON:-}"
+if [ -z "$PY" ] && [ -x "$HOME/.workbuddy/binaries/python/envs/default/Scripts/python.exe" ]; then
+  PY="$HOME/.workbuddy/binaries/python/envs/default/Scripts/python.exe"
+fi
+[ -z "$PY" ] && PY=python
+cd "$ROOT"
+exec "$PY" -m roomwatch "$@"

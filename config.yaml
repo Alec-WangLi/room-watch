@@ -19,7 +19,7 @@ detector:
   cooldown_seconds: 90  # 一次事件后 90 秒内不再报。保洁待 20 分钟也不会刷屏
 
 snapshot:
-  dir: captures     # 照片存这里，按日期分目录
+  dir: data/captures  # 照片存这里，按日期分目录（相对项目根，不是当前目录）
   keep_days: 30     # 超过 30 天自动清理。0 表示永不清理
   jpeg_quality: 90
   draw_boxes: true  # 在人身上画框 + 盖时间戳，留证更完整
@@ -97,7 +97,7 @@ identity:
   # YuNet 给出 5 个关键点，SFace 按关键点把脸摆正再提 128 维特征。
   enabled: true
   model: models/face_recognition_sface_2021dec.onnx
-  owner_file: identity/owner.npz   # 注册后的「本人模板」存这里
+  owner_file: data/identity/owner.npz   # 注册后的「本人模板」存这里
 
   # 余弦相似度阈值。官方建议 0.363，这里更严一点：
   # 认错人的代价（把保洁当你、直接免报）比多认一次的代价大得多。
@@ -130,7 +130,7 @@ voice:
   # 实测 SAPI5 在 volume=1.0 时输出峰值只有 -11.8 dBFS，
   # 引擎自己浪费了约 12 dB。所以真正的响度在这一段处理：合成后重新做振幅。
   preprocess: true          # 合成一次 → 处理后缓存 → 每次播缓存。关掉就退回实时合成（会变小声）
-  cache_dir: voice_cache    # 处理后的音频缓存目录，里面还留着增益报告，可核对
+  cache_dir: var/cache/voice   # 处理后的音频缓存目录，里面还留着增益报告，可核对
 
   loudness:
     target_peak_dbfs: -1.0  # 峰值目标。越接近 0 越响，超过 0 会削波
@@ -156,8 +156,8 @@ heartbeat:
   stale_after_seconds: 120  # 超过 120 秒没读到画面，状态页就显示「已停止」
 
 storage:
-  database: events.db   # SQLite 事件日志
-  status: status.json   # 运行状态快照，给 --status 和相册页读取
+  database: var/db/events.db   # SQLite 事件日志
+  status: var/state/status.json   # 运行状态快照，给 rw status 和相册页读取
 
   # —— 容量上限 ——
   # snapshot.keep_days 是按「天数」清理，管不住「今天有人来了一整天」这种情况：
@@ -176,9 +176,9 @@ guardian:
                           # 因为摄像头重连、模型下载都会让心跳短暂停顿
   stall_confirmations: 2  # 连续判定卡死几次才真的杀掉重启（避免误杀正在自愈的进程）
   max_backoff_seconds: 900  # 连续重启失败时的最长间隔，防止疯狂重启刷日志
-  watcher_log: watcher.log
-  state: guardian_state.json
-  lock: guardian.lock
+  watcher_log: var/logs/watcher.log
+  state: var/state/guardian_state.json
+  lock: var/state/guardian.lock
   python: null            # null = 用当前解释器
 
 notify:

@@ -24,7 +24,7 @@ import yaml
 
 import json
 
-from logic import (
+from .rules import (
     ACTION_BEST,
     ACTION_FIRE,
     ACTION_START,
@@ -43,15 +43,17 @@ from logic import (
     snapshot_path,
     usage_bytes,
 )
-import audio_device
-import loudness
-import speaker
-from audio_recorder import AudioRecorder, pre_roll_delay_ms
-from faces import FaceFinder
-from identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker
-from notifier import Notifier
-from recorder import Recorder, video_path_for
-from speaker import Speaker
+from . import audio_device
+from . import loudness
+from . import paths
+from . import speaker
+from .paths import resolve
+from .audio_recorder import AudioRecorder, pre_roll_delay_ms
+from .detector import FaceFinder
+from .identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker
+from .notifier import Notifier
+from .recorder import Recorder, video_path_for
+from .speaker import Speaker
 
 log = logging.getLogger("room-watch")
 
@@ -62,9 +64,32 @@ BACKENDS = {
 }
 
 
+# 这些键指向磁盘上的文件/目录。config.yaml 里允许写相对路径，
+# 但基准必须是**项目根**而不是当前工作目录——否则从别的目录启动就会
+# 找不到自己的 captures / events.db / 模型（包化前的老问题）。
+# 集中在这里解析一次，下游一律当绝对路径使用。
+_PATH_KEYS = (
+    ("detector", "model"),
+    ("face", "model"),
+    ("identity", "owner_file"),
+    ("snapshot", "dir"),
+    ("storage", "database"),
+    ("storage", "status"),
+    ("voice", "cache_dir"),
+    ("guardian", "watcher_log"),
+    ("guardian", "state"),
+    ("guardian", "lock"),
+)
+
+
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        cfg = yaml.safe_load(f) or {}
+    for section, key in _PATH_KEYS:
+        block = cfg.get(section)
+        if isinstance(block, dict) and block.get(key):
+            block[key] = resolve(block[key])
+    return cfg
 
 
 def idle_seconds_windows() -> float:
@@ -160,7 +185,7 @@ class Watcher:
         )
 
         snap = cfg.get("snapshot") or {}
-        self.snap_dir = snap.get("dir", "captures")
+        self.snap_dir = snap.get("dir") or resolve("data/captures")
         self.keep_days = int(snap.get("keep_days", 30))
         self.jpeg_quality = int(snap.get("jpeg_quality", 90))
         self.draw_boxes = bool(snap.get("draw_boxes", True))
@@ -203,8 +228,8 @@ class Watcher:
         self.stale_seconds = float(heartbeat.get("stale_after_seconds", 120))
 
         storage = cfg.get("storage") or {}
-        self.status_path = storage.get("status", "status.json")
-        self.store = EventStore(storage.get("database", "events.db"))
+        self.status_path = storage.get("status") or resolve("var/state/status.json")
+        self.store = EventStore(storage.get("database") or resolve("var/db/events.db"))
         self.notifier = Notifier(cfg.get("notify") or {})
 
         # 容量上限：keep_days 管不住「一天之内写满盘」，所以再加一道体积闸门
@@ -765,8 +790,10 @@ class Watcher:
         if not ok:
             log.error("读不到画面")
             sys.exit(3)
-        cv2.imwrite("preview.jpg", frame)
-        log.info("已保存 preview.jpg（%sx%s），打开看看角度对不对", frame.shape[1], frame.shape[0])
+        os.makedirs(paths.MEDIA_DIR, exist_ok=True)
+        out = paths.MEDIA_DIR / "preview.jpg"
+        cv2.imwrite(str(out), frame)
+        log.info("已保存 %s（%sx%s），打开看看角度对不对", out, frame.shape[1], frame.shape[0])
         self.cap.release()
 
 
@@ -886,7 +913,7 @@ def print_storage(config_path: str) -> None:
     """看存储占用、上限，以及最旧/最新文件。"""
     cfg = load_config(config_path)
     snap = cfg.get("snapshot") or {}
-    directory = snap.get("dir", "captures")
+    directory = snap.get("dir") or resolve("data/captures")
     st = cfg.get("storage") or {}
     max_gb = float(st.get("max_total_gb", 20))
     min_free_gb = float(st.get("min_free_gb", 3))
@@ -935,9 +962,9 @@ def print_storage(config_path: str) -> None:
             print(f"  {ext:<6s} {cnt:5d} 个   {size / (1024 ** 2):9.1f} MB")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="房间进入检测与抓拍")
-    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--config", default=resolve("config.yaml"))
     parser.add_argument("--dry-run", action="store_true", help="抓拍但不推送")
     parser.add_argument("--probe", action="store_true", help="只拍一张预览图然后退出")
     parser.add_argument("--status", action="store_true", help="打印监控是否还在线")
@@ -956,7 +983,7 @@ def main() -> None:
                         help="测试识别：判断这张图里的人是不是你")
     parser.add_argument("--storage", action="store_true",
                         help="查看存储占用、容量上限与最旧文件")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     handlers = [logging.StreamHandler()]
     if args.log:
@@ -1029,7 +1056,7 @@ def main() -> None:
 def print_status(config_path: str) -> None:
     """读 watcher 写下的 status.json，判断它是否还活着。"""
     cfg = load_config(config_path)
-    path = (cfg.get("storage") or {}).get("status", "status.json")
+    path = (cfg.get("storage") or {}).get("status") or resolve("var/state/status.json")
 
     if not os.path.exists(path):
         print("监控未运行（找不到 status.json）")

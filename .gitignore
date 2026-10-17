@@ -61,7 +61,7 @@ __pycache__/
 # ---------- 6. 本机真实凭据的约定存放处（不入库） ----------
 # config.yaml 入库且只放占位串。若要在本机长期保留真实推送凭据，
 # 复制一份 config.local.yaml 填真值，启动时用 --config config.local.yaml 指定
-# （watcher.py:940 与 guardian.py:438 都支持 --config）。该文件永不入库。
+# （rw start / rw guard 都接受 --config）。该文件永不入库。
 config.local.yaml
 
 # ---------- 7. WorkBuddy 工作区 ----------
@@ -72,3 +72,13 @@ config.local.yaml
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---------- 9. 重构后的运行时目录（2026-10-18） ----------
+# data/ = 隐私数据（抓拍、录像、人脸模板）；var/ = 可重建的状态、日志、缓存、产物。
+# 整目录忽略比逐条列举更不容易漏：将来新增 var/reports 之类不会意外入库。
+/data/
+/var/
+# 打包产物（PyInstaller）
+/build/
+/dist/
+*.spec

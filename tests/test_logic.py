@@ -5,6 +5,12 @@
 
 from __future__ import annotations
 
+# 直接运行 tests/xxx.py 时把项目根加入 sys.path；`rw test` / `-m unittest` 不需要这一步。
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import json
 import os
 import shutil
@@ -12,7 +18,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 
-from logic import (
+from roomwatch.rules import (
     RECORD_CONTINUE,
     RECORD_STOP_IDLE,
     RECORD_STOP_MAX,
@@ -255,7 +261,7 @@ class TestStatusAfterHardKill(unittest.TestCase):
             json.dump(data, f)
 
     def test_killed_process_reports_stopped(self):
-        import gallery
+        from roomwatch import gallery
 
         self._write(last_frame_at=(datetime.now() - timedelta(minutes=10)).isoformat())
         out = gallery.read_status(self.path, stale_after=120)
@@ -263,14 +269,14 @@ class TestStatusAfterHardKill(unittest.TestCase):
         self.assertNotIn("在线", out)
 
     def test_live_process_reports_online(self):
-        import gallery
+        from roomwatch import gallery
 
         self._write(last_frame_at=datetime.now().isoformat())
         out = gallery.read_status(self.path, stale_after=120)
         self.assertIn("在线", out)
 
     def test_missing_status_file(self):
-        import gallery
+        from roomwatch import gallery
 
         self.assertIn("监控未运行", gallery.read_status(os.path.join(self.tmp, "nope.json")))
 
@@ -332,7 +338,7 @@ class TestGallery(unittest.TestCase):
         shutil.rmtree(self.base, ignore_errors=True)
 
     def test_render_keeps_css_braces(self):
-        import gallery
+        from roomwatch import gallery
 
         html = gallery.render(self.base)
         self.assertIn("font-family", html)
@@ -340,14 +346,14 @@ class TestGallery(unittest.TestCase):
         self.assertNotIn("{days}", html)
 
     def test_render_lists_snapshots(self):
-        import gallery
+        from roomwatch import gallery
 
         html = gallery.render(self.base)
         self.assertIn("2026-10-16/143012.jpg", html)
         self.assertIn("14:30:12", html)
 
     def test_render_empty_dir(self):
-        import gallery
+        from roomwatch import gallery
 
         self.assertIn("还没有抓拍", gallery.render("definitely-not-here"))
 

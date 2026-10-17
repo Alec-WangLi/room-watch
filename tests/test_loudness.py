@@ -10,6 +10,12 @@
 
 from __future__ import annotations
 
+# 直接运行 tests/xxx.py 时把项目根加入 sys.path；`rw test` / `-m unittest` 不需要这一步。
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import math
 import os
 import tempfile
@@ -17,7 +23,7 @@ import unittest
 
 import numpy as np
 
-import loudness as L
+from roomwatch import loudness as L
 
 RATE = 22050
 

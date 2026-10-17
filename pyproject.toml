@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "room-watch"
+description = "房间进入抓拍：YOLO 人形检测 + 人脸识别 + 录像 + 本地相册"
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+# 运行时依赖故意不写在这里：本机的 cv2 / ultralytics / torch 由既有环境提供，
+# 版本以 requirements.txt 为准。若在这里声明，`pip install -e .` 会试图
+# 重装 2GB 的 torch —— 那是本机下载最慢的一环，不该由元数据触发。
+dependencies = []
+
+[project.scripts]
+# 安装后可直接在任意目录敲 rw；未安装时用仓库根的 rw.cmd（Windows）或 rw（bash）。
+rw = "roomwatch.cli:main"
+
+[tool.setuptools]
+packages = ["roomwatch"]
+
+[tool.setuptools.dynamic]
+version = { attr = "roomwatch.__version__" }

@@ -137,7 +137,7 @@ def send_test(channel: str, creds: dict) -> bool:
     return False
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="推送配置引导")
     ap.add_argument("--channel", choices=CHANNELS)
     ap.add_argument("--token")
@@ -145,7 +145,7 @@ def main() -> int:
     ap.add_argument("--sendkey")
     ap.add_argument("--webhook")
     ap.add_argument("--no-test", action="store_true", help="只写配置，不发测试消息")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     channel = args.channel or pick_channel()
     creds = collect_creds(channel, args)

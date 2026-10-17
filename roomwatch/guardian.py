@@ -59,6 +59,8 @@ from typing import Optional
 
 import yaml
 
+from .paths import PROJECT_ROOT, resolve
+
 log = logging.getLogger("guardian")
 
 # decide() 的返回值
@@ -68,11 +70,11 @@ ACT_RESTART_GONE = "restart_gone"      # 进程没了
 ACT_RESTART_STALLED = "restart_stalled"  # 进程在但心跳停了
 ACT_BACKOFF = "backoff"          # 在退避窗口内，先不动
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = str(PROJECT_ROOT)
 
 
 def _abs(path: str) -> str:
-    return path if os.path.isabs(path) else os.path.join(HERE, path)
+    return resolve(path)
 
 
 def pid_alive(pid: Optional[int]) -> bool:
@@ -305,7 +307,9 @@ class Guard:
         """拉起 watcher。返回新 PID（拿不到就 None）。"""
         cmd = [
             self.python,
-            os.path.join(HERE, "watcher.py"),
+            "-m",
+            "roomwatch",
+            "start",
             "--config",
             self.config_path,
             "--log",
@@ -433,13 +437,13 @@ def load_config(path: str) -> dict:
     return cfg
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="room-watch 守护进程")
-    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--config", default=resolve("config.yaml"))
     ap.add_argument("--once", action="store_true", help="只检查一次就退出（给计划任务用）")
     ap.add_argument("--status", action="store_true", help="打印当前状态与重启历史")
     ap.add_argument("--dry-run", action="store_true", help="只报告该做什么，不真的重启")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO,

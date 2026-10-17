@@ -16,6 +16,12 @@
 
 from __future__ import annotations
 
+# 直接运行 tests/xxx.py 时把项目根加入 sys.path；`rw test` / `-m unittest` 不需要这一步。
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import os
 import shutil
 import sqlite3
@@ -26,7 +32,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-import watcher
+from roomwatch import watcher
 
 SIZE = (320, 180)
 FPS = 10.0

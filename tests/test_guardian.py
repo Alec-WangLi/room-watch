@@ -8,13 +8,19 @@
 
 from __future__ import annotations
 
+# 直接运行 tests/xxx.py 时把项目根加入 sys.path；`rw test` / `-m unittest` 不需要这一步。
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import os
 import shutil
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 
-import guardian as G
+from roomwatch import guardian as G
 
 
 LIVE_PID = os.getpid()
