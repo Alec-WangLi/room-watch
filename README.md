@@ -16,6 +16,20 @@
 
 ## 快速开始
 
+### 第 0 步（只做一次，新克隆必做）：启用提交前检查
+
+在本目录双击 `setup-hooks.bat`（命令行运行亦可）。
+
+它只做一件事：把 Git 的 `core.hooksPath` 指向 `.githooks`，让提交前检查生效。
+
+**为什么非做不可**：`core.hooksPath` 是**本地配置，不随仓库分发**，所以每一份新克隆默认都是
+零保护状态。不启用的话，`config.yaml` 里填的真实推送凭据、以及 `captures/` 下的抓拍与录像，
+可以无声无息地进 Git 历史 —— **而进了历史就再也删不干净**（删文件也抹不掉历史里的对象）。
+
+脚本会回显验证结果（应当看到 `hooksPath : .githooks`，而不是空白），并顺手汇报一次当前
+`config.yaml` 的检查结论（「通过」还是「被拦」）。它是幂等的，重复运行没有任何副作用，
+也不会启动 watcher 或 gallery。
+
 ```bash
 # 1. 装依赖
 pip install -r requirements.txt
@@ -490,6 +504,7 @@ python guardian.py --once
 | `test_guardian.py` | 31 项，`python test_guardian.py`（不真重启进程） |
 | `test_identity.py` | 31 项，`python test_identity.py`（合成图像，不需要真实摄像头） |
 | `test_audio_storage.py` | 24 项，`python test_audio_storage.py`（临时文件，不需要麦克风） |
+| `setup-hooks.bat` | **启用 Git 提交前检查**（幂等，双击即可）。新克隆必跑，见「快速开始」第 0 步 |
 | `start-room-watch.bat` | 双击独立启动，日志写到 `watcher.log` |
 | `start-with-guardian.bat` | 双击启动：守护进程 + 监控一起拉起来 |
 | `install-autostart.ps1` | 配置开机自启（需要你亲手执行） |
