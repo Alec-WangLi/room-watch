@@ -342,7 +342,15 @@ done
 ## G. 当前已知待办（含为何暂缓）
 
 按「要么现在做完、要么写明为何暂缓」的要求列出。本次任务范围是建 Git 基建与写约定文档，
-因此下面这些**不在本次范围**，逐条写明原因：
+因此下面这些**不在本次范围**，逐条写明原因。
+
+**2026-10-18 已解决、已从清单移除的两项**（保留记录以免有人重复做）：
+- `README.md:473` 的用例数「16 项」已改为「18 项」（commit `e5455cf`，diff 为 +1/-1）。
+- `start-room-watch.bat` / `start-with-guardian.bat` / `install-autostart.ps1` 的磁盘换行已转成 CRLF。
+  转换前后做了哈希等价性验证（CRLF 全换回 LF 后 sha256 一致），内容零变化。
+  **注意：这次转换没有产生新的 commit，也不需要** —— `.gitattributes` 的 `text eol=crlf`
+  让 CRLF 的工作区文件规范化后与 HEAD 中的 blob 完全同一对象（`git hash-object` 与
+  `git rev-parse HEAD:<file>` 结果相同），`git diff` 为空，无可提交内容。
 
 1. **gallery 的长期守护方案未定** —— 后台任务方式会被系统回收（2026-10-17 23:22 前后实测发生过，
    进程死亡、8765 无监听）。`guardian.py` 目前只守护 watcher，不管 gallery。
@@ -351,15 +359,5 @@ done
 2. **录像在用户本人坐在电脑前时仍会录** —— `behavior.skip_when_user_active` 只抑制推送，不抑制录像。
    实测 14 分钟产出 4 段 mp4 共 653MB（约 46MB/分钟），长期会吃满磁盘。
    **暂缓原因**：这是产品决策（是否接受把自己也录下来），需用户拍板；改完还需重启 watcher。
-3. **`README.md:473` 仍写着「test_gallery.py 16 项」，实际是 18 项**（2026-10-17 23:15 修裂图问题时加了两个用例）。
-   **暂缓原因**：本次任务明确约定 `README.md` 只读，如需修正请交由用户确认后单独改。
-4. **`start-room-watch.bat` / `start-with-guardian.bat` / `install-autostart.ps1` 目前在磁盘上仍是 LF**。
-   版本库里存的已经是规范化后的 LF（`git ls-files --eol` 显示 `i/lf`，且 attr 列为 `text eol=crlf`），
-   所以**索引没有问题、不需要修**。差别只在工作区：这三个文件是首次提交前就存在的，git 还没往磁盘写过它们。
-   证据：`git add` 时 git 打印过
-   `warning: in the working copy of 'start-room-watch.bat', LF will be replaced by CRLF the next time Git touches it`。
-   下次任何一次检出（新克隆、`git checkout`、`git reset --hard`）它们就会变成 CRLF。
-   想在本机立刻生效：删掉这三个文件后 `git checkout -- start-room-watch.bat start-with-guardian.bat install-autostart.ps1`。
-   **暂缓原因**：本次任务约定不改动磁盘上已有文件的内容，故只在文档里写清楚，未擅自转换。
-5. **`.gitignore` 里的 `config.local.yaml` 是一个约定而非现存文件** —— 目前磁盘上没有它。
+3. **`.gitignore` 里的 `config.local.yaml` 是一个约定而非现存文件** —— 目前磁盘上没有它。
    它是为 E.4 第 2 条方案预留的位置，只有当你真的要用「本机真凭据」方案时才创建。
