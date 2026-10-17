@@ -470,7 +470,7 @@ python guardian.py --once
 | `test_logic.py` | 56 项单测，`python test_logic.py` |
 | `test_loudness.py` | 32 项单测，`python test_loudness.py`（纯数学，不需要声卡） |
 | `test_recorder.py` | 19 项，`python test_recorder.py`（真的写一段视频再读回来数帧；含数据库迁移） |
-| `test_gallery.py` | 16 项，`python test_gallery.py`（真起 HTTP 服务验证 Range 206 与目录穿越防护） |
+| `test_gallery.py` | 18 项，`python test_gallery.py`（真起 HTTP 服务验证 Range 206 与目录穿越防护） |
 | `test_integration.py` | 6 项，`python test_integration.py`（假摄像头 + 假 YOLO 跑完整主循环） |
 | `start-room-watch.bat` | 双击独立启动，日志写到 `watcher.log` |
 | `models/` | YuNet 人脸检测模型（230KB） |
