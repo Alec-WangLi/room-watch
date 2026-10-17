@@ -290,7 +290,7 @@ done
 - **原因**：`events_today` 只在进程内存里累加，不落盘。
 - **正解**：真实事件数查 `events.db`（SQLite，`storage.database`）。判断「今天有没有人进来」不要只看 `events_today`。
 
-### D.10 三个 Python 里只有一个能跑（本条为本次建库时新增确认）
+### D.10 四个 Python 里只有一个能跑（本条为本次建库时新增确认）
 
 - **现象**：`python watcher.py` 报 `ModuleNotFoundError: No module named 'cv2'`。
 - **原因**：git-bash 的 PATH 把 `python` 解析到了没有项目依赖的解释器。
@@ -371,6 +371,18 @@ done
 - 本机 git 全局 `core.autocrlf=true`，靠 `.gitattributes` 覆盖它。
 - 仓库本地已设 `core.quotepath=false`，`git status` 不会把中文路径转义成 `\344\275\240` 这种形式。
 - `.githooks/pre-commit` 被单独规定为 LF：CRLF 的 shebang 会让 Git for Windows 的 sh 找不到解释器，钩子会静默失效。
+- **三个 `.bat`（`setup-hooks.bat` / `start-room-watch.bat` / `start-with-guardian.bat`）必须带 UTF-8 BOM（`EF BB BF`），
+  并且开头必须是两行：`@echo off 2>nul` 紧接 `@echo off`**。原因是两个独立的坑：
+  1. 无 BOM 时 cmd.exe 用机器代码页（本机 936/GBK）解码文件字节，中文 `echo` 行会被从中间劈开，
+     后半段被当成命令执行，报 `'...' is not recognized as an internal or external command`。
+  2. 有 BOM 时 cmd.exe **也不是每次都识别**（实测：新会话里第一次启动的 cmd 不识别，可重复）。
+     一旦不识别，BOM 三个字节会粘到第 1 行开头，`@echo off` 就不再算行首 token，
+     结果是整个文件回显全开 + 报 `'@echo' is not recognized`。
+     加 `2>nul` 让第 1 行静默失败，第 2 行无论如何都能关掉回显。
+  **改动 `.bat` 时不要丢掉 BOM、不要删掉这两行、也不要存成 ANSI/GBK**；注释行保持 ASCII 作为额外保险。
+- **未处理项（已知，不在本次范围）**：`install-autostart.ps1` 有 24 行中文且**无 BOM**。PowerShell 5.1
+  对无 BOM 的 `.ps1` 按 ANSI 解码，中文会显示成乱码（不会像 cmd 那样劈行，严重性低一档）。
+  修法与上面相同（加 BOM），但本次未改，等确认后再动。
 
 ---
 
@@ -420,6 +432,13 @@ done
   **注意：这次转换没有产生新的 commit，也不需要** —— `.gitattributes` 的 `text eol=crlf`
   让 CRLF 的工作区文件规范化后与 HEAD 中的 blob 完全同一对象（`git hash-object` 与
   `git rev-parse HEAD:<file>` 结果相同），`git diff` 为空，无可提交内容。
+
+**2026-10-18 第 2 轮 QA 回归修复的一项**（同样保留记录）：
+- 三个 `.bat`（`setup-hooks.bat` / `start-room-watch.bat` / `start-with-guardian.bat`）已加 UTF-8 BOM。
+  修复前实测：`setup-hooks.bat` 的失败分支会把「钩子本身已启用成功，这一步只是告诉你当前
+  config.yaml 的状态。」这句从「，」处劈开，后半段被当命令执行，输出
+  `'这一步只是告诉你当前' is not recognized as an internal or external command`。
+  加 BOM 后两句提示都能完整打印，退出码仍为 1。详见 E.5。
 
 1. **gallery 的长期守护方案未定** —— 后台任务方式会被系统回收（2026-10-17 23:22 前后实测发生过，
    进程死亡、8765 无监听）。`guardian.py` 目前只守护 watcher，不管 gallery。

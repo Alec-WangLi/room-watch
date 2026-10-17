@@ -1,4 +1,8 @@
+﻿@echo off 2>nul
 @echo off
+rem  UTF-8 with BOM. Keep BOTH echo-off lines: cmd.exe does not always
+rem  honour the BOM, and then line 1 fails silently while line 2 still
+rem  turns echo off. Full explanation in setup-hooks.bat.
 chcp 65001 >nul
 title 房间监控 - 守护模式
 cd /d "%~dp0"
