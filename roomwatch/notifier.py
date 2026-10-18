@@ -53,7 +53,7 @@ class Notifier:
         c = self.cfg.get("wxpusher") or {}
         token = c.get("app_token", "").strip()
         uid = c.get("uid", "").strip()
-        if not token or not uid or token.startswith("AT_xxx"):
+        if not token or not uid or "replace_me" in token.lower():
             log.warning("WxPusher 未配置 app_token / uid，跳过推送")
             return False
 
@@ -74,7 +74,9 @@ class Notifier:
     def _serverchan(self, text: str) -> bool:
         c = self.cfg.get("serverchan") or {}
         key = c.get("sendkey", "").strip()
-        if not key or key.startswith("SCT"):
+        # 只认占位符，不能按前缀判断——真实 SendKey 同样以 SCT 开头，
+        # 旧写法 key.startswith("SCT") 会把真 key 当成没配置，永久静默。
+        if not key or "replace_me" in key.lower():
             log.warning("Server酱 未配置 sendkey，跳过推送")
             return False
 
@@ -97,6 +99,10 @@ class Notifier:
             return False
 
         ok = True
+        if image_bytes and not isinstance(image_bytes, (bytes, bytearray)):
+            # 防御：调用方把标题/正文误传进第二个参数时，别让整条推送挂掉
+            log.warning("image_bytes 不是字节（%s），本次只发文字", type(image_bytes).__name__)
+            image_bytes = None
         if image_bytes:
             import base64
 

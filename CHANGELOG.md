@@ -9,6 +9,63 @@
 
 ---
 
+## [0.2.1] - 2026-10-18
+
+### 修复
+
+- **心跳推送从来没发成功过**。`maybe_heartbeat` 写的是 `notifier.send("监控在线", text)`，
+  而 `send()` 的第二个参数是**图片字节**：正文被拿去做 base64，抛
+  `a bytes-like object is required`，整条推送失败。切到企业微信后才暴露；
+  wxpusher 时期更隐蔽——它只取第一个参数，于是永远只发出「监控在线」四个字。
+  现在改为 `send(text)`，并在 `_wecom_bot` 里对非字节的第二参数做防御。
+- **Server酱 渠道永久静默**。判定写成 `sendkey.startswith("SCT")`，
+  而真实 SendKey 同样以 SCT 开头，于是真 key 被当成「没配置」直接跳过。
+  改为只认占位符（`replace_me`）。
+
+- **`rw push` 写入 webhook 的双嵌套 bug**（真机实测发现）。旧逻辑只替换
+  `key=REPLACE_ME` 里的占位符，用户粘完整地址时配置里变成
+  `?key=https://qyapi.../send?key=xxx`。文字消息接口校验宽松，照样「测试成功」；
+  `upload_media` 严格校验 key，直接 `40058 invalid param 'key'` ——
+  表现是「文字能收到、录像永远发不出」。
+  新增 `normalize_wecom_webhook()` 统一剥 key，并改用整行替换。
+
+### 变更
+
+- **凭据迁到 `config.local.yaml`（只写差异）**，新增 `roomwatch/config.py`：
+  启动时自动深合并同目录的 `config.local.yaml`，`config.yaml` 保持占位串、
+  一个字都不被写。不再需要 `rw start --config config.local.yaml`。
+- `rw push` 只写 `config.local.yaml`，且按 key 合并——换渠道不会清掉其它渠道凭据。
+
+### 实测
+
+- 企业微信群机器人（内部群）实收：文字 ✓、图片 ✓、录像 ✓。
+- `rw push-video` 36.2MB/33.7s → 0.5MB；94.7MB/85.7s → 2.8MB，均上传成功。
+
+---
+
+## [0.2.0] - 2026-10-18
+
+### 新增
+
+- **录像也能发到微信了**（`roomwatch/videopush.py`）。企业微信群机器人没有视频消息
+  类型，只能发文件：ffmpeg 瘦身到 `video.max_mb`（默认 18，官方硬上限 20）
+  → `upload_media` 换 `media_id` → 发 `file` 消息。
+- **`rw push-video PATH`**：单独验证录像推送，不用等一次真实事件。
+- **音轨合并完成回调**（`AudioRecorder.merge_async(on_done=...)`）：视频推送挂在合并
+  之后，避免发出没有声音的哑巴视频。
+- 配置项 `notify.wecom_bot.send_video` 与 `notify.wecom_bot.video.{max_mb,width,fps,audio}`。
+
+### 变更
+
+- 图片与录像共用同一道推送闸门 `Watcher.notify_allowed()`（dry-run 不发、本人在电脑前不发）。
+
+### 实测
+
+- 本机 ffmpeg 9.0：36.2 MB/33.7 s → 0.52 MB（0.6 s）；99.3 MB/85.7 s → 2.84 MB（1.1 s）。
+- 全部在后台线程串行执行，队列上限 8，满了丢弃，不拖慢检测主循环。
+
+---
+
 ## [0.1.0] - 2026-10-18
 
 第一个有明确版本号、统一入口和桌面界面的版本。功能与 0.0.x（未编号时期）一致，

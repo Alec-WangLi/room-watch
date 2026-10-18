@@ -39,6 +39,8 @@ YOLO 人形检测  yolov8n.pt / detector.conf / detector.imgsz          （confi
    ↓
 播报 + 推送    SAPI5 离线合成（voice.require_face=true）
               notify.channel = wxpusher / serverchan / wecom_bot / none
+              wecom_bot 支持图（base64）与录像（转码→upload_media→file）
+              （notifier.py 发图；videopush.py 发视频，走后台队列）
    ↓
 本地相册      gallery.py，127.0.0.1:8765，jpg 当封面、点开播 mp4
    ↓
@@ -57,13 +59,15 @@ YOLO 人形检测  yolov8n.pt / detector.conf / detector.imgsz          （confi
 | `roomwatch/detector.py` | 人脸检测（YuNet，Haar 兜底） | 原 `faces.py` |
 | `roomwatch/identity.py` | 人脸识别（SFace）+ 多帧投票 | |
 | `roomwatch/speaker.py` / `loudness.py` | SAPI5 语音 / 响度增益 | |
-| `roomwatch/notifier.py` | 推送渠道 | |
+| `roomwatch/notifier.py` | 推送渠道（文字 + 图片） | |
+| `roomwatch/videopush.py` | 录像推送：ffmpeg 瘦身 → `upload_media` → 发文件 | 后台单线程队列，队列满即丢弃，不阻塞主循环 |
 | `roomwatch/gallery.py` | 本地相册 HTTP | 只用标准库，自实现 Range |
 | `roomwatch/guardian.py` | 守护进程（判活/退避/单实例锁） | |
 | `roomwatch/setup_push.py` | 推送配置引导 | |
 | `roomwatch/gui.py` | 桌面界面 | 独立进程，不 import cv2 |
 | `roomwatch/cli.py` | 全局命令表与参数翻译 | 新增命令先改这里 |
 | `roomwatch/paths.py` | 项目根 / 运行时目录 / 解释器发现 | 路径基准的唯一来源 |
+| `roomwatch/config.py` | 配置加载：主配置 + `config.local.yaml` 深合并 + 路径归一 | 别在别处直接 `yaml.safe_load(config.yaml)` |
 
 ---
 
@@ -122,6 +126,7 @@ sounddevice / psutil / pycaw。
 | 相册 | `rw gallery [--port 9000]` |
 | 守护 | `rw guard [--once\|--status\|--dry-run]` |
 | 推送配置 | `rw push` |
+| 验证录像推送 | `rw push-video PATH`（需 webhook 已配好） |
 | 测试 | `rw test [--fast]` |
 | 版本 | `rw version`（带 git 短哈希） |
 | 桌面界面 | `rw gui` |
@@ -168,7 +173,7 @@ sounddevice / psutil / pycaw。
 
 ## E. 测试
 
-11 个文件、261 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
+15 个文件、320 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
 
 | 文件 | 用例数 | 命令 | 需要什么 |
 |---|---:|---|---|
@@ -178,7 +183,11 @@ sounddevice / psutil / pycaw。
 | `test_gallery.py` | 18 | `python tests/test_gallery.py` | cv2，真起 HTTP（约 17 秒，占 8765） |
 | `test_guardian.py` | 31 | `python tests/test_guardian.py` | yaml + psutil，不真重启 |
 | `test_identity.py` | 31 | `python tests/test_identity.py` | cv2 + 合成图（2 项按设计跳过） |
-| `test_audio_storage.py` | 24 | `python tests/test_audio_storage.py` | 临时文件 |
+| `test_audio_storage.py` | 27 | `python tests/test_audio_storage.py` | 临时文件 |
+| `test_videopush.py` | 22 | `python tests/test_videopush.py` | 纯逻辑，ffmpeg 与 HTTP 都 mock |
+| `test_config.py` | 14 | `python tests/test_config.py` | 临时配置文件 |
+| `test_setup_push.py` | 10 | `python tests/test_setup_push.py` | 纯逻辑，不联网 |
+| `test_notifier.py` | 10 | `python tests/test_notifier.py` | 纯逻辑，HTTP 全 mock |
 | `test_integration.py` | 6 | `python tests/test_integration.py` | 假摄像头 + 假 YOLO（约 55 秒） |
 | `test_cli.py` | 18 | `python tests/test_cli.py` | 纯逻辑，不启进程 |
 | `test_paths.py` | 11 | `python tests/test_paths.py` | 纯逻辑 |
@@ -186,7 +195,7 @@ sounddevice / psutil / pycaw。
 
 全量：`rw test`（约 90 秒）；`rw test --fast` 跳过集成测试。
 
-> 2026-10-18 v0.1.0 实测：11 个文件全部 `OK`，共 261 项。
+> 2026-10-18 v0.2.1 实测：14 个文件全部 `OK`，共 310 项。
 
 ---
 
@@ -261,6 +270,21 @@ sounddevice / psutil / pycaw。
   报「找不到文件」。
 - **正解**：这两个参数用**绝对路径**（`scripts/build-exe.ps1` 已这么写）。
 
+### F.12a 推送层三个静默失效点（2026-10-18 真机连中三个）
+
+推送是最容易「看起来配好了其实没发」的模块，这三个都表现为**没有任何报错**：
+
+1. **`send(text, image_bytes)` 的第二参数是图片字节**。`maybe_heartbeat` 曾写成
+   `send("监控在线", text)`，正文被当图片做 base64 → TypeError → 整条失败。
+   企业微信下日志能看见 `a bytes-like object is required`；wxpusher 下只取第一个
+   参数，于是永久只发「监控在线」四个字，正文全丢。
+2. **`sendkey.startswith("SCT")` 把真 key 当占位符**。Server酱 的真实 SendKey 就是
+   SCT 开头。凭据判定一律用 `"replace_me" in value.lower()`，不要用前缀。
+3. **webhook 双嵌套**（详见 G.2）。文字接口宽松、`upload_media` 严格，
+   表现为「文字收得到、录像发不出」。
+
+排查口诀：文字通了不代表通道通了；先用 `rw push-video` 打一次真实录像。
+
 ### F.12 窗口程序没有控制台，排障靠追踪日志
 
 - **现象**：exe 双击没反应，看不出卡在哪。
@@ -285,6 +309,15 @@ sounddevice / psutil / pycaw。
 `config.yaml` 里四个凭据键入库时必须是占位串：
 `notify.wxpusher.app_token` / `notify.wxpusher.uid` / `notify.serverchan.sendkey` /
 `notify.wecom_bot.webhook`。
+
+真实凭据只放 `config.local.yaml`（已忽略），由 `rw push` 自动生成；
+`config.load_config()` 启动时深合并，不用改启动命令。
+
+**webhook 必须是标准地址**：`.../webhook/send?key=<key>`。
+2026-10-18 踩过——旧版 `rw push` 把用户粘的完整地址替换到 `key=REPLACE_ME` 的位置，
+得到 `?key=https://...?key=xxx` 的双嵌套。文字消息接口校验宽松照样能发，
+`upload_media` 严格校验直接 `40058 invalid param 'key'`，症状是「文字能收到、视频永远发不出」。
+现在 `setup_push.normalize_wecom_webhook()` 统一剥 key，`tests/test_setup_push.py` 钉住。
 
 **泄漏风险靠提交前钩子拦，不靠忽略文件。** 钩子：`.githooks/check_secrets.py`（判定）
 + `.githooks/pre-commit`（薄壳）。启用：`scripts\setup-hooks.bat`（幂等，会回读回显

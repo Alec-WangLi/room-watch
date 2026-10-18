@@ -94,6 +94,7 @@ Windows 下把 `./rw` 换成 `rw`（`rw.cmd` 会自己找对解释器）。
 | `rw volume-check` / `rw volume-set 70` | 音量诊断 / 设置主音量 |
 | `rw storage` | 磁盘占用与最旧文件 |
 | `rw push` | 配置推送渠道 |
+| `rw push-video PATH` | 把一段录像发到企业微信（验证视频推送） |
 | `rw test [--fast]` | 跑全部测试（`--fast` 跳过集成测试） |
 | `rw doctor` | 环境自检 |
 | `rw version` | 版本号 + 当前 git 提交 |
@@ -142,15 +143,35 @@ room-watch/
 | `identity.threshold` | 0.45 | 人脸相似度阈值 |
 | `voice.require_face` | true | 看清脸才出声 |
 | `notify.channel` | none | wxpusher / serverchan / wecom_bot |
+| `notify.wecom_bot.send_video` | true | 录像也发（先压缩到 `video.max_mb`） |
+| `notify.wecom_bot.video.max_mb` | 18 | 企业微信文件硬上限 20MB，压不到就只发文字 |
+
+### 微信里能收到什么
+
+| 渠道 | 文字 | 照片 | 录像 |
+|---|---|---|---|
+| `wecom_bot`（企业微信群机器人） | ✓ | ✓ base64 直传 | ✓ 转码后当文件发 |
+| `wxpusher` / `serverchan` | ✓ | ✗ | ✗ |
+
+只有企业微信机器人能把画面直接送到手机，且不经过任何公网图床 —— 照片不出本机。
+录像走「后台队列 + ffmpeg 瘦身」：实测 99MB/86 秒压到 2.8MB，约 1 秒完成，不卡监控。
+注意机器人只支持**内部群**，别把房间画面推进有同事的全员群。
 
 ### 推送凭据不要写在入库文件里
 
-`config.yaml` 入库，四个凭据键必须是占位串。两种做法：
+`config.yaml` 入库，四个凭据键必须是占位串。真实凭据放 **`config.local.yaml`**（已被忽略）：
 
-1. 复制一份 `config.local.yaml` 填真值（已被忽略），启动时 `rw start --config config.local.yaml`；
-2. 直接改 `config.yaml`，提交前把值改回占位串。
+```
+rw push --channel wecom_bot --webhook https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
+```
 
-提交前钩子会拦真实凭据，命中时会打印行号、值和三种修法。
+这条命令只写 `config.local.yaml`（3 行左右：渠道 + 凭据），`config.yaml` 一个字都不动。
+启动时 `roomwatch.config.load_config()` 会自动把同目录的 `config.local.yaml` **深合并**到主配置之上，
+所以启动方式不用改（`rw start` / `rw guard` / 桌面快捷方式都照旧）。
+
+比「复制一份完整配置」更好的地方：主配置改了自动跟随，不会出现「明明改了没生效」的漂移。
+
+提交前钩子仍会拦真实凭据，命中时会打印行号、值和修法。
 
 ---
 

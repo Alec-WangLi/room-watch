@@ -184,7 +184,7 @@ guardian:
 notify:
   # wxpusher | serverchan | wecom_bot | none
   # none = 只写日志，不推送（调试用）
-  channel: wxpusher
+  channel: wecom_bot
   title: 房间有人进入
 
   # —— 渠道一：WxPusher（微信）——
@@ -206,3 +206,9 @@ notify:
   # 图片走 base64，不需要公网图床，照片不出你的机器
   wecom_bot:
     webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_ME"
+    send_video: true        # 录像收尾后也发一段（先压缩到 max_mb 以内）
+    video:
+      max_mb: 18            # 官方硬上限 20，留 2MB 余量；压不到就只发文字
+      width: 854            # 压缩后的宽度，高度按比例（480p）
+      fps: 12
+      audio: true

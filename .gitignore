@@ -59,9 +59,8 @@ __pycache__/
 /tts_test.mp3
 
 # ---------- 6. 本机真实凭据的约定存放处（不入库） ----------
-# config.yaml 入库且只放占位串。若要在本机长期保留真实推送凭据，
-# 复制一份 config.local.yaml 填真值，启动时用 --config config.local.yaml 指定
-# （rw start / rw guard 都接受 --config）。该文件永不入库。
+# config.yaml 入库且只放占位串。真实推送凭据由 `rw push` 写进 config.local.yaml，
+# 启动时 config.load_config() 自动深合并（不需要 --config 指定）。该文件永不入库。
 config.local.yaml
 
 # ---------- 7. WorkBuddy 工作区 ----------

@@ -33,7 +33,7 @@ import subprocess
 import threading
 import wave
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -299,14 +299,29 @@ class AudioRecorder:
                 pass
         return video_path
 
-    def merge_async(self, video_path: str, wav_path: str, delay_ms: int = 0) -> None:
-        """合并放到后台线程——ffmpeg 要好几百毫秒，不能卡住检测主循环。"""
+    def merge_async(
+        self,
+        video_path: str,
+        wav_path: str,
+        delay_ms: int = 0,
+        on_done: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """合并放到后台线程——ffmpeg 要好几百毫秒，不能卡住检测主循环。
+
+        on_done 在合并结束后调用（参数始终是视频路径，失败也一样）。
+        视频推送要靠它排队：合并前的 mp4 还没有音轨，推上去就是哑巴视频。
+        """
 
         def _run() -> None:
             try:
                 self.merge_into(video_path, wav_path, delay_ms)
             except Exception as exc:  # noqa: BLE001
                 log.warning("后台合并音轨异常: %s", exc)
+            if on_done is not None:
+                try:
+                    on_done(video_path)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("合并完成回调异常: %s", exc)
 
         threading.Thread(target=_run, daemon=True, name="audio-merge").start()
 

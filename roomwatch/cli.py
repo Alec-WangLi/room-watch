@@ -12,7 +12,7 @@
     rw enroll / whoami                      人脸注册与验证
     rw say / ab / volume-check / volume-set 语音与音量
     rw storage                              磁盘占用
-    rw push                                 推送配置
+    rw push / push-video PATH              推送配置 / 验证录像推送
     rw test [--fast] / doctor / version     工程自检
     rw gui                                  桌面界面
 
@@ -86,6 +86,9 @@ COMMANDS: dict[str, Command] = {
     "gallery": Command("启动本地相册（默认 127.0.0.1:8765）", "gallery"),
     "guard": Command("守护进程：保证监控进程一直活着", "guardian"),
     "push": Command("配置微信/Server酱推送渠道", "setup_push"),
+    "push-video": Command("把一段录像发到企业微信（验证视频推送）：rw push-video PATH",
+                          "videopush", prefix=("--video",), takes="--video",
+                          requires_value=True),
     "test": Command("跑全部测试（--fast 跳过最慢的集成测试）"),
     "doctor": Command("环境自检：解释器、依赖、模型、目录、端口、钩子"),
     "version": Command("打印版本号"),

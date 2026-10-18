@@ -48,12 +48,14 @@ from . import loudness
 from . import paths
 from . import speaker
 from .paths import resolve
+from .config import load_config as _load_config
 from .audio_recorder import AudioRecorder, pre_roll_delay_ms
 from .detector import FaceFinder
 from .identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker
 from .notifier import Notifier
 from .recorder import Recorder, video_path_for
 from .speaker import Speaker
+from .videopush import VideoPusher
 
 log = logging.getLogger("room-watch")
 
@@ -64,32 +66,9 @@ BACKENDS = {
 }
 
 
-# 这些键指向磁盘上的文件/目录。config.yaml 里允许写相对路径，
-# 但基准必须是**项目根**而不是当前工作目录——否则从别的目录启动就会
-# 找不到自己的 captures / events.db / 模型（包化前的老问题）。
-# 集中在这里解析一次，下游一律当绝对路径使用。
-_PATH_KEYS = (
-    ("detector", "model"),
-    ("face", "model"),
-    ("identity", "owner_file"),
-    ("snapshot", "dir"),
-    ("storage", "database"),
-    ("storage", "status"),
-    ("voice", "cache_dir"),
-    ("guardian", "watcher_log"),
-    ("guardian", "state"),
-    ("guardian", "lock"),
-)
-
-
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    for section, key in _PATH_KEYS:
-        block = cfg.get(section)
-        if isinstance(block, dict) and block.get(key):
-            block[key] = resolve(block[key])
-    return cfg
+# 配置加载（含 config.local.yaml 覆盖与路径归一）已搬到 config.py。
+# 这里保留同名入口，避免调用方和历史代码到处改 import。
+load_config = _load_config
 
 
 def idle_seconds_windows() -> float:
@@ -231,6 +210,8 @@ class Watcher:
         self.status_path = storage.get("status") or resolve("var/state/status.json")
         self.store = EventStore(storage.get("database") or resolve("var/db/events.db"))
         self.notifier = Notifier(cfg.get("notify") or {})
+        # 录像推送：转码+上传要几十秒，走后台队列，不在主循环里等
+        self.video_pusher = VideoPusher(cfg.get("notify") or {}, resolve("var/cache/push"))
 
         # 容量上限：keep_days 管不住「一天之内写满盘」，所以再加一道体积闸门
         self.max_total_bytes = int(float(storage.get("max_total_gb", 20)) * (1024 ** 3))
@@ -251,6 +232,8 @@ class Watcher:
             max_total_seconds=float(rec_cfg.get("max_total_seconds", 1800.0)),
         )
         self.current_video: str | None = None
+        # 录像收尾时才知道文件名，推送文案要用事件发生的时刻，先存着
+        self.last_event_at: datetime | None = None
 
         self.cap = None
         self.model = None
@@ -308,6 +291,16 @@ class Watcher:
         if not self.skip_when_active:
             return False
         return idle_seconds_windows() < self.idle_threshold
+
+    def notify_allowed(self) -> bool:
+        """图片和视频共用同一道闸门：dry-run 不发，本人坐在电脑前不发。"""
+        if self.dry_run:
+            log.info("dry-run 模式，跳过推送")
+            return False
+        if self.user_is_active():
+            log.info("检测到你本人正在电脑前，跳过推送")
+            return False
+        return True
 
     # ---------- 身份识别 ----------
 
@@ -510,7 +503,23 @@ class Watcher:
 
         if video and wav:
             # 视频开头是预录画面（当时还没开始录音），音轨要补等长静音才对得上
-            self.audio.merge_async(video, wav, pre_roll_delay_ms(pre_frames, self.fps))
+            # 合并完成后才推视频——合并前的 mp4 还没有音轨
+            self.audio.merge_async(
+                video, wav, pre_roll_delay_ms(pre_frames, self.fps), on_done=self.push_video
+            )
+        elif video:
+            self.push_video(video)
+
+    def push_video(self, video_path: str) -> None:
+        """把一段收尾好的录像交给后台队列推送。"""
+        if not video_path or not os.path.exists(video_path):
+            return
+        if not self.notify_allowed():
+            return
+        when = self.last_event_at
+        stamp = when.strftime("%H:%M:%S") if when else os.path.basename(video_path)[:6]
+        mb = os.path.getsize(video_path) / 1048576
+        self.video_pusher.submit(video_path, f"{stamp} 房间录像（{mb:.1f} MB，已压缩）")
 
     def pump_recording(self, frame, dets: list, now: datetime) -> None:
         """每帧一次：喂帧 + 判断该不该收尾。"""
@@ -605,7 +614,11 @@ class Watcher:
             f"今日抓拍 {self.events_today} 次 · 最后画面 "
             f"{self.last_frame_at.strftime('%H:%M:%S') if self.last_frame_at else '未知'}"
         )
-        self.notifier.send("监控在线", text)
+        # 注意 send() 的第二个参数是图片字节，不是副标题。
+        # 曾误写成 send("监控在线", text)，正文被当图片做 base64，抛
+        # "a bytes-like object is required" 而整条推送失败（wxpusher 时更隐蔽：
+        # 只取第一个参数，于是永远只发出去「监控在线」四个字）。
+        self.notifier.send(text)
 
     def fire_event(self, frame, dets: list, when: datetime) -> None:
         conf = max((d.conf for d in dets), default=0.0)
@@ -615,12 +628,9 @@ class Watcher:
         if self.current_video:
             log.info("配套录像: %s", self.current_video)
 
+        self.last_event_at = when
         notified = False
-        if self.dry_run:
-            log.info("dry-run 模式，跳过推送")
-        elif self.user_is_active():
-            log.info("检测到你本人正在电脑前，跳过推送")
-        else:
+        if self.notify_allowed():
             text = f"{when.strftime('%H:%M:%S')} 检测到有人进入房间\n存档: {path}"
             if self.current_video:
                 text += f"\n录像: {self.current_video}"

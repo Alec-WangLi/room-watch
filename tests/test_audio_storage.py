@@ -23,6 +23,7 @@ import wave
 from datetime import datetime, timedelta
 
 import numpy as np
+from unittest import mock
 
 from roomwatch import audio_recorder as A
 from roomwatch import rules as L
@@ -91,6 +92,36 @@ class TestWavDuration(unittest.TestCase):
             self.assertAlmostEqual(A.wav_duration(p), 2.0, places=2)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class TestMergeAsyncCallback(unittest.TestCase):
+    """合并完成回调：视频推送要等音轨并进去之后才发，否则发出去的是哑巴视频。"""
+
+    def test_on_done_called_with_video_path(self):
+        rec = A.AudioRecorder({})
+        seen = []
+        with mock.patch.object(rec, "merge_into", return_value="v.mp4"):
+            rec.merge_async("v.mp4", "v.wav", 8000, on_done=seen.append)
+            time.sleep(0.3)
+        self.assertEqual(seen, ["v.mp4"])
+
+    def test_on_done_also_called_when_merge_failed(self):
+        rec = A.AudioRecorder({})
+        seen = []
+        with mock.patch.object(rec, "merge_into", return_value=None):
+            rec.merge_async("v.mp4", "v.wav", 0, on_done=seen.append)
+            time.sleep(0.3)
+        self.assertEqual(seen, ["v.mp4"])
+
+    def test_callback_exception_does_not_raise(self):
+        rec = A.AudioRecorder({})
+
+        def boom(_path):
+            raise RuntimeError("推送提交失败")
+
+        with mock.patch.object(rec, "merge_into", return_value="v.mp4"):
+            rec.merge_async("v.mp4", "v.wav", 0, on_done=boom)
+            time.sleep(0.3)  # 没抛异常就算通过
 
 
 class TestMediaEnumeration(unittest.TestCase):

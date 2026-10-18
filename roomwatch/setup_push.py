@@ -5,27 +5,53 @@
     rw push --channel serverchan --sendkey SCTxxx
     rw push --channel wecom_bot --webhook https://qyapi.weixin.qq.com/...
 
-config.yaml 里全是中文注释，直接用 yaml 库重写会把注释全部抹掉，
-所以这里做的是**精准文本替换**：只替换占位符和 channel 那一行。
+凭据一律写进 `config.local.yaml`（不入库），`config.yaml` 里的占位串原样不动。
+这样既不用重写带满中文注释的入库文件（早期用 yaml.safe_dump 会把注释全抹掉），
+也不会让真实 webhook 混进 Git 历史。
 """
 
 from __future__ import annotations
 
 import argparse
-import re
+import os
 import sys
 
 import requests
+import yaml
 
 CONFIG = "config.yaml"
+LOCAL_CONFIG = "config.local.yaml"
 
-PLACEHOLDERS = {
-    "wxpusher": [("AT_xxx_replace_me", "app_token"), ("UID_xxx_replace_me", "uid")],
-    "serverchan": [("SCTxxx_replace_me", "sendkey")],
-    "wecom_bot": [("REPLACE_ME", "webhook")],
-}
+LOCAL_HEADER = """# 本机配置覆盖（不入库）
+# 由 `rw push` 生成：只放生效渠道与凭据，其余键仍以 config.yaml 为准。
+# 要改采集/录像参数请改 config.yaml，不要在这里重复写，否则会覆盖主配置。
+"""
 
 CHANNELS = ("wxpusher", "serverchan", "wecom_bot")
+
+WECOM_SEND_API = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={key}"
+
+
+def normalize_wecom_webhook(value: str) -> str:
+    """接受完整 webhook 地址或裸 key，统一成标准地址。
+
+    历史坑（2026-10-18 实际踩到）：旧版 write_config 只把输入替换掉
+    `key=REPLACE_ME` 里的占位符，用户粘完整地址时就会变成
+    `?key=https://qyapi.../send?key=xxx` 这种双嵌套。
+
+    send 接口对这种畸形地址校验宽松——文字照样能发出去，看起来「测试成功」；
+    但 upload_media 严格校验 key，直接返回 40058 invalid param 'key'，
+    于是视频永远发不出去，而且没有任何明显症状。所以这里先剥出真正的 key。
+    """
+    v = (value or "").strip().strip('"').strip("'")
+    if not v:
+        return ""
+    if "key=" in v:
+        v = v.rsplit("key=", 1)[-1]  # 双嵌套时取最后一截
+        v = v.split("&")[0].strip()
+    if not v:
+        return ""
+    return WECOM_SEND_API.format(key=v)
 
 
 def ask(prompt: str, default: str = "") -> str:
@@ -61,34 +87,45 @@ def collect_creds(channel: str, args) -> dict:
         key = args.sendkey or ask("粘贴 Server酱 SendKey（SCT 开头）: ")
         return {"sendkey": key}
     hook = args.webhook or ask("粘贴企业微信机器人 Webhook 地址: ")
-    return {"webhook": hook}
+    return {"webhook": normalize_wecom_webhook(hook)}
 
 
 def write_config(channel: str, creds: dict) -> list:
-    """精准替换占位符和 channel 行，保住所有注释。返回替换摘要。"""
-    with open(CONFIG, "r", encoding="utf-8") as f:
-        text = f.read()
+    """把渠道与凭据写进 config.local.yaml，返回变更摘要。
 
-    changes = []
-    for old, name in PLACEHOLDERS[channel]:
-        if old not in text:
-            changes.append(f"跳过 {name}：配置里找不到占位符（可能已填过）")
-            continue
-        value = creds.get(
-            "token" if name == "app_token" else name, ""
+    不碰 config.yaml：那是入库文件，凭据必须保持占位。
+    已存在的 local 文件按 key 合并，所以换渠道不会把别的渠道凭据清掉。
+    """
+    data: dict = {}
+    if os.path.exists(LOCAL_CONFIG):
+        try:
+            with open(LOCAL_CONFIG, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError):
+            data = {}
+
+    changes = [f"写入 {LOCAL_CONFIG}（不入库）"]
+    notify = data.setdefault("notify", {})
+    notify["channel"] = channel
+    changes.append(f"生效渠道设为 {channel}")
+
+    if channel == "wecom_bot":
+        notify.setdefault("wecom_bot", {})["webhook"] = normalize_wecom_webhook(
+            creds.get("webhook", "")
         )
-        text = text.replace(old, value)
-        changes.append(f"已写入 {name}")
-
-    # 把生效渠道改成所选的
-    text, n = re.subn(r"^(\s*channel:\s*)\S+", rf"\g<1>{channel}", text, count=1, flags=re.M)
-    if n:
-        changes.append(f"生效渠道设为 {channel}")
+        changes.append("已写入 webhook")
+    elif channel == "wxpusher":
+        block = notify.setdefault("wxpusher", {})
+        block["app_token"] = creds.get("token", "")
+        block["uid"] = creds.get("uid", "")
+        changes.append("已写入 app_token / uid")
     else:
-        changes.append("警告：没找到 channel 行，请手动检查")
+        notify.setdefault("serverchan", {})["sendkey"] = creds.get("sendkey", "")
+        changes.append("已写入 sendkey")
 
-    with open(CONFIG, "w", encoding="utf-8") as f:
-        f.write(text)
+    with open(LOCAL_CONFIG, "w", encoding="utf-8") as f:
+        f.write(LOCAL_HEADER)
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
     return changes
 
 
@@ -160,13 +197,15 @@ def main(argv: list[str] | None = None) -> int:
         print(" ", line)
 
     if args.no_test:
-        print("\n已写入配置。重启 watcher.py 后生效。")
+        print(f"\n已写入 {LOCAL_CONFIG}。重启监控后生效。")
         return 0
 
     print("\n发送测试消息...")
     if send_test(channel, creds):
         print("✓ 成功！去手机上看看有没有收到。")
-        print("\n注意：watcher.py 需要**重启一次**才会用上新配置。")
+        print("\n注意：监控进程需要**重启一次**才会用上新配置。")
+        if channel == "wecom_bot":
+            print("建议再验证一次录像推送：rw push-video <某段 mp4>")
         return 0
     print("✗ 失败。检查上面的返回信息；凭据填错的话重新跑一次即可覆盖。")
     return 1
