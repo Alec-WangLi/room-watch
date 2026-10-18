@@ -33,6 +33,7 @@ import cv2
 import numpy as np
 
 from roomwatch import watcher
+from roomwatch.rules import Detection
 
 SIZE = (320, 180)
 FPS = 10.0
@@ -90,14 +91,20 @@ class FakeBoxes(list):
 
 
 class ScriptedModel:
-    """YOLO 的替身：这一帧有人就让 cap 已经读到的结果通过。"""
+    """检测器的替身：这一段脚本里有人就返回一个框。
+
+    接口对齐 onnx_detector：主循环只认 `detect(frame)`，不关心引擎是 ONNX 还是 torch。
+    """
+
+    name = "scripted"
 
     def __init__(self, cam: ScriptedCamera):
         self.cam = cam
 
-    def predict(self, frame, **_kw):
-        boxes = FakeBoxes.make(1) if self.cam.current else FakeBoxes()
-        return [type("R", (), {"boxes": boxes})()]
+    def detect(self, frame, **_kw):
+        if not self.cam.current:
+            return []
+        return [Detection(x1=60.0, y1=20.0, x2=260.0, y2=170.0, conf=0.93)]
 
 
 def read_back(path: str):
@@ -161,7 +168,7 @@ class FullRunTest(unittest.TestCase):
         cam = ScriptedCamera(plan)
 
         w.open_camera = lambda: (setattr(w, "cap", cam), True)[1]
-        w.load_model = lambda: setattr(w, "model", ScriptedModel(cam))
+        w.load_model = lambda: setattr(w, "detector", ScriptedModel(cam))
         try:
             w.run()
         except KeyboardInterrupt:

@@ -3,7 +3,7 @@
 摄像头盯着房间，YOLO 确认「有人进来了」就抓一张带时间戳的照片、录一段 mp4、
 本机语音播报、再推一条微信消息。全部在本机跑，视频不出机器。
 
-> 当前版本 **0.1.1**（`VERSION`，测试版）。桌面程序双击即用，命令行统一走 `rw`。
+> 当前版本 **0.1.2**（`VERSION`，测试版）。桌面程序双击即用，命令行统一走 `rw`。
 > 版本纪律：前两位是已批准基线（`VERSION-APPROVED`），未经所有者同意只动第三位。
 > 结构说明见 [`docs/architecture.md`](docs/architecture.md)，协作约定见 [`AGENTS.md`](AGENTS.md)。
 
@@ -24,7 +24,7 @@
 |---|---|
 | 打开窗口看状态、启停监控、翻抓拍 | **桌面程序** `dist\room-watch.exe` |
 | 装完就想跑、或要写脚本 / 计划任务 | **命令行** `rw start` |
-| 在手机 / 平板上看抓拍 | 相册 `rw gallery`（本机 8765 端口） |
+| 在手机 / 平板上看抓拍 | 相册 `rw gallery`（默认只有本机；`gallery.host=0.0.0.0` + `gallery.token` 后手机可访问） |
 
 桌面程序只是一个「控制台」：它读状态文件、启停子进程，**自己不碰摄像头**。
 关掉窗口不会停止监控，也不会影响正在录的像。
@@ -87,7 +87,7 @@ Windows 下把 `./rw` 换成 `rw`（`rw.cmd` 会自己找对解释器）。
 | `rw dry-run` | 抓拍存档但不推送 |
 | `rw probe` | 拍预览图后退出 |
 | `rw status` | 是否在线（读取时重算心跳） |
-| `rw gallery [--port 8765]` | 本地相册 |
+| `rw gallery [--host H] [--port 8765]` | 相册（非回环地址必须配 token） |
 | `rw guard [--once\|--status\|--dry-run]` | 守护进程 |
 | `rw enroll [--from IMG]` | 注册本人人脸 |
 | `rw whoami IMG` | 判断某张图是不是本人 |
@@ -135,6 +135,9 @@ room-watch/
 
 | 键 | 默认 | 说明 |
 |---|---|---|
+| `camera.source` | 空 | 空=用 `camera.index`；也可填 `rtsp://…` 或视频文件 |
+| `detector.engine` | auto | auto / onnx / torch；ONNX 不需要 torch |
+| `gate.enabled` | true | 静止门控，空房间不推理 |
 | `detector.conf` | 0.55 | 调高少误报，调低少漏报 |
 | `detector.trigger_frames` | 3 | 连续几帧命中才算「进入」 |
 | `snapshot.keep_days` | 30 | 按天清理 |
@@ -145,6 +148,7 @@ room-watch/
 | `voice.require_face` | true | 看清脸才出声 |
 | `notify.channel` | none | wxpusher / serverchan / wecom_bot |
 | `notify.wecom_bot.send_video` | true | 录像也发（先压缩到 `video.max_mb`） |
+| `gallery.token` | 空 | 相册访问密码；绑非回环地址时必填 |
 | `notify.wecom_bot.video.max_mb` | 18 | 企业微信文件硬上限 20MB，压不到就只发文字 |
 
 ### 微信里能收到什么

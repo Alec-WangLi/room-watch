@@ -233,13 +233,17 @@ def _check_deps() -> Check:
 
 
 def _check_models(root: Path) -> Check:
+    # yolov8n.pt 不再是必需项：运行时默认走 ONNX，torch 只在「没有 ONNX」或
+    # 需要重新导出时才用。分发包里不带 torch 也能完整运行。
     expected = [
-        root / "yolov8n.pt",
+        root / "models" / "yolov8n.onnx",
         root / "models" / "face_detection_yunet_2023mar.onnx",
         root / "models" / "face_recognition_sface_2021dec.onnx",
     ]
     missing = [p.name for p in expected if not p.is_file()]
-    detail = "权重齐全" if not missing else f"缺：{', '.join(missing)}"
+    detail = "权重齐全（人体检测走 ONNX，不需要 torch）" if not missing else f"缺：{', '.join(missing)}"
+    if not missing and not (root / "yolov8n.pt").is_file():
+        detail += "；未带 yolov8n.pt（仅重新导出 ONNX 时需要）"
     return Check("模型", not missing, detail)
 
 

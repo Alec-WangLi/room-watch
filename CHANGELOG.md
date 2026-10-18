@@ -14,6 +14,40 @@
 
 ---
 
+## [0.1.2] - 2026-10-19
+
+### 新增
+
+- **RTSP / 网络摄像头接入**（`roomwatch/camera.py`）。`camera.source` 支持
+  本机编号、`rtsp://`（含账号密码）、视频文件三种写法；设备走 dshow，
+  网络流强制 FFmpeg + TCP + 5 秒超时。以前 `rtsp://` 会被 `int()` 抛 ValueError 直接退出。
+- **断线重连退避**：网络流连续 3 次读帧失败即重连，等待 3→6→12…（封顶 60 秒）；
+  本机设备仍是 10 次。文件源播完自动退出，不再空转。
+- **静止门控**（`roomwatch/gate.py`）：帧差不过阈值就不推理。录像中或刚检测到人
+  时自动旁路；空闲时每 `gate.force_every_seconds`（默认 3 秒）强制看一眼，
+  避免「站着不动的人被判成人走了」。
+- **人体检测改走 ONNX**（`roomwatch/onnx_detector.py`）：YOLOv8n → `cv2.dnn`，
+  **不再需要 torch / ultralytics**。`detector.engine=auto` 时没有 ONNX 才退回 torch。
+  后处理（letterbox / 解码 / NMS）自己实现，可离线单测。
+- **相册鉴权**：`gallery.host/port/token`；绑定非回环地址时**没有 token 直接拒绝启动**。
+  HTTP Basic（用户名随意，密码填 token），失败响应延迟 0.4 秒。
+
+### 变更
+
+- 主循环按「整轮耗时」控速，不再无条件 sleep，RTSP 下不会被压到 8fps。
+- `rw enroll` 也走采集源解析，接 IP 摄像头时可以远程注册人脸。
+- `rw doctor` 的模型检查改为认 `models/yolov8n.onnx`，`yolov8n.pt` 不再是必需项。
+- `requirements.txt` 移除 ultralytics，运行依赖从约 1.2GB 降到约 160MB。
+
+### 实测
+
+- 同一张 720p 抓拍：torch 19ms（6 核）vs `cv2.dnn` 58.7ms（2 线程，约 0.6 核），
+  框与置信度完全一致（400,5→1263,706，conf 0.93）。
+- 12 秒视频源试跑：RSS 约 294MB（原 564MB），门控统计 `inferred 100 / skipped 20`。
+- 测试 19 个文件 375 项全绿（新增 camera 15 / gate 8 / onnx_detector 13 / gallery_auth 18）。
+
+---
+
 ## [0.1.1] - 2026-10-18
 
 > 本节原记为 `0.2.0` 与 `0.2.1`（两节），但**次版本号未经批准**，按版本纪律

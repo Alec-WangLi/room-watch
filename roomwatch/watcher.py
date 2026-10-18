@@ -49,8 +49,11 @@ from . import paths
 from . import speaker
 from .paths import resolve
 from .config import load_config as _load_config
+from . import camera
 from .audio_recorder import AudioRecorder, pre_roll_delay_ms
 from .detector import FaceFinder
+from .gate import MotionGate
+from .onnx_detector import build_detector
 from .identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker
 from .notifier import Notifier
 from .recorder import Recorder, video_path_for
@@ -59,11 +62,8 @@ from .videopush import VideoPusher
 
 log = logging.getLogger("room-watch")
 
-BACKENDS = {
-    "dshow": cv2.CAP_DSHOW,
-    "msmf": cv2.CAP_MSMF,
-    "any": cv2.CAP_ANY,
-}
+# 采集源解析（USB / RTSP / 文件）已搬到 camera.py。
+# 主循环只面对 cap 对象，不再关心背后是哪个后端。
 
 
 # 配置加载（含 config.local.yaml 覆盖与路径归一）已搬到 config.py。
@@ -147,13 +147,31 @@ class Watcher:
 
         cam = cfg.get("camera") or {}
         self.cam_index = int(cam.get("index", 0))
-        self.backend = BACKENDS.get(str(cam.get("backend", "dshow")).lower(), cv2.CAP_DSHOW)
+        # camera.source 为空时沿用 camera.index，老配置不用改
+        try:
+            self.camera_spec = camera.parse_source(cam.get("source"), self.cam_index)
+        except ValueError as exc:
+            log.error("%s", exc)
+            sys.exit(2)
+        self.backend_name = str(cam.get("backend", "dshow")).lower()
+        self.open_timeout_ms = int(cam.get("open_timeout_ms", 5000))
+        self.read_timeout_ms = int(cam.get("read_timeout_ms", 5000))
+        self.reconnect_base = float(cam.get("reconnect_seconds", 3.0))
+        self.reconnect_max = float(cam.get("reconnect_max_seconds", 60.0))
+        # 本机设备偶尔失败一帧很正常，连续 10 次才重开；网络流掉线要快得多才救得回来
+        self.reconnect_after = 3 if self.camera_spec.kind == camera.URL else 10
+        self.reconnect_attempt = 0
         self.width = int(cam.get("width", 1280))
         self.height = int(cam.get("height", 720))
         self.fps = int(cam.get("fps", 10))
 
         det = cfg.get("detector") or {}
+        self.detector_cfg = det
         self.model_name = det.get("model", "yolov8n.pt")
+        # 静止门控：空房间不推理。事件期间自动旁路，见 gate.py 的说明。
+        self.gate = MotionGate(cfg.get("gate") or {})
+        self.last_detection_at = None
+        self.detect_errors = 0
         self.det_conf = float(det.get("conf", 0.5))
         self.imgsz = int(det.get("imgsz", 640))
         self.state = TriggerState(
@@ -236,7 +254,7 @@ class Watcher:
         self.last_event_at: datetime | None = None
 
         self.cap = None
-        self.model = None
+        self.detector = None
         self.candidate_frame = None
         self.candidate_dets = []
 
@@ -255,36 +273,59 @@ class Watcher:
         self.fail_streak = 0
 
     def open_camera(self) -> bool:
-        self.cap = cv2.VideoCapture(self.cam_index, self.backend)
+        self.cap = camera.open_capture(
+            self.camera_spec,
+            backend=self.backend_name,
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+            open_timeout_ms=self.open_timeout_ms,
+            read_timeout_ms=self.read_timeout_ms,
+        )
         if not self.cap.isOpened():
-            log.error("打不开摄像头 index=%s，试试改 config.yaml 里的 camera.index", self.cam_index)
+            log.error(
+                "打不开 %s。%s",
+                self.camera_spec.label,
+                "检查地址、账号密码与网络连通性"
+                if self.camera_spec.kind == camera.URL
+                else "试试改 config.yaml 里的 camera.index / camera.backend",
+            )
             return False
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self.gate.reset()  # 重连后画面尺寸可能变了，丢掉旧参考帧
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        log.info("摄像头已打开：%sx%s (请求 %sx%s)", actual_w, actual_h, self.width, self.height)
+        log.info(
+            "采集已打开：%s，%sx%s (请求 %sx%s)",
+            self.camera_spec.label, actual_w, actual_h, self.width, self.height,
+        )
         return True
 
     def load_model(self) -> None:
-        from ultralytics import YOLO
-
-        log.info("加载模型 %s（首次运行会自动下载，几 MB）", self.model_name)
-        self.model = YOLO(self.model_name)
+        log.info("加载检测器（engine=%s，模型 %s）", self.detector_cfg.get("engine", "auto"),
+                 self.model_name)
+        self.detector = build_detector(self.detector_cfg, base_dir=str(paths.PROJECT_ROOT))
+        cv2.setNumThreads(max(1, int(self.detector_cfg.get("threads", 2))))
+        log.info(
+            "检测器就绪：%s%s",
+            self.detector.name,
+            "（torch 兜底，CPU 占用会明显更高）" if self.detector.name == "torch" else "",
+        )
 
     def detect(self, frame) -> list:
-        results = self.model.predict(
-            frame, classes=[0], conf=self.det_conf, imgsz=self.imgsz, verbose=False
-        )
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
+        """跑一次人体检测。引擎细节在 onnx_detector.py。
+
+        推理异常不往外抛：偶发的单帧失败不应该让监控整个退出。但也不能装没事——
+        前几次打完整栈，之后每 100 次提醒一次，免得日志被刷满。
+        """
+        if self.detector is None:
             return []
-        out = []
-        for b in boxes:
-            x1, y1, x2, y2 = b.xyxy[0].tolist()
-            out.append(Detection(x1=x1, y1=y1, x2=x2, y2=y2, conf=float(b.conf[0])))
-        return out
+        try:
+            return self.detector.detect(frame)
+        except Exception as exc:  # noqa: BLE001
+            self.detect_errors += 1
+            if self.detect_errors <= 3 or self.detect_errors % 100 == 0:
+                log.exception("检测失败（累计 %d 次）：%s", self.detect_errors, exc)
+            return []
 
     def user_is_active(self) -> bool:
         """人在电脑前（刚有键鼠输入）就不推送，避免给自己发自己的照片。"""
@@ -396,6 +437,9 @@ class Watcher:
             ),
             "stale": is_stale(self.last_frame_at, now, self.stale_seconds),
             "camera_ok": camera_ok,
+            "camera_source": self.camera_spec.label,
+            "engine": getattr(self.detector, "name", None),
+            "gated": self.gate.stats(),
             "frames": self.frames,
             "events_today": self.events_today,
             "recording": self.recorder.recording,
@@ -658,26 +702,45 @@ class Watcher:
 
         try:
             while True:
+                # 按整轮耗时控速，而不是无条件 sleep：RTSP 的 read() 本身就会阻塞到
+                # 下一帧，再补 100ms 会把实际帧率压到 8fps 以下。
+                loop_start = time.monotonic()
                 ok, frame = self.cap.read()
                 now = datetime.now()
 
                 if not ok:
-                    # 摄像头被占用、驱动抽风、USB 掉线都会走到这里
+                    # 摄像头被占用、驱动抽风、USB 掉线、RTSP 断流都会走到这里
                     self.fail_streak += 1
                     log.warning("读帧失败（连续 %d 次）", self.fail_streak)
                     self.write_status(camera_ok=False)
-                    if self.fail_streak >= 10:
-                        log.error("连续失败 10 次，尝试重新打开摄像头")
+                    # 文件源没有「断线重连」这回事，读完就该退出，
+                    # 否则会一直重开、把最后一帧当成永远失败的摄像头。
+                    if self.camera_spec.kind == camera.FILE and self.fail_streak >= 2:
+                        log.info("视频文件已播完，退出")
+                        break
+                    if self.fail_streak >= self.reconnect_after:
+                        self.reconnect_attempt += 1
+                        delay = camera.backoff_seconds(
+                            self.reconnect_attempt, self.reconnect_base, self.reconnect_max
+                        )
+                        log.error(
+                            "连续失败 %d 次，%.0f 秒后重连（第 %d 次）",
+                            self.fail_streak, delay, self.reconnect_attempt,
+                        )
                         self.cap.release()
-                        time.sleep(2.0)
+                        time.sleep(delay)
                         if self.open_camera():
+                            log.info("采集重连成功")
                             self.fail_streak = 0
+                            self.reconnect_attempt = 0
                         else:
-                            self.fail_streak = 0  # 重置计数，下一轮再试
-                    time.sleep(1.0)
+                            self.fail_streak = 0  # 下一轮重新计数，避免原地死循环
+                    else:
+                        time.sleep(0.2)
                     continue
 
                 self.fail_streak = 0
+                self.reconnect_attempt = 0
                 self.frames += 1
                 self.last_frame_at = now
 
@@ -686,7 +749,19 @@ class Watcher:
                     self.events_today = 0
                     prune_old(self.snap_dir, self.keep_days, now)
 
-                dets = self.detect(frame)
+                # 静止门控：空房间不推理，有人走动才唤醒。
+                # busy 保证「正在录像 / 刚有人经过」期间全速推理，事件一帧都不省。
+                mono = time.monotonic()
+                busy = self.recorder.recording or (
+                    self.last_detection_at is not None
+                    and (mono - self.last_detection_at) < self.gate.idle_grace
+                )
+                if self.gate.should_infer(frame, mono, busy):
+                    dets = self.detect(frame)
+                else:
+                    dets = []
+                if dets:
+                    self.last_detection_at = mono
                 h, w = frame.shape[:2]
                 action = self.state.observe(dets, now, (w, h))
                 # 让录像器知道画面多大——摄像头给多大就录多大
@@ -770,7 +845,9 @@ class Watcher:
                     self.write_status(camera_ok=True)
                     last_status_write = time.time()
 
-                time.sleep(interval)
+                spent = time.monotonic() - loop_start
+                if spent < interval:
+                    time.sleep(interval - spent)
         except KeyboardInterrupt:
             log.info("收到 Ctrl+C，退出")
         finally:
@@ -850,10 +927,22 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
             return 3
     else:
         cam = cfg.get("camera") or {}
-        backend = BACKENDS.get(str(cam.get("backend", "dshow")).lower(), cv2.CAP_DSHOW)
-        cap = cv2.VideoCapture(int(cam.get("index", 0)), backend)
+        # 注册也走同一套采集源解析：接 IP 摄像头时能远程取画面注册，
+        # 不用把笔记本搬到摄像头跟前。
+        try:
+            spec = camera.parse_source(cam.get("source"), int(cam.get("index", 0)))
+        except ValueError as exc:
+            print(exc)
+            return 2
+        cap = camera.open_capture(
+            spec,
+            backend=str(cam.get("backend", "dshow")),
+            width=int(cam.get("width", 1280)),
+            height=int(cam.get("height", 720)),
+            fps=int(cam.get("fps", 10)),
+        )
         if not cap.isOpened():
-            print("打不开摄像头，注册失败")
+            print(f"打不开 {spec.label}，注册失败")
             return 2
         print(f"请正对镜头看一会儿，正在采集 {samples} 张（约 {int(samples * 0.5)} 秒）...")
         try:

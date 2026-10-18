@@ -1,26 +1,90 @@
 """本地抓拍相册。只用标准库，不装任何额外依赖。
 
-    rw gallery                     # 只本机访问 http://127.0.0.1:8765
-    rw gallery --port 9000
+    rw gallery                     # 本机访问 http://127.0.0.1:8765
+    rw gallery --host 0.0.0.0      # 局域网/手机访问，必须配 token
 
-手机上看的话需要内网穿透（frp / cpolar / Tailscale 等），
-不要把 --host 暴露到公网：这是你房间的照片。
+安全边界
+--------
+默认只绑 127.0.0.1。一旦绑到 0.0.0.0 就等于把房间画面对整个局域网开放，
+所以**没有 token 时直接拒绝启动**，不给「先开起来再说」的机会。
+认证用 HTTP Basic：手机浏览器输一次就记住了，不依赖 cookie 和 JS。
+
+注意 Basic 走明文 HTTP 只能挡「随手点开」，同一网络里抓包的人拦不住。
+要放到公网，前面必须套 HTTPS（反向代理或 Tailscale）。
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hmac
 import html
 import json
 import os
 import re
 import sys
+import time
 from urllib.parse import unquote, urlparse
 
-from .paths import CAPTURES_DIR, STATE_DIR
+from .config import load_config
+from .paths import CAPTURES_DIR, STATE_DIR, resolve
 from .rules import gap_seconds
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+# 认证失败时故意拖慢一点，抬高暴力猜 token 的成本。
+AUTH_FAIL_DELAY = 0.4
+
+
+def parse_basic_auth(header: str):
+    """'Basic dXNlcjpwYXNz' → (user, password)；格式不对返回 None。"""
+    if not header:
+        return None
+    parts = header.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "basic":
+        return None
+    try:
+        raw = base64.b64decode(parts[1].strip(), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    user, sep, password = raw.partition(":")
+    if not sep:
+        return None
+    return user, password
+
+
+def authorized(header: str, token: str) -> bool:
+    """token 为空表示不启用认证（调用方必须保证只绑回环地址）。
+
+    用户名和密码字段都接受 token：手机端密码管理器经常把凭据填到用户名里，
+    为了这个把用户挡在门外没有意义。
+    """
+    if not token:
+        return True
+    creds = parse_basic_auth(header)
+    if creds is None:
+        return False
+    user, password = creds
+    return hmac.compare_digest(password, token) or hmac.compare_digest(user, token)
+
+
+def check_bind(host: str, token: str) -> str | None:
+    """返回错误说明；None 表示可以启动。"""
+    if host in LOOPBACK:
+        return None
+    if not token:
+        return (
+            f"拒绝启动：--host {host} 会把房间画面暴露到局域网，但没有配置 token。\n"
+            "请在 config.yaml（或 config.local.yaml）的 gallery.token 里设一个长密码，"
+            "或加 --token 参数。"
+        )
+    if len(token) < 12:
+        return f"拒绝启动：token 只有 {len(token)} 位，太短了，请至少 12 位。"
+    return None
 
 
 HTML = """<!doctype html>
@@ -197,8 +261,25 @@ class Handler(SimpleHTTPRequestHandler):
     captures_dir: str = "captures"
     status_file: str = "status.json"
     stale_after: float = 120.0
+    auth_token: str = ""
+
+    def _auth_ok(self) -> bool:
+        if authorized(self.headers.get("Authorization", ""), self.auth_token):
+            return True
+        time.sleep(AUTH_FAIL_DELAY)
+        body = "需要登录：用户名随意，密码填 gallery.token".encode("utf-8")
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="room-watch", charset="UTF-8"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        return False
 
     def do_GET(self):
+        if not self._auth_ok():
+            return
         if self.path in ("/", "/index.html"):
             page = render(self.captures_dir, self.status_file, self.stale_after).encode("utf-8")
             self.send_response(200)
@@ -216,6 +297,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_HEAD(self):
         """浏览器探测视频时长时会先发 HEAD。"""
+        if not self._auth_ok():
+            return
         return self.serve_media()
 
     def _resolve_media_path(self):
@@ -322,22 +405,45 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="本地抓拍相册")
+    ap.add_argument("--config", default=str(resolve("config.yaml")),
+                    help="从这份配置的 gallery 段读 host/port/token")
     ap.add_argument("--captures", default=str(CAPTURES_DIR))
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--host", default=None, help="默认读配置，未配置则 127.0.0.1")
+    ap.add_argument("--port", type=int, default=None)
+    ap.add_argument("--token", default=None, help="访问密码；绑非回环地址时必填")
     ap.add_argument("--status-file", default=str(STATE_DIR / "status.json"))
     ap.add_argument("--stale-after", type=float, default=120.0)
     args = ap.parse_args(argv)
 
+    gallery_cfg: dict = {}
+    if os.path.exists(args.config):
+        try:
+            gallery_cfg = (load_config(args.config) or {}).get("gallery") or {}
+        except Exception as exc:  # noqa: BLE001
+            print(f"读配置失败（{args.config}）：{exc}，改用命令行参数与默认值")
+
+    host = args.host or str(gallery_cfg.get("host") or "127.0.0.1")
+    port = args.port if args.port is not None else int(gallery_cfg.get("port") or 8765)
+    token = (args.token if args.token is not None else str(gallery_cfg.get("token") or "")).strip()
+
+    problem = check_bind(host, token)
+    if problem:
+        print(problem)
+        raise SystemExit(2)
+
     Handler.captures_dir = os.path.abspath(args.captures)
     Handler.status_file = os.path.abspath(args.status_file)
     Handler.stale_after = args.stale_after
-    if args.host not in ("127.0.0.1", "localhost"):
-        print("警告：你正在把相册暴露到局域网之外，这是你房间的照片。确认吗？")
+    Handler.auth_token = token
 
-    url = f"http://{args.host}:{args.port}/"
-    print(f"相册地址 {url} （Ctrl+C 停止）")
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    url = f"http://{host}:{port}/"
+    if token:
+        print(f"相册地址 {url}（需要登录：用户名随意，密码 = gallery.token）")
+    else:
+        print(f"相册地址 {url}（仅本机，Ctrl+C 停止）")
+    if host not in LOOPBACK:
+        print("提示：Basic 认证走明文 HTTP，只适合家庭/办公内网；公网请套 HTTPS。")
+    server = ThreadingHTTPServer((host, port), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

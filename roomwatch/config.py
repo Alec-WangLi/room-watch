@@ -30,6 +30,7 @@ LOCAL_NAME = "config.local.yaml"
 # 这些键的值是相对项目根的路径，读进来就要归一成绝对路径
 _PATH_KEYS = (
     ("detector", "model"),
+    ("detector", "onnx_model"),
     ("face", "model"),
     ("identity", "owner_file"),
     ("snapshot", "dir"),

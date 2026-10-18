@@ -5,13 +5,35 @@
 
 camera:
   index: 0          # 摄像头编号。0 通常是第一个；不对就试 1、2
-  backend: dshow    # Windows 用 dshow 最稳。打不开时换成 msmf 或 any
-  width: 1280
+  # 网络摄像头写在这里（留空则用上面的 index）。接 IP 摄像头时填：
+  #   rtsp://用户名:密码@192.168.1.64:554/Streaming/Channels/101
+  # 也支持本地视频文件路径，用来离线调参。
+  # 带密码的地址不要写进 config.yaml（会入库），放 config.local.yaml。
+  source: null
+  backend: dshow    # 本机设备用 dshow 最稳；网络流一律自动走 FFmpeg，此项无效
+  width: 1280       # 本机设备会协商这个分辨率；网络流由摄像头决定
   height: 720
   fps: 10           # 检测帧率。房间这种慢场景 5~10 就够，省 CPU
+  open_timeout_ms: 5000   # 打开超时。网络流连不上时别一直卡着
+  read_timeout_ms: 5000   # 读帧超时。摄像头掉线后要能返回失败，而不是永久阻塞
+  reconnect_seconds: 3    # 重连退避起点，连续失败按 3→6→12… 递增
+  reconnect_max_seconds: 60
+
+# 静止门控：画面没变化就不跑模型。空房间的 CPU 占用基本归零。
+# 人在录像/刚经过时自动旁路，事件期间不省算力。
+gate:
+  enabled: true
+  width: 160              # 帧差用的缩略图宽度，越小越省
+  diff_threshold: 12      # 灰度差超过多少算「变了」。摄像头噪声约 2~6
+  min_changed_ratio: 0.004  # 变化像素占比达到 0.4% 才唤醒
+  force_every_seconds: 3.0  # 再静也至少每 3 秒推理一次（站着不动的人靠这个发现）
+  idle_grace_seconds: 4.0   # 刚检测到人后的 4 秒内全速推理
 
 detector:
-  model: yolov8n.pt # n 是 nano，CPU 可跑。想要更准换 yolov8s.pt，会慢一些
+  engine: auto      # auto = 有 ONNX 就用 ONNX，否则退回 torch
+  model: yolov8n.pt # torch 兜底用；同时也是导出 ONNX 的来源
+  onnx_model: models/yolov8n.onnx  # 分发包里带这个，运行时不需要 torch
+  threads: 2        # 推理线程数。CPU 小主机上别超过物理核的一半
   conf: 0.55        # 置信度阈值。误报多就调高到 0.65，漏报多就调到 0.45
   imgsz: 640
   trigger_frames: 3     # 连续 3 帧检测到人才算「进入」，过滤单帧误检
@@ -212,3 +234,13 @@ notify:
       width: 854            # 压缩后的宽度，高度按比例（480p）
       fps: 12
       audio: true
+
+gallery:
+  # 本地相册。默认只绑本机，手机看不到——要手机访问就把 host 改成 0.0.0.0，
+  # 但**必须**同时设置 token，否则程序会拒绝启动（房间画面不能裸奔）。
+  #   手机访问：http://电脑局域网IP:8765/    用户名随便填，密码填 token
+  # 走公网请套一层 HTTPS（反向代理或 Tailscale），Basic 认证在明文 HTTP 上
+  # 只能防「随手点开」，防不了同一网络里抓包的人。
+  host: 127.0.0.1
+  port: 8765
+  token: ""      # 访问密码。留空 = 不加认证（只允许 host 为 127.0.0.1）

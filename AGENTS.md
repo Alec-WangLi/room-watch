@@ -18,9 +18,13 @@
 ### 主链路（括号里是出处，用键名/函数名定位）
 
 ```
-摄像头        camera.index / backend=dshow / 1280x720 / 10fps      （config.yaml 的 camera: 段）
+采集源        camera.source：本机编号 / rtsp:// / 视频文件
+              设备走 dshow，网络流走 FFmpeg（TCP + 5s 超时）        （camera.py）
    ↓
-YOLO 人形检测  yolov8n.pt / detector.conf / detector.imgsz          （config.yaml 的 detector: 段）
+静止门控      empty room → 帧差不过阈值就不推理；busy 时全速        （gate.py）
+   ↓
+人体检测      YOLOv8n ONNX（cv2.dnn，2 线程，无需 torch）
+              engine=auto 时没 ONNX 才退回 ultralytics            （onnx_detector.py）
    ↓
 连续帧确认    detector.trigger_frames 帧连续命中 → ACTION_START     （rules.py 的 TriggerState）
    ↓
@@ -52,6 +56,9 @@ YOLO 人形检测  yolov8n.pt / detector.conf / detector.imgsz          （confi
 | 文件 | 职责 | 备注 |
 |---|---|---|
 | `roomwatch/watcher.py` | 主循环 + 命令行入口 | 采集/检测/抓拍/录像/语音/推送/清理 |
+| `roomwatch/camera.py` | 采集源解析：USB / RTSP / 文件，后端选择、超时、退避 | 日志里密码必须脱敏 |
+| `roomwatch/gate.py` | 静止门控：帧差不过阈值就不推理 | busy 时旁路，别把「站着不动的人」滤掉 |
+| `roomwatch/onnx_detector.py` | 人体检测：YOLOv8 ONNX（cv2.dnn）+ NMS；torch 兜底 | 运行时**不许**顶层 import torch |
 | `roomwatch/rules.py` | **纯逻辑层**：连续帧、挑帧、冷却、录像收尾、清理 | 不依赖摄像头和网络，单测覆盖率最高，新逻辑优先放这里 |
 | `roomwatch/recorder.py` | 环形 JPEG 预录 + 后台线程写 H.264 | |
 | `roomwatch/audio_recorder.py` | 录音 + ffmpeg 并音轨 | |
@@ -173,7 +180,7 @@ sounddevice / psutil / pycaw。
 
 ## E. 测试
 
-15 个文件、321 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
+19 个文件、375 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
 
 | 文件 | 用例数 | 命令 | 需要什么 |
 |---|---:|---|---|
@@ -188,14 +195,18 @@ sounddevice / psutil / pycaw。
 | `test_config.py` | 14 | `python tests/test_config.py` | 临时配置文件 |
 | `test_setup_push.py` | 10 | `python tests/test_setup_push.py` | 纯逻辑，不联网 |
 | `test_notifier.py` | 10 | `python tests/test_notifier.py` | 纯逻辑，HTTP 全 mock |
-| `test_integration.py` | 6 | `python tests/test_integration.py` | 假摄像头 + 假 YOLO（约 55 秒） |
+| `test_integration.py` | 6 | `python tests/test_integration.py` | 假摄像头 + 假检测器（约 55 秒） |
 | `test_cli.py` | 18 | `python tests/test_cli.py` | 纯逻辑，不启进程 |
 | `test_paths.py` | 12 | `python tests/test_paths.py` | 纯逻辑 |
 | `test_gui_state.py` | 15 | `python tests/test_gui_state.py` | 临时状态库，不建窗口 |
+| `test_camera.py` | 15 | `python tests/test_camera.py` | 纯逻辑，不碰摄像头 |
+| `test_gate.py` | 8 | `python tests/test_gate.py` | 合成图，钉住事件期间不跳帧 |
+| `test_onnx_detector.py` | 13 | `python tests/test_onnx_detector.py` | 合成张量，不加载模型 |
+| `test_gallery_auth.py` | 18 | `python tests/test_gallery_auth.py` | 真起 HTTP，约 2.5 秒 |
 
 全量：`rw test`（约 90 秒）；`rw test --fast` 跳过集成测试。
 
-> 2026-10-18 v0.1.1 实测：15 个文件全部 `OK`，共 321 项。
+> 2026-10-19 v0.1.2 实测：19 个文件全部 `OK`，共 375 项。
 
 ---
 
@@ -210,67 +221,83 @@ sounddevice / psutil / pycaw。
 - **正解**：改完代码或配置，必须重启监控与相册。不要靠「再开一份」验证。
 - **另**：**禁止同时跑两组实例**（2026-10-18 实测出现过两个 guardian + 两个 watcher
   同时存在的局面，互相抢摄像头）。发现重复实例先 `rw status` 看 PID，再确认后终止。
+- **RTSP 不受此限**：网络摄像头允许多个客户端同时拉流，但仍建议只跑一份——
+  两份都会推送、都会录像，重复告警比抢设备更烦。
 
-### F.2 判断是否活着必须重算心跳
+### F.2 静止门控不能把「站着不动的人」滤掉
+
+- **现象**（若写错）：人进屋后站着不动，帧差归零 → 不推理 → 20 秒后录像被判「人走了」收尾。
+- **正解**：三道保险缺一不可——`busy`（录像中/刚检测到人）时无条件推理；
+  空闲时每 `gate.force_every_seconds` 至少推理一次；门控只决定跑不跑模型，不改检测语义。
+- **改动 gate.py 后必须跑** `tests/test_gate.py`，里面直接钉了这四条行为。
+
+### F.3 运行时不许把 torch 拉回来
+
+- **背景**：torch 539MB 且默认吃满所有核，是「依赖乱、CPU 打满」的根因。
+- **约束**：顶层 import 里不能出现 `torch` / `ultralytics`；`onnx_detector.py` 里
+  只在 `TorchDetector.__init__` 和 `export()` 内部惰性 import。
+- **验证**：`grep -rn "ultralytics" roomwatch/` 只应命中注释与这两个函数体。
+
+### F.4 判断是否活着必须重算心跳
 
 - **现象**：进程被强杀后，`status.json` 里的 `stale` 仍是 `false`，把死的报成在线。
 - **原因**：进程被杀前来不及再写状态。
 - **正解**：在读取那一刻重算 `now - last_frame_at > heartbeat.stale_after_seconds`。
   `rw status`、相册页、桌面界面都按这个规则实现（`gui.read_state()`）。
 
-### F.3 本机 `Start-Process`（PowerShell）无法启动进程
+### F.5 本机 `Start-Process`（PowerShell）无法启动进程
 
 - **现象**：报「已添加项。字典中的关键字:'Path'所添加的关键字:'PATH'」。
 - **正解**：启动后台进程一律用 bash 后台方式，或 `subprocess.Popen` +
   `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`（guardian 与 GUI 都这么做）。
 
-### F.4 录像必须用 avc1(H.264)
+### F.6 录像必须用 avc1(H.264)
 
 - **现象**：日志刷 `Failed to load OpenH264 library`。
 - **原因**：本机 OpenCV 5.0 只有 avc1 与 mp4v 能写；浏览器基本只认 H.264。报错来自
   FFmpeg 后端，实际由 Media Foundation 接手成功编码。
 - **正解**：`record.codec` 保持 `avc1`；那条 stderr 是噪音。mp4v 只在兜底时用，网页放不了。
 
-### F.5 H.264 编码 11~18ms/帧，必须后台线程写盘
+### F.7 H.264 编码 11~18ms/帧，必须后台线程写盘
 
 - **正解**：`record.queue_size`（默认 120）满时宁可丢帧，也不许拖慢检测主循环。
 
-### F.6 录像有 8 秒预录，合并音轨要 `adelay`
+### F.8 录像有 8 秒预录，合并音轨要 `adelay`
 
 - **现象**：并好音轨后声音整段晚 8 秒。
 - **原因**：预录画面发生在开始录音之前，音轨天然比视频短。
 - **正解**：`-af adelay=<预录毫秒>:all=1`，视频流 copy 不重编码
   （`audio_recorder.py` 拼参数处；`test_audio_storage.py` 有断言）。
 
-### F.7 `alignCrop()` 必须传原图与原图坐标系的关键点
+### F.9 `alignCrop()` 必须传原图与原图坐标系的关键点
 
 - **现象**：人脸识别认错人，但不报任何错。
 - **原因**：YuNet 在 YOLO 人形框的裁剪图上跑，返回的是裁剪图坐标；直接交给
   `alignCrop()` 会把脸摆歪、特征全废。
 - **正解**：用 `detector.py` 的 `_shift_row()` 补回偏移。任何新增的人脸相关调用都走同一条路。
 
-### F.8 编辑 `config.yaml` 用最小增量并复读
+### F.10 编辑 `config.yaml` 用最小增量并复读
 
 - **现象**：`behavior.idle_threshold_seconds` 曾被吞进上一行注释里，配置项静默失效。
 - **正解**：只改目标行，改完立刻 grep 该键确认还在、缩进没变。不要顺手重排整个文件。
 
-### F.9 `events_today` 是内存计数，重启归零
+### F.11 `events_today` 是内存计数，重启归零
 
 - **正解**：真实事件数查 `var/db/events.db`（`storage.database`）。
 
-### F.10 桌面界面没有 tkinter 可用时不要让用户自己猜
+### F.12 桌面界面没有 tkinter 可用时不要让用户自己猜
 
 - **现象**：主环境 `import tkinter` 报 `ModuleNotFoundError`。
 - **正解**：`gui._relaunch_with_tk()` 自动换成有 tkinter 的解释器重启自己；
   打包后的 exe 内嵌 tkinter，不受影响。
 
-### F.11 打包参数里的相对路径按 spec 目录解析
+### F.13 打包参数里的相对路径按 spec 目录解析
 
 - **现象**：`--add-data VERSION;.` 与 `--icon assets\x.ico` 在配合 `--specpath build` 时
   报「找不到文件」。
 - **正解**：这两个参数用**绝对路径**（`scripts/build-exe.ps1` 已这么写）。
 
-### F.12a 推送层三个静默失效点（2026-10-18 真机连中三个）
+### F.14 推送层三个静默失效点（2026-10-18 真机连中三个）
 
 推送是最容易「看起来配好了其实没发」的模块，这三个都表现为**没有任何报错**：
 
@@ -285,7 +312,7 @@ sounddevice / psutil / pycaw。
 
 排查口诀：文字通了不代表通道通了；先用 `rw push-video` 打一次真实录像。
 
-### F.12 窗口程序没有控制台，排障靠追踪日志
+### F.15 窗口程序没有控制台，排障靠追踪日志
 
 - **现象**：exe 双击没反应，看不出卡在哪。
 - **正解**：设 `ROOMWATCH_GUI_TRACE=1` 后启动，阶段写入 `var/logs/gui-trace.log`；

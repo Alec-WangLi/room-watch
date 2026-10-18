@@ -1,21 +1,24 @@
-# 必需
-opencv-python>=4.10      # 摄像头采集 + 图像写出
-ultralytics>=8.3         # YOLO 人形检测（会带上 torch，体积较大但开箱可用）
+# —— 运行必需 ——
+# 装完这些就能跑完整功能：采集、ONNX 推理、录像、推送、相册。
+# **不需要 torch / ultralytics**：人体检测默认走 cv2.dnn + models/yolov8n.onnx。
+opencv-python>=4.10      # 采集 + 图像写出 + DNN 推理（ONNX）
+numpy>=1.26              # 帧差门控、响度处理
 requests>=2.32           # 推送
 PyYAML>=6.0              # 读 config.yaml
+sounddevice>=0.4.6       # 录像音轨（PortAudio，Windows 自带 dll，无需额外编译）
 pyttsx3>=2.90            # 语音提示（Windows SAPI5，离线）
-sounddevice>=0.4.6       # 录像的音轨（PortAudio，Windows 自带 dll，无需额外编译）
 psutil>=5.9              # 守护进程判断 PID 是否真的存活
-pycaw>=20240210          # 系统主音量读取与保底（Windows）
-comtypes>=1.2            # pycaw 的底层依赖
-numpy>=1.26              # 响度处理（乘响度、压缩）。ultralytics 本来就会带上它
 
-# 可选：读取/设置系统音量，用来诊断「怎么调都小」
-# 不装也能跑，只是 --volume-check / ensure_system_volume 无效
+# —— Windows 音量（可选）——
+# 不装也能跑，只是 voice.ensure_system_volume / rw volume-check 无效
 pycaw>=20240210
 comtypes>=1.4
 
-# gallery.py 不需要任何额外依赖，只用标准库 http.server
-# 注意：OpenCV 5 起不再自带 Haar 级联，人脸检测改用 YuNet（models/ 目录，已含）
-# 注意：Python 3.13 已移除 audioop，响度处理自己用 numpy 实现，不依赖它
+# —— 仅开发/构建时需要（分发包不带）——
+# 换模型或重新导出 ONNX 时才装，会把 torch 一起拖进来（约 540MB）
+# ultralytics>=8.3
+# onnx>=1.16
 
+# gallery.py 只用标准库 http.server，没有额外依赖。
+# 注意：OpenCV 5 起不再自带 Haar 级联，人脸检测改用 YuNet（models/ 已含）。
+# 注意：Python 3.13 已移除 audioop，响度处理用 numpy 自己实现。
