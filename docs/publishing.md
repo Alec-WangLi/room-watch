@@ -100,6 +100,19 @@ $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
 
 ## 4. 打 tag 并发布
 
+### 方式 A：一条命令（推荐）
+
+```bash
+# token 需要 repo 权限；只发 Release 不需要 workflow 权限
+export GH_TOKEN=ghp_xxx          # PowerShell: $env:GH_TOKEN="ghp_xxx"
+python scripts/release.py
+```
+
+脚本会：读 `VERSION` → 算安装包 SHA256 并写 `.sha256` → 在 `main` 当前提交上建 tag
+→ 建 Release → 上传两个资产。**幂等**：重复执行只补缺失的资产，不会重复建 tag/release。
+
+### 方式 B：手动
+
 ```bash
 git add -A
 git commit -m "release: 0.1.4"
