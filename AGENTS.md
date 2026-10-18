@@ -407,6 +407,24 @@ room-watch-<版本>\
   `dist\room-watch.exe --selftest` 会建窗→刷新→销毁并写 `var/logs/gui-selftest.log`。
   曾靠它发现 `gui.main()` 没读 `sys.argv`、导致 `--selftest` 被忽略的 bug。
 
+### F.16 客户端断开 ≠ 服务端故障（Windows 是第三个异常类）
+
+- **现象**：`rw gallery` 挂着两小时，日志里 23 段
+  `Exception occurred during processing of request`，每段 30 行堆栈，
+  末行 `ConnectionAbortedError: [WinError 10053] 你的主机中的软件中止了一个已建立的连接`。
+- **成因**：浏览器关页面、拖视频进度条会掐掉上一条连接。拔连接有三种落法，
+  **类不同**：`BrokenPipeError`（EPIPE）、`ConnectionResetError`（10054，RST）、
+  `ConnectionAbortedError`（10053，正常 FIN 后服务端继续写）。
+  原代码只捕前两个，10053 直接漏到 `socketserver.handle_error` 打成故障。
+- **正解**：统一用 `gallery.CLIENT_GONE` 四元组；两层都拦 ——
+  `serve_media()` 的发送循环捕异常，`GalleryServer.handle_error()` 兜住
+  写响应头/首页/401 阶段的同类断开，其余异常照旧打印。
+- **鉴别力**：`tests/test_gallery.py::TestClientDisconnect` 用真 socket 跑两种断法
+  （`SO_LINGER` 造 RST、普通 `close()` 造 10053），断言 stderr 无 `Traceback`
+  且服务之后仍能回 200。把 `CLIENT_GONE` 清空即复现满屏堆栈。
+- **反例提醒**：别用 `except OSError: pass` 一把抓 —— 磁盘读失败也会被吞掉。
+  文件打开错误单独回 500，只有发送阶段的断开才静默。
+
 ---
 
 ## G. Git、隐私与钩子

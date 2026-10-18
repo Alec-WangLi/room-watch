@@ -39,6 +39,16 @@ LOOPBACK = ("127.0.0.1", "localhost", "::1")
 # 认证失败时故意拖慢一点，抬高暴力猜 token 的成本。
 AUTH_FAIL_DELAY = 0.4
 
+# 客户端主动断开连接时 socket 写入抛出的异常集合。
+#
+# 为什么必须把 ConnectionAbortedError 也列进来：浏览器关闭页面、拖视频进度条
+# 重新发 Range 请求时，会直接掐掉上一条连接。Windows 上这种半途中断报的是
+# WinError 10053（ConnectionAbortedError），和 Linux 常见的
+# ECONNRESET（ConnectionResetError）/ EPIPE（BrokenPipeError）不是同一个类。
+# 只捕后两个的话，每拖一次进度条 socketserver 就会往 stderr 打一整段堆栈，
+# 实测 2 小时 23 次、日志里全是噪音，真正的故障反而被埋掉。
+CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)
+
 
 def parse_basic_auth(header: str):
     """'Basic dXNlcjpwYXNz' → (user, password)；格式不对返回 None。"""
@@ -371,18 +381,25 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         try:
-            with open(path, "rb") as f:
-                f.seek(start)
-                left = length
+            f = open(path, "rb")
+        except OSError as exc:
+            # 文件在列目录后被删/被占用——回 500，不要把半截响应留在连接里
+            self.send_error(500, f"打不开文件: {exc}")
+            return
+
+        with f:
+            f.seek(start)
+            left = length
+            try:
                 while left > 0:
                     chunk = f.read(min(65536, left))
                     if not chunk:
                         break
                     self.wfile.write(chunk)
                     left -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            # 拖进度条时浏览器会主动掐掉上一个请求，这不是错误
-            pass
+            except CLIENT_GONE:
+                # 拖进度条/关页面时浏览器会主动掐掉上一个请求，这不是错误
+                pass
 
     def _serve_status(self):
         if not os.path.exists(self.status_file):
@@ -401,6 +418,22 @@ class Handler(SimpleHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+
+class GalleryServer(ThreadingHTTPServer):
+    """把「客户端跑掉」从故障里摘出来，其余异常照旧打印堆栈。
+
+    处理函数里的 try 只能盖住媒体正文那段写入；连接在写响应头、写首页 HTML
+    或认证 401 时断开，异常会一路抛到 socketserver 的 handle_error，
+    标准实现一律 print 成「Exception occurred during processing of request」。
+    这类日志对排查毫无价值（对方已经走了，回什么都不可能送达），却足以把真
+    故障淹掉，所以在这一层统一吞掉。
+    """
+
+    def handle_error(self, request, client_address) -> None:
+        if isinstance(sys.exc_info()[1], CLIENT_GONE):
+            return
+        super().handle_error(request, client_address)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -443,7 +476,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"相册地址 {url}（仅本机，Ctrl+C 停止）")
     if host not in LOOPBACK:
         print("提示：Basic 认证走明文 HTTP，只适合家庭/办公内网；公网请套 HTTPS。")
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = GalleryServer((host, port), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

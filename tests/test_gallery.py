@@ -15,14 +15,18 @@ import sys as _sys
 
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+import contextlib
+import io
 import os
 import shutil
+import socket
+import struct
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
 
 import cv2
 import numpy as np
@@ -128,7 +132,7 @@ class TestRangeRequests(GalleryFixture):
         make_video(os.path.join(self.day, "090310.mp4"))
         gallery.Handler.captures_dir = os.path.abspath(self.captures)
         gallery.Handler.status_file = os.path.abspath(os.path.join(self.base, "status.json"))
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), gallery.Handler)
+        self.server = gallery.GalleryServer(("127.0.0.1", 0), gallery.Handler)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -237,6 +241,111 @@ class TestRangeRequests(GalleryFixture):
     def test_missing_file_is_404(self):
         status, _, _ = self._request("/captures/2026-10-17/nope.mp4")
         self.assertEqual(status, 404)
+
+
+class TestClientDisconnect(GalleryFixture):
+    """浏览器掐连接是正常现象，不能变成满屏堆栈。
+
+    真实起因：手动跑 `rw gallery` 挂着两小时，日志里 23 段
+    「Exception occurred during processing of request」，全部是
+    ConnectionAbortedError(WinError 10053)——浏览器关页面/拖进度条时
+    上一条连接就这么断了。原代码只捕 BrokenPipe/ConnectionReset，
+    Windows 上这条优雅关闭走的是 ConnectionAborted，于是每次都漏到
+    socketserver 打一整套堆栈。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 文件必须够大（远大于内核发送缓冲），否则服务端一次 write 就写完，
+        # 等不到「写着写着对端没了」这个时刻。
+        with open(os.path.join(self.day, "100000.mp4"), "wb") as f:
+            f.write(b"\0" * (8 * 1024 * 1024))
+        gallery.Handler.captures_dir = os.path.abspath(self.captures)
+        gallery.Handler.status_file = os.path.abspath(
+            os.path.join(self.base, "status.json")
+        )
+        self.server = gallery.GalleryServer(("127.0.0.1", 0), gallery.Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        super().tearDown()
+
+    def _drop_mid_stream(self, hard_reset: bool) -> str:
+        """请求 8MB 视频，读到一半就断，返回服务端这期间打到 stderr 的内容。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            if hard_reset:
+                # SO_LINGER(on, 0)：close() 直接发 RST
+                sock.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                )
+            sock.sendall(
+                b"GET /captures/2026-10-17/100000.mp4 HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\nRange: bytes=0-\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            sock.recv(2048)  # 确认已经进入正文发送阶段再断
+            sock.close()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and "Traceback" not in buf.getvalue():
+                time.sleep(0.05)
+        return buf.getvalue()
+
+    def _assert_server_alive(self):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/status")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            self.assertEqual(r.status, 200)
+
+    def test_connection_aborted_counts_as_client_gone(self):
+        """钉死平台差异：Windows 这条断法抛的是 ConnectionAbortedError。"""
+        self.assertIn(ConnectionAbortedError, gallery.CLIENT_GONE)
+
+    def test_handle_error_swallows_every_client_gone_flavour(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            for exc_type in (
+                ConnectionAbortedError,
+                ConnectionResetError,
+                BrokenPipeError,
+                TimeoutError,
+            ):
+                try:
+                    raise exc_type(10053, "对端没了")
+                except exc_type:
+                    self.server.handle_error(None, ("127.0.0.1", 1))
+        self.assertEqual(buf.getvalue(), "", "客户端断开不该打堆栈")
+
+    def test_handle_error_still_reports_real_bug(self):
+        """吞连接异常不等于吞掉所有异常——真 bug 还必须打印。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                raise ValueError("真的出问题了")
+            except ValueError:
+                self.server.handle_error(None, ("127.0.0.1", 1))
+        self.assertIn("ValueError", buf.getvalue())
+
+    def test_graceful_close_mid_stream_leaves_no_traceback(self):
+        """真实场景：浏览器关页面（正常 FIN），服务端还在写 → 10053。"""
+        noise = self._drop_mid_stream(hard_reset=False)
+        self.assertNotIn(
+            "Traceback", noise,
+            "客户端正常断开被当成服务端故障打印了堆栈：\n" + noise,
+        )
+        self._assert_server_alive()
+
+    def test_hard_reset_mid_stream_leaves_no_traceback(self):
+        """拖进度条：浏览器直接 RST → 10054。"""
+        noise = self._drop_mid_stream(hard_reset=True)
+        self.assertNotIn(
+            "Traceback", noise,
+            "客户端 RST 被当成服务端故障打印了堆栈：\n" + noise,
+        )
+        self._assert_server_alive()
 
 
 if __name__ == "__main__":

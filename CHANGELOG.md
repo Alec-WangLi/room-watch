@@ -14,6 +14,29 @@
 
 ---
 
+## [0.1.8] - 2026-10-19
+
+### 修复
+
+- **相册服务被「客户端断开」刷屏**：手动跑 `rw gallery` 挂 2 小时 24 分钟，
+  日志里攒了 23 段
+  `Exception occurred during processing of request`，每段 30 行堆栈，末行一律是
+  `ConnectionAbortedError: [WinError 10053]`。关页面、拖视频进度条都会触发。
+  根因是 `serve_media()` 只捕 `BrokenPipeError`/`ConnectionResetError`，
+  而 Windows 上「浏览器正常关闭、服务端还在写」抛的是第三个类 `ConnectionAbortedError`。
+  现在统一到 `gallery.CLIENT_GONE` 四元组，并新增 `GalleryServer.handle_error()`
+  兜住写响应头/首页/401 阶段的同类断开；真异常（如 `ValueError`）照旧打印。
+- **媒体文件打不开时不再留半截响应**：文件在列目录后被删除/被占用，原来异常直接
+  抛出连接，浏览器侧表现为卡住；现在显式回 500。
+
+### 测试
+
+- `tests/test_gallery.py::TestClientDisconnect` 新增 5 项，用真 socket 覆盖两种断法
+  （`SO_LINGER` 造 RST→10054、普通 `close()`→10053），断言 stderr 无堆栈且服务
+  随后仍能回 200；另有 2 项钉住 `handle_error` 只吞连接类异常。全库 462 项通过。
+
+---
+
 ## [0.1.7] - 2026-10-19
 
 ### 修复
