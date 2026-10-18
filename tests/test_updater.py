@@ -422,5 +422,27 @@ class HelperScriptTest(unittest.TestCase):
                 updater.handoff_install(Path(tmp) / "nope.exe")
 
 
+class PruneDownloadsTest(unittest.TestCase):
+    def test_keeps_only_requested_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            old1 = base / "room-watch-0.1.4-setup.exe"
+            old2 = base / "room-watch-0.1.4-setup.exe.sha256"
+            keep = base / "room-watch-0.1.5-setup.exe"
+            other = base / "notes.txt"
+            for p in (old1, old2, keep, other):
+                p.write_bytes(b"x")
+
+            self.assertEqual(updater.prune_downloads(keep, folder=base), 2)
+            self.assertTrue(keep.exists())
+            self.assertTrue(other.exists())   # 非安装包不动
+            self.assertFalse(old1.exists())
+            self.assertFalse(old2.exists())
+
+    def test_missing_folder_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(updater.prune_downloads(folder=Path(tmp) / "nope"), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

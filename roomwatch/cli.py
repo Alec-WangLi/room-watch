@@ -545,6 +545,8 @@ def _cmd_update(argv: Sequence[str]) -> int:
         return done(1, error="缺少 SHA256 摘要", **found)
 
     dest = updater.cache_dir() / asset["name"]
+    # 先清掉上次留下的安装包（每个 142MB），避免 var/cache/updates 越堆越大
+    updater.prune_downloads(keep=dest)
     size_mb = int(asset.get("size") or 0) / 1048576
     # 走 302 回退时拿不到资产列表，size 是 0 —— 别显示成「0.0 MB」
     say(f"\n下载 {asset['name']}" + (f"（{size_mb:.1f} MB）" if size_mb else "") + "…")

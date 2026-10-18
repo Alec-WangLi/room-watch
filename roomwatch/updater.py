@@ -507,6 +507,11 @@ def handoff_install(setup: Path, *, mode: str = "none", delay_seconds: int = 4) 
     try:
         if setup.resolve() != staged.resolve():
             shutil.copy2(setup, staged)
+            # 缓存里那份已经用不上了（182MB×2 堆着），helper 用的是 %TEMP% 的暂存
+            try:
+                setup.unlink()
+            except OSError:
+                pass
     except OSError as exc:
         raise UpdateError(f"复制安装包到临时目录失败：{exc}") from exc
 
@@ -673,3 +678,30 @@ def update_config(cfg: dict) -> dict:
 
 def cache_dir() -> Path:
     return paths.CACHE_DIR / "updates"
+
+
+def prune_downloads(keep: Optional[Path] = None, *, folder: Optional[Path] = None) -> int:
+    """清掉缓存里除 `keep` 之外的安装包，返回删掉的个数。
+
+    一个 setup.exe 就是 142MB。之前每更新一次就往 `var/cache/updates` 里堆一个，
+    装完也不删 —— 实测两次更新后 `var/` 涨到 285MB（安装目录本身 368MB）。
+    """
+    base = Path(folder) if folder else cache_dir()
+    if not base.is_dir():
+        return 0
+    keep_path: Optional[Path] = None
+    if keep is not None:
+        try:
+            keep_path = Path(keep).resolve()
+        except OSError:
+            keep_path = None
+    removed = 0
+    for item in base.glob("room-watch-*-setup.exe*"):
+        try:
+            if keep_path is not None and item.resolve() == keep_path:
+                continue
+            item.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
