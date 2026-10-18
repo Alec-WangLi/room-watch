@@ -73,6 +73,7 @@
 | `roomwatch/setup_push.py` | 推送配置引导 | |
 | `roomwatch/gui.py` | 桌面界面 | 独立进程，不 import cv2 |
 | `roomwatch/cli.py` | 全局命令表与参数翻译 | 新增命令先改这里 |
+| `roomwatch/updater.py` | 自动更新：Releases → 版本策略 → 下载校验 → 静默安装 | 下载域名有白名单；SHA256 不过不许装 |
 | `roomwatch/paths.py` | 项目根 / 运行时目录 / 解释器发现 | 路径基准的唯一来源 |
 | `roomwatch/config.py` | 配置加载：主配置 + `config.local.yaml` 深合并 + 路径归一 | 别在别处直接 `yaml.safe_load(config.yaml)` |
 
@@ -113,6 +114,21 @@ python -m venv .venv
 `paths.find_python()` 顺序：`ROOMWATCH_PYTHON` →（分发包内）`runtime\python`
 → 当前解释器 → `python`。`rw.cmd` 在 Windows 上会优先试项目内的内嵌运行时，
 所以双击和命令行都不需要配置 PATH。
+
+### B.4 自动更新与版本纪律的关系
+
+`rw update` 把版本纪律写进了代码：同 `主.次` 只前进修订号才自动装，
+跨次版本必须 `--yes`。改 `updater.decide()` 之前先确认这是不是要放开规则 ——
+它由 `tests/test_updater.py::DecideTest` 钉死，测试名就是规则本身。
+
+更新链路是全项目唯一「下载可执行文件并运行」的地方，三条不许妥协：
+
+1. 下载域名白名单（`github.com` / `objects.githubusercontent.com`）+ 强制 https；
+2. SHA256 校验不过就删包并失败，`require_checksum` 默认 true；
+3. 安装前必须先停 watcher（否则 runtime 里的 dll 被占用，安装器替换失败）。
+
+GitHub 匿名 API 限流 60 次/小时，被限流时走 `/releases/latest` 的 302 拿 tag。
+不要为此引入 token —— 客户端不该存任何凭据。
 
 ---
 

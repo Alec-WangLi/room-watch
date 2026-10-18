@@ -93,6 +93,7 @@ COMMANDS: dict[str, Command] = {
                           requires_value=True),
     "test": Command("跑全部测试（--fast 跳过最慢的集成测试）"),
     "doctor": Command("环境自检：解释器、依赖、模型、目录、端口、钩子"),
+    "update": Command("检查并安装更新（--check 只查，--yes 允许跨次版本）"),
     "version": Command("打印版本号"),
     "gui": Command("打开桌面界面"),
 }
@@ -386,6 +387,147 @@ def _cmd_gui(argv: Sequence[str]) -> int:
     return gui.main(list(argv))
 
 
+def _cmd_update(argv: Sequence[str]) -> int:
+    """检查 / 安装更新。
+
+    退出码：0 已是最新或已完成；1 失败；10 有更新但需要确认（脚本可据此判断）。
+    """
+    from . import updater
+    from .config import load_config
+
+    unknown = [a for a in argv if a not in
+               ("--check", "--yes", "--force", "--no-restart", "--help", "-h")]
+    if unknown:
+        raise UsageError(f"rw update 不认识这些参数：{' '.join(unknown)}")
+    if "--help" in argv or "-h" in argv:
+        print(
+            "用法：rw update [--check] [--yes] [--force] [--no-restart]\n"
+            "  --check       只检查，不下载不安装\n"
+            "  --yes         允许跨次版本/主版本升级（版本纪律要求显式确认）\n"
+            "  --force       允许降级（一般只用于回滚到旧版排障）\n"
+            "  --no-restart  装完不自动把监控拉起来"
+        )
+        return 0
+
+    check_only = "--check" in argv
+    assume_yes = "--yes" in argv
+    force = "--force" in argv
+    do_restart = "--no-restart" not in argv
+
+    cfg_path = paths.PROJECT_ROOT / "config.yaml"
+    cfg = load_config(str(cfg_path)) if cfg_path.is_file() else {}
+    opt = updater.update_config(cfg)
+
+    current = updater.Version.parse(__version__)
+    print(f"本地版本  {current}")
+    if not opt["enabled"]:
+        print("自动更新已关闭（update.enabled=false），跳过。")
+        return 0
+
+    print(f"检查仓库  {opt['repo']}")
+    try:
+        release = updater.fetch_latest(opt["repo"])
+    except updater.UpdateError as exc:
+        print(f"✗ {exc}")
+        return 1
+
+    latest = release.version
+    when = (release.published_at or "")[:10]
+    print(f"远端版本  {latest}" + (f"（发布 {when}）" if when else ""))
+
+    policy = updater.decide(current, latest,
+                            allow_downgrade=force or opt["allow_downgrade"])
+
+    if policy == "up-to-date":
+        print("\n已是最新版本。")
+        return 0
+    if policy == "blocked-downgrade":
+        print(f"\n远端 {latest} 比本地 {current} 旧，默认不降级。"
+              "确认要回滚请加 --force。")
+        return 0
+    if policy == "downgrade":
+        print(f"\n注意：这是降级（{current} → {latest}），因为给了 --force 才继续。")
+
+    if policy in ("confirm-minor", "confirm-major"):
+        kind = "次版本" if policy == "confirm-minor" else "主版本"
+        print(f"\n这是一个{kind}升级（{current} → {latest}）。")
+        print("按项目版本纪律，跨次版本要显式确认，不会自动安装。")
+        if not (assume_yes or opt["allow_minor"]):
+            print("确认升级请重跑：rw update --yes")
+            return 10
+
+    if release.notes.strip():
+        print("\n更新说明：")
+        for line in release.notes.strip().splitlines()[:20]:
+            print("  " + line)
+
+    if check_only:
+        print("\n有新版本可用（--check 模式，未安装）。")
+        return 10
+
+    asset = release.installer_asset()
+    if not asset:
+        print(f"\n✗ release {release.tag} 里没有 room-watch-<版本>-setup.exe，无法自动更新。")
+        return 1
+
+    expected = updater.expected_sha256(release)
+    if not expected:
+        # release 说明里没写摘要时，再看有没有 <安装包>.sha256 这个资产
+        expected = updater.fetch_sha256_asset(release)
+    if not expected and opt["require_checksum"]:
+        print("\n✗ 该 release 没有提供 SHA256（*.sha256 资产或说明里的 sha256:），")
+        print("  为安全起见拒绝安装。可临时在配置里设 update.require_checksum=false。")
+        return 1
+
+    dest = updater.cache_dir() / asset["name"]
+    print(f"\n下载 {asset['name']}（{int(asset.get('size') or 0) / 1048576:.1f} MB）…")
+
+    def _bar(done: int, total: int) -> None:
+        if total:
+            pct = done * 100 // total
+            print(f"\r  {pct:3d}%  {done / 1048576:.1f}/{total / 1048576:.1f} MB", end="", flush=True)
+
+    try:
+        updater.download(asset["browser_download_url"], dest, progress=_bar)
+    except updater.UpdateError as exc:
+        print(f"\n✗ {exc}")
+        return 1
+    print()
+
+    if expected:
+        if not updater.verify_sha256(dest, expected):
+            dest.unlink(missing_ok=True)
+            print("✗ SHA256 校验失败，已删除下载文件。")
+            print(f"  期望 {expected}")
+            print(f"  实际 {updater.sha256_of(dest) if dest.exists() else '文件已删'}")
+            return 1
+        print("✓ SHA256 校验通过")
+    else:
+        print("⚠ 未提供 SHA256，跳过校验（update.require_checksum=false）")
+
+    was_running = updater.stop_watcher()
+    if was_running:
+        print("已停止正在运行的监控进程")
+
+    print("正在安装（静默，约 30~60 秒）…")
+    try:
+        code = updater.run_installer(dest)
+    except updater.UpdateError as exc:
+        print(f"✗ {exc}")
+        return 1
+    if code != 0:
+        print(f"✗ 安装器返回 {code}，更新未完成。安装包保留在 {dest}")
+        return 1
+
+    print(f"✓ 已更新到 {latest}")
+    if was_running and do_restart:
+        if updater.restart_monitor():
+            print("已重新拉起监控进程。")
+        else:
+            print("⚠ 监控没能自动重启，请手动打开 room-watch。")
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -408,6 +550,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_test(rest)
         if name == "doctor":
             return _cmd_doctor(rest)
+        if name == "update":
+            return _cmd_update(rest)
         if name == "version":
             return _cmd_version(rest)
         if name == "gui":

@@ -244,3 +244,29 @@ gallery:
   host: 127.0.0.1
   port: 8765
   token: ""      # 访问密码。留空 = 不加认证（只允许 host 为 127.0.0.1）
+
+update:
+  # 自动更新：查 GitHub Releases，比对 VERSION，下载 setup.exe 并静默安装。
+  # 手动检查：rw update            （只查不装：rw update --check）
+  #
+  # 版本纪律（项目所有者定的规则，代码里实现了，不会被绕过）：
+  #   同一「主.次」下只升修订号  → 自动装（0.1.3 → 0.1.4）
+  #   跨次版本 / 跨主版本        → 必须显式确认（rw update --yes）
+  #   远端比本地旧               → 默认拒绝，要回滚得加 --force
+  enabled: true
+  repo: "Alec-WangLi/room-watch"
+
+  # 预留：监控进程启动时后台自检的间隔。0 = 不在后台自检。
+  check_interval_hours: 24
+
+  # 允许自动跨次版本升级。保持 false 才符合版本纪律；
+  # 设 true 等于放弃「正式版要本人点头」这条约束。
+  allow_minor: false
+
+  # 允许降级（一般只在排障回滚时临时开）
+  allow_downgrade: false
+
+  # 强制校验安装包 SHA256。发布时必须同时上传 .sha256 文件或在说明里写
+  # sha256: <64位>，否则拒绝安装。关掉等于把「下载到什么都装」的口子打开，
+  # 不建议。
+  require_checksum: true

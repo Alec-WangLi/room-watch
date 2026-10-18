@@ -1,0 +1,46 @@
+room-watch
+Copyright (C) 2026 Alexander Wang
+
+本项目的源代码以 GNU Affero General Public License v3.0（AGPL-3.0）发布，
+全文见仓库根目录的 LICENSE 文件。
+
+--------------------------------------------------------------------------
+第三方组件与模型权重
+--------------------------------------------------------------------------
+
+本项目**不使用**「第三方模型即我的代码」这种模糊说法，下面逐项列清来源与许可。
+其中 Ultralytics YOLOv8 与本项目主许可证同为 AGPL-3.0，因此不存在许可冲突；
+若你打算闭源商用，需要自行取得 Ultralytics 的商业授权，或替换检测模型。
+
+1. YOLOv8n（人体检测）
+   文件：models/yolov8n.onnx、models/yolov8n.pt
+   来源：Ultralytics YOLOv8（https://github.com/ultralytics/ultralytics）
+   许可：AGPL-3.0
+   说明：onnx 由 yolov8n.pt 导出，推理时用 OpenCV 的 cv2.dnn，
+         不依赖 ultralytics / torch 运行时。
+
+2. YuNet 人脸检测
+   文件：models/face_detection_yunet_2023mar.onnx
+   来源：OpenCV Zoo（https://github.com/opencv/opencv_zoo）
+   许可：MIT
+
+3. SFace 人脸识别
+   文件：models/face_recognition_sface_2021dec.onnx
+   来源：OpenCV Zoo（同上），原始模型出自 Zhong Yaoyao 等人的 SFace 工作
+   许可：MIT
+
+4. Python 运行时（仅在分发包 runtime/ 中出现，不随仓库分发）
+   Python 3.13，PSF License。
+   分发包内还包含 opencv-python、numpy、requests、PyYAML、sounddevice、
+   pyttsx3、psutil、pywin32 等 wheel，各自许可见其 METADATA。
+
+5. ffmpeg（仅在分发包 tools/ 中出现，不随仓库分发）
+   gyan.dev essentials build，GPL/LGPL 组合，具体以该 build 的 LICENSE 为准。
+
+--------------------------------------------------------------------------
+关于 AGPL 与网络服务
+--------------------------------------------------------------------------
+
+AGPL-3.0 第 13 条要求：如果你修改本程序并通过网络提供服务，必须向使用者
+提供对应的完整源代码。本项目本身是本地运行的监控程序，但相册功能会通过
+HTTP 暴露到局域网；如果你在修改版中把它开放到公网，请注意这一条的义务。

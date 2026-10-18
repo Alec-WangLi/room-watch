@@ -32,8 +32,9 @@ room-watch/
 │  ├─ guardian.py           # 守护进程（判活、退避、单实例锁）
 │  ├─ setup_push.py         # 推送配置引导
 │  ├─ wizard.py             # 首次配置向导（摄像头/webhook/自启）
+│  ├─ updater.py            # 自动更新（Releases → 校验 → 静默安装）
 │  └─ gui.py                # 桌面界面（Tkinter，独立进程）
-├─ tests/                   # 20 个测试文件，全部可离线运行
+├─ tests/                   # 21 个测试文件，全部可离线运行
 ├─ scripts/                 # 启动、钩子、开机自启、打包
 ├─ docs/                    # 本文件
 ├─ assets/                  # 图标

@@ -3,9 +3,15 @@
 摄像头盯着房间，YOLO 确认「有人进来了」就抓一张带时间戳的照片、录一段 mp4、
 本机语音播报、再推一条微信消息。全部在本机跑，视频不出机器。
 
-> 当前版本 **0.1.2**（`VERSION`，测试版）。桌面程序双击即用，命令行统一走 `rw`。
+[![tests](https://github.com/Alec-WangLi/room-watch/actions/workflows/tests.yml/badge.svg)](https://github.com/Alec-WangLi/room-watch/actions/workflows/tests.yml)
+[![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+
+> 当前版本 **0.1.3**（`VERSION`，测试版）。桌面程序双击即用，命令行统一走 `rw`。
 > 版本纪律：前两位是已批准基线（`VERSION-APPROVED`），未经所有者同意只动第三位。
-> 结构说明见 [`docs/architecture.md`](docs/architecture.md)，协作约定见 [`AGENTS.md`](AGENTS.md)。
+> 结构说明见 [`docs/architecture.md`](docs/architecture.md)，协作约定见 [`AGENTS.md`](AGENTS.md)，
+> 发版与 Release 规范见 [`docs/publishing.md`](docs/publishing.md)。
+>
+> 许可证 **AGPL-3.0**；第三方模型（YOLOv8 / YuNet / SFace）的来源与许可见 [`NOTICE`](NOTICE)。
 
 ## 为什么不是 Frigate / MotionEye
 
@@ -141,6 +147,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 | `rw push-video PATH` | 把一段录像发到企业微信（验证视频推送） |
 | `rw test [--fast]` | 跑全部测试（`--fast` 跳过集成测试） |
 | `rw doctor` | 环境自检 |
+| `rw update [--check\|--yes\|--force]` | 检查并安装更新（见「自动更新」） |
 | `rw version` | 版本号 + 当前 git 提交 |
 | `rw gui` | 打开桌面界面 |
 
@@ -290,9 +297,45 @@ rw test --fast   # 跳过最慢的集成测试（约 55 秒）
 
 ---
 
-## 版本
+## 版本与更新
 
 `VERSION` 是唯一来源：`roomwatch.__version__` 读它，`pyproject.toml` 从
 `__version__` 取，`rw version` 打印它，`tests/test_paths.py` 保证三者一致。
 
-发版：改 `VERSION` → 在 `CHANGELOG.md` 顶部加一节 → `git tag vX.Y.Z`。
+发版：改 `VERSION` → 在 `CHANGELOG.md` 顶部加一节 → 打 tag → 上传安装包与
+`.sha256`（细节见 [`docs/publishing.md`](docs/publishing.md)）。
+
+### 自动更新
+
+```bash
+rw update            # 检查并在允许时直接安装
+rw update --check    # 只看有没有新版，不下载
+rw update --yes      # 允许跨次版本（0.1.4 → 0.2.0）
+rw update --force    # 允许降级（回滚排障用）
+```
+
+行为按版本纪律分流，不是「有新版就闷头装」：
+
+| 远端版本 | 行为 |
+|---|---|
+| 同一 `主.次`，只前进修订号 | 自动下载、校验、安装、重启监控 |
+| 跨次版本 / 跨主版本 | 打印更新说明，要求 `rw update --yes` |
+| 比本地旧 | 默认拒绝 |
+
+安装包必须提供 SHA256（`.sha256` 资产或说明里的 `sha256:`），校验不过直接拒绝安装。
+GitHub 匿名 API 每小时 60 次，被打满时自动退回网页重定向取版本号，不占配额。
+
+Linux / 源码部署不走这条链路（只对 Windows 安装包有效），更新用 `git pull`。
+
+## 许可证
+
+**AGPL-3.0**，全文见 [`LICENSE`](LICENSE)。
+
+选它的直接原因是 `models/yolov8n.onnx` 来自 Ultralytics YOLOv8，本身即 AGPL-3.0；
+主许可证与之一致，不存在「声明 MIT 却打包了 AGPL 权重」的矛盾。
+
+如果你要闭源商用，两条路：向 Ultralytics 购买商业授权，或把检测模型换成
+Apache-2.0 的（YOLOX-Nano / NanoDet-Plus），再按需调整本项目许可证。
+
+第三方组件的来源与许可逐项列在 [`NOTICE`](NOTICE)。
+

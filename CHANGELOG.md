@@ -14,6 +14,40 @@
 
 ---
 
+## [0.1.4] - 2026-10-19
+
+### 新增
+
+- **自动更新**（`roomwatch/updater.py` + `rw update`）：从 GitHub Releases
+  取最新版本，比对后按版本纪律处置 —— 同 `主.次` 的修订号前进自动安装，
+  跨次版本/主版本必须 `--yes`，降级默认拒绝。下载后强制校验 SHA256，
+  再停掉监控、静默安装、重新拉起。
+- **API 限流回退**：匿名 GitHub API 只有 60 次/小时，实测会被打到 403；
+  此时退回 `github.com/<repo>/releases/latest` 的 302 Location 取 tag，
+  不消耗 API 配额，资产地址按 GitHub 固定路径拼。
+- **开源配套**：`LICENSE`（AGPL-3.0）、`NOTICE`（逐项列出 YOLOv8 / YuNet /
+  SFace 的来源与许可）、`.github/workflows/tests.yml`（3.10 与 3.13 双版本跑测试）、
+  `docs/publishing.md`（发版与 Release 资产规范）。
+
+### 变更
+
+- **构建脚本不再写死本机路径**：`build-exe.ps1` 逐个 `import tkinter` 实测筛选
+  解释器；`build-portable.ps1` 用 `py -3.13` 解析真实路径再回退 PATH 与默认安装目录。
+  此前别人 clone 后必然构建失败。
+- `AGENTS.md` 的 B.1/B.2/B.3 改成通用环境说明，删掉本机解释器对照表。
+- `config.yaml` 新增 `update` 段（enabled / repo / allow_minor / require_checksum 等）。
+- `pyproject.toml` 补 `license` 字段。
+
+### 安全
+
+- 测试里硬编码的真实企业微信 webhook key 换成全零占位值。
+- 仓库历史用 `git-filter-repo` 重写：清除上述 key 与 `C:\Users\<本机>` 路径。
+  **该 key 已按泄露处理，应在企业微信后台重新生成机器人。**
+- 新增下载域名白名单（只允许 `github.com` / `objects.githubusercontent.com`）
+  与 https 强制校验，见 `tests/test_updater.py::DownloadGuardTest`。
+
+---
+
 ## [0.1.3] - 2026-10-19
 
 ### 新增
