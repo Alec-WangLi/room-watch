@@ -3,10 +3,9 @@
 摄像头盯着房间，YOLO 确认「有人进来了」就抓一张带时间戳的照片、录一段 mp4、
 本机语音播报、再推一条微信消息。全部在本机跑，视频不出机器。
 
-[![tests](https://github.com/Alec-WangLi/room-watch/actions/workflows/tests.yml/badge.svg)](https://github.com/Alec-WangLi/room-watch/actions/workflows/tests.yml)
 [![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
-> 当前版本 **0.1.3**（`VERSION`，测试版）。桌面程序双击即用，命令行统一走 `rw`。
+> 当前版本 **0.1.4**（`VERSION`，测试版）。桌面程序双击即用，命令行统一走 `rw`。
 > 版本纪律：前两位是已批准基线（`VERSION-APPROVED`），未经所有者同意只动第三位。
 > 结构说明见 [`docs/architecture.md`](docs/architecture.md)，协作约定见 [`AGENTS.md`](AGENTS.md)，
 > 发版与 Release 规范见 [`docs/publishing.md`](docs/publishing.md)。

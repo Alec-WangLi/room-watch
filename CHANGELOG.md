@@ -26,8 +26,8 @@
   此时退回 `github.com/<repo>/releases/latest` 的 302 Location 取 tag，
   不消耗 API 配额，资产地址按 GitHub 固定路径拼。
 - **开源配套**：`LICENSE`（AGPL-3.0）、`NOTICE`（逐项列出 YOLOv8 / YuNet /
-  SFace 的来源与许可）、`.github/workflows/tests.yml`（3.10 与 3.13 双版本跑测试）、
-  `docs/publishing.md`（发版与 Release 资产规范）。
+  SFace 的来源与许可）、`docs/publishing.md`（发版与 Release 资产规范）、
+  `docs/ci-tests.yml`（CI 定义；放进 `.github/workflows/` 即启用）。
 
 ### 变更
 

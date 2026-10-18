@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 下界 3.10 是 pyproject 声明的最低版本，上界跟开发环境一致
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          # 用 headless 版 cv2：CI 没有 X11，完整版会因缺 libGL 导入失败
+          pip install opencv-python-headless numpy pyyaml requests psutil
+
+      - name: 跑单元测试
+        # --fast 跳过需要真实摄像头/模型的集成用例，CI 环境没有设备
+        run: python -m roomwatch test --fast
+
+      - name: 检查版本号一致性
+        run: |
+          python -c "import pathlib,sys; sys.path.insert(0,'.'); from roomwatch import __version__ as v; d=pathlib.Path('VERSION').read_text(encoding='utf-8').strip(); print(f'VERSION={d} code={v}'); sys.exit(0 if d==v else 1)"

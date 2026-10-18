@@ -43,6 +43,21 @@ git remote -v
 > 且要意识到旧对象在 GitHub 上仍可能通过 API 访问到 —— 这种情况下正确答案是
 > 删库重建，而不是强推。
 
+## 0.1 启用 CI（一次性，30 秒）
+
+`.github/workflows/` 下的文件受 GitHub 保护：**OAuth App 的 token 没有 `workflow`
+权限时，push 会被整条拒绝**（`refusing to allow an OAuth App to create or update
+workflow ... without workflow scope`）。所以 CI 定义暂时放在 `docs/ci-tests.yml`。
+
+启用方式（不需要任何 token 权限，用网页即可）：
+
+1. 打开 <https://github.com/Alec-WangLi/room-watch/contents/.github/workflows>
+2. `Add file` → `Create new file`，文件名填 `tests.yml`
+3. 把 `docs/ci-tests.yml` 的内容整段粘进去，提交
+
+之后想继续用命令行改 CI，需要一个带 `workflow` scope 的 classic PAT
+（Settings → Developer settings → Tokens (classic) → 勾 `repo` + `workflow`）。
+
 ## 1. 发版前检查
 
 ```bash
