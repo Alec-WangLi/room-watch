@@ -173,7 +173,7 @@ sounddevice / psutil / pycaw。
 
 ## E. 测试
 
-15 个文件、320 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
+15 个文件、321 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
 
 | 文件 | 用例数 | 命令 | 需要什么 |
 |---|---:|---|---|
@@ -190,12 +190,12 @@ sounddevice / psutil / pycaw。
 | `test_notifier.py` | 10 | `python tests/test_notifier.py` | 纯逻辑，HTTP 全 mock |
 | `test_integration.py` | 6 | `python tests/test_integration.py` | 假摄像头 + 假 YOLO（约 55 秒） |
 | `test_cli.py` | 18 | `python tests/test_cli.py` | 纯逻辑，不启进程 |
-| `test_paths.py` | 11 | `python tests/test_paths.py` | 纯逻辑 |
+| `test_paths.py` | 12 | `python tests/test_paths.py` | 纯逻辑 |
 | `test_gui_state.py` | 15 | `python tests/test_gui_state.py` | 临时状态库，不建窗口 |
 
 全量：`rw test`（约 90 秒）；`rw test --fast` 跳过集成测试。
 
-> 2026-10-18 v0.2.1 实测：14 个文件全部 `OK`，共 310 项。
+> 2026-10-18 v0.1.1 实测：15 个文件全部 `OK`，共 321 项。
 
 ---
 
@@ -354,7 +354,12 @@ sounddevice / psutil / pycaw。
 9. **提交前不要绕过钩子**，不要用 `--no-verify`；钩子阻断时按它打印的方法改。
 10. **不要 `git add -f` 隐私文件**，不要删除 `data/captures/`（用户的数据）。
 11. **引用用语义锚点，不写行号**；改完文档复读一遍，确认路径与命令与代码一致。
-12. **版本号只改 `VERSION`**，同步在 `CHANGELOG.md` 顶部加一节；`bump` 后跑 `rw version` 验证。
+12. **版本号纪律（硬性）**：`VERSION` 的前两位是**项目所有者批准的基线**，记在
+    `VERSION-APPROVED`。**没有本人明确同意，只许动第三位（修订号）** —— 一直停在测试版序列。
+    要升 `0.2.0` 这类正式版，先取得同意，再把 `VERSION-APPROVED` 改成新基线，然后才动 `VERSION`。
+    越界会被 `tests/test_paths.py::VersionTest::test_minor_bump_requires_approval` 判红。
+    改版本号须同步在 `CHANGELOG.md` 顶部加一节，并跑 `rw version` 与 `rw test` 验证。
+13. **不要替用户宣布「正式版」**。版本号里的 `0.x` 就是测试版，说「正式版」前先确认基线。
 
 ---
 

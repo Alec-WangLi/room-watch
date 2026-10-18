@@ -5,11 +5,31 @@
 - **版本号只有一个来源**：仓库根的 `VERSION` 文件。
   `roomwatch.__version__` 从它读取，`pyproject.toml` 从 `__version__` 读取，
   `rw version` 再打印它。三者不一致会被 `tests/test_paths.py` 拦下。
-- **发版动作**：改 `VERSION` → 在本文件顶部加一节 → `git tag vX.Y.Z`。
+- **版本纪律（硬性，项目所有者定）**：前两位 `主版本.次版本` 是**已批准的基线**，
+  记在 `VERSION-APPROVED` 里。**没有本人明确同意，只允许动第三位（修订号）**，
+  也就是一直停在测试版序列（0.1.1 → 0.1.2 → …）。
+  要进 `0.2.0` 这类正式版，必须先拿到同意，把 `VERSION-APPROVED` 改成新基线，
+  再动 `VERSION` 的前两位。越界会被 `tests/test_paths.py::VersionTest` 判红。
+- **发版动作**：改 `VERSION` → 在本文件顶部加一节。`git tag` 仍需本人批准。
 
 ---
 
-## [0.2.1] - 2026-10-18
+## [0.1.1] - 2026-10-18
+
+> 本节原记为 `0.2.0` 与 `0.2.1`（两节），但**次版本号未经批准**，按版本纪律
+> 合并回退为修订号 `0.1.1`。功能内容不变。
+
+### 新增
+
+- **录像也能发到微信了**（`roomwatch/videopush.py`）。企业微信群机器人没有视频消息
+  类型，只能发文件：ffmpeg 瘦身到 `video.max_mb`（默认 18，官方硬上限 20）
+  → `upload_media` 换 `media_id` → 发 `file` 消息。
+- **`rw push-video PATH`**：单独验证录像推送，不用等一次真实事件。
+- **音轨合并完成回调**（`AudioRecorder.merge_async(on_done=...)`）：视频推送挂在合并
+  之后，避免发出没有声音的哑巴视频。
+- 配置项 `notify.wecom_bot.send_video` 与 `notify.wecom_bot.video.{max_mb,width,fps,audio}`。
+- **`roomwatch/config.py`**：主配置深合并同目录 `config.local.yaml`（只写差异）。
+- **版本纪律闸门**：`VERSION-APPROVED` + `VersionTest` 强制「未经批准不得升次版本号」。
 
 ### 修复
 
@@ -21,7 +41,6 @@
 - **Server酱 渠道永久静默**。判定写成 `sendkey.startswith("SCT")`，
   而真实 SendKey 同样以 SCT 开头，于是真 key 被当成「没配置」直接跳过。
   改为只认占位符（`replace_me`）。
-
 - **`rw push` 写入 webhook 的双嵌套 bug**（真机实测发现）。旧逻辑只替换
   `key=REPLACE_ME` 里的占位符，用户粘完整地址时配置里变成
   `?key=https://qyapi.../send?key=xxx`。文字消息接口校验宽松，照样「测试成功」；
@@ -31,37 +50,15 @@
 
 ### 变更
 
-- **凭据迁到 `config.local.yaml`（只写差异）**，新增 `roomwatch/config.py`：
-  启动时自动深合并同目录的 `config.local.yaml`，`config.yaml` 保持占位串、
-  一个字都不被写。不再需要 `rw start --config config.local.yaml`。
+- **凭据迁到 `config.local.yaml`（只写差异）**：启动时自动深合并，
+  `config.yaml` 保持占位串、一个字都不被写。不再需要 `rw start --config config.local.yaml`。
 - `rw push` 只写 `config.local.yaml`，且按 key 合并——换渠道不会清掉其它渠道凭据。
-
-### 实测
-
-- 企业微信群机器人（内部群）实收：文字 ✓、图片 ✓、录像 ✓。
-- `rw push-video` 36.2MB/33.7s → 0.5MB；94.7MB/85.7s → 2.8MB，均上传成功。
-
----
-
-## [0.2.0] - 2026-10-18
-
-### 新增
-
-- **录像也能发到微信了**（`roomwatch/videopush.py`）。企业微信群机器人没有视频消息
-  类型，只能发文件：ffmpeg 瘦身到 `video.max_mb`（默认 18，官方硬上限 20）
-  → `upload_media` 换 `media_id` → 发 `file` 消息。
-- **`rw push-video PATH`**：单独验证录像推送，不用等一次真实事件。
-- **音轨合并完成回调**（`AudioRecorder.merge_async(on_done=...)`）：视频推送挂在合并
-  之后，避免发出没有声音的哑巴视频。
-- 配置项 `notify.wecom_bot.send_video` 与 `notify.wecom_bot.video.{max_mb,width,fps,audio}`。
-
-### 变更
-
 - 图片与录像共用同一道推送闸门 `Watcher.notify_allowed()`（dry-run 不发、本人在电脑前不发）。
 
 ### 实测
 
-- 本机 ffmpeg 9.0：36.2 MB/33.7 s → 0.52 MB（0.6 s）；99.3 MB/85.7 s → 2.84 MB（1.1 s）。
+- 企业微信群机器人（内部群）实收：文字 ✓、图片 ✓、录像 ✓。
+- 本机 ffmpeg 9.0：36.2 MB/33.7 s → 0.52 MB（0.6 s）；94.7 MB/85.7 s → 2.84 MB（1.1 s）。
 - 全部在后台线程串行执行，队列上限 8，满了丢弃，不拖慢检测主循环。
 
 ---

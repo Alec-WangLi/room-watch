@@ -62,6 +62,29 @@ class VersionTest(unittest.TestCase):
         self.assertGreaterEqual(len(parts), 3)
         self.assertTrue(all(p.isdigit() for p in parts[:3]))
 
+    def test_minor_bump_requires_approval(self) -> None:
+        """没有所有者批准，只许动修订号。
+
+        VERSION-APPROVED 记的是「已批准到哪一位」（major.minor）。未取得同意时
+        VERSION 的前两位不得越过它；越界 = 擅自把测试版升成正式版，测试直接判红。
+        """
+        approved_raw = (paths.PROJECT_ROOT / "VERSION-APPROVED").read_text(encoding="utf-8")
+        approved = [
+            ln.strip() for ln in approved_raw.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ][0]
+        cur_major, cur_minor = (int(p) for p in __version__.split(".")[:2])
+        ok_major, ok_minor = (int(p) for p in approved.split(".")[:2])
+        self.assertLessEqual(
+            (cur_major, cur_minor),
+            (ok_major, ok_minor),
+            msg=(
+                f"VERSION={__version__} 超过了已批准基线 {approved}。\n"
+                "升次版本号必须先得到项目所有者同意，再把 VERSION-APPROVED 改成新基线；"
+                "否则请只改第三位（修订号）。"
+            ),
+        )
+
 
 class FindPythonTest(unittest.TestCase):
     def test_env_override_wins(self) -> None:
