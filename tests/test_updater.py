@@ -386,5 +386,41 @@ class GuiLauncherTest(unittest.TestCase):
             self.assertTrue(cmd and cmd[-2:] == ["roomwatch", "gui"])
 
 
+class HelperScriptTest(unittest.TestCase):
+    """交接脚本必须能容忍中文用户名（客户机 `C:\\Users\\张三\\...`）。"""
+
+    def test_is_pure_ascii(self) -> None:
+        for mode in ("gui", "watcher", "none"):
+            updater._helper_script(mode, 4).encode("ascii")
+
+    def test_paths_come_from_arguments_not_literals(self) -> None:
+        text = updater._helper_script("gui", 4)
+        self.assertIn('set "APP=%~1"', text)
+        self.assertIn('set "SETUP=%~2"', text)
+        self.assertIn("ping -n 4", text)
+
+    def test_gui_mode_reopens_window(self) -> None:
+        text = updater._helper_script("gui", 4)
+        # 成功路径一次 + 失败兜底一次
+        self.assertEqual(text.count('start "" "%APP%\\room-watch.exe"'), 2)
+
+    def test_watcher_mode_restarts_monitor(self) -> None:
+        text = updater._helper_script("watcher", 4)
+        self.assertIn("-m roomwatch start", text)
+        # 成功路径不碰界面，只有失败兜底才开界面
+        self.assertEqual(text.count('start "" "%APP%\\room-watch.exe"'), 1)
+
+    def test_none_mode_only_fallback_on_failure(self) -> None:
+        text = updater._helper_script("none", 4)
+        self.assertNotIn("-m roomwatch start", text)
+        # 失败兜底：只开界面一次，成功路径不启动任何东西
+        self.assertEqual(text.count('start "" "%APP%\\room-watch.exe"'), 1)
+
+    def test_missing_setup_is_update_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(updater.UpdateError):
+                updater.handoff_install(Path(tmp) / "nope.exe")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

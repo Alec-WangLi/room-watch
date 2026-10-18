@@ -14,6 +14,27 @@
 
 ---
 
+## [0.1.6] - 2026-10-19
+
+### 修复
+
+- **`rw update` 在真实安装版上必然失败（返回 5 并回滚）**：更新器是用包内
+  `runtime\python\python.exe` 跑的，Inno 的 RestartManager 发现「Python 占着
+  要替换的 dll」，又关不掉自己的父进程，30 秒后静默模式按 Abort 处理。
+  现象是「下载完、校验通过、然后报安装器返回 5」，且回滚会把安装目录弄脏。
+  0.1.4 → 0.1.5 实测 100% 复现，日志：`Defaulting to Abort for suppressed
+  message box (Abort/Retry/Ignore)`。
+- 改为**交接安装**（`updater.handoff_install`）：先把安装包复制到 `%TEMP%`，
+  再由一个与安装目录无关的 `cmd.exe` 脚本等更新器退出后执行安装器；
+  装完按场景把界面或监控拉起来，失败则至少把界面打开，日志写
+  `var/logs/update.log`。命令行会立即返回「已交接」而不是假装装完了。
+- **中文 Windows 下的假死**：`tasklist` 输出是 GBK，按 UTF-8 解码会在
+  subprocess 读线程里抛 `UnicodeDecodeError`；改成按字节匹配 PID。
+- 交接脚本**不写死路径**，改用命令行参数传入 —— 客户机用户名带中文时
+  （`C:\Users\张三\AppData\...`）脚本仍能保持纯 ASCII，不会乱码。
+
+---
+
 ## [0.1.5] - 2026-10-19
 
 ### 新增

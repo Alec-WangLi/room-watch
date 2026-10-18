@@ -455,6 +455,7 @@ def _cmd_update(argv: Sequence[str]) -> int:
         "checked_at": "",
         "check_interval_hours": opt["check_interval_hours"],
         "installed": False,
+        "handed_off": False,
     }
 
     def say(*parts: object) -> None:
@@ -544,7 +545,9 @@ def _cmd_update(argv: Sequence[str]) -> int:
         return done(1, error="缺少 SHA256 摘要", **found)
 
     dest = updater.cache_dir() / asset["name"]
-    say(f"\n下载 {asset['name']}（{int(asset.get('size') or 0) / 1048576:.1f} MB）…")
+    size_mb = int(asset.get("size") or 0) / 1048576
+    # 走 302 回退时拿不到资产列表，size 是 0 —— 别显示成「0.0 MB」
+    say(f"\n下载 {asset['name']}" + (f"（{size_mb:.1f} MB）" if size_mb else "") + "…")
 
     def _bar(step: int, total: int) -> None:
         if total and not json_mode:
@@ -572,28 +575,22 @@ def _cmd_update(argv: Sequence[str]) -> int:
     if was_running:
         say("已停止正在运行的监控进程")
 
-    say("正在安装（静默，约 30~60 秒）…")
+    # 交接给安装器：本进程就是包内 runtime\python，RestartManager 关不掉它，
+    # 自己调 setup.exe 会被判 Abort（返回 5 并回滚）。详见 updater.handoff_install。
+    mode = "gui" if relaunch_gui else ("watcher" if was_running and do_restart else "none")
+    say("正在交接给安装器（约 40~60 秒；日志 var\\logs\\update.log）…")
     try:
-        code = updater.run_installer(dest)
+        updater.handoff_install(dest, mode=mode)
     except updater.UpdateError as exc:
         say(f"✗ {exc}")
         return done(1, error=str(exc), **found)
-    if code != 0:
-        say(f"✗ 安装器返回 {code}，更新未完成。安装包保留在 {dest}")
-        return done(1, error=f"安装器返回 {code}", **found)
 
-    say(f"✓ 已更新到 {latest}")
-    if was_running and do_restart:
-        if updater.restart_monitor():
-            say("已重新拉起监控进程。")
-        else:
-            say("⚠ 监控没能自动重启，请手动打开 room-watch。")
-    if relaunch_gui:
-        if updater.relaunch_gui():
-            say("已重新打开界面。")
-        else:
-            say("⚠ 没能自动打开界面，请双击桌面上的 room-watch。")
-    return done(0, installed=True, **found)
+    say("✓ 安装器已启动，这个窗口可以关掉了。")
+    if mode == "gui":
+        say("  装完会自动重新打开界面。")
+    elif mode == "watcher":
+        say("  装完会自动把监控拉起来。")
+    return done(0, handed_off=True, **found)
 
 
 # ---------------------------------------------------------------- 入口
