@@ -31,7 +31,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import control
 from . import paths
+from . import procutil
 
 DEFAULT_REPO = "Alec-WangLi/room-watch"
 API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
@@ -374,6 +376,122 @@ def stop_watcher(status_path: Optional[Path] = None, *, grace: float = 8.0) -> b
     return True
 
 
+def _watcher_pid(status_path: Optional[Path] = None) -> int:
+    path = Path(status_path) if status_path else paths.STATE_DIR / "status.json"
+    try:
+        return int(json.loads(path.read_text(encoding="utf-8")).get("pid") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def _roomwatch_processes(root: Path) -> list[dict]:
+    """当前所有进程的 pid / exe / cmdline（取不到的字段给空值）。"""
+    try:
+        import psutil
+    except Exception:  # noqa: BLE001 - 没有 psutil 时退回「只停 watcher」
+        return []
+    out: list[dict] = []
+    for proc in psutil.process_iter(["pid", "exe", "cmdline"]):
+        try:
+            out.append(proc.info)
+        except Exception:  # noqa: BLE001 - 进程在枚举中途退出属正常
+            continue
+    return out
+
+
+def select_targets(processes: list[dict], root: Path,
+                   exclude: Optional[list[int]] = None) -> list[int]:
+    """挑出「跑在这个安装目录下的本程序进程」。
+
+    两个条件缺一不可：
+      1. 可执行文件在安装目录下（不能误杀开发目录或别的 python）；
+      2. 命令行里出现 roomwatch（`tools\ffmpeg.exe` 虽然同目录，但它是
+         watcher 的子进程，随父进程一起退，不该单点）。
+    路径比较不分大小写：Windows 的路径本来就不分。
+    """
+    root_text = str(root).replace("\\", "/").rstrip("/").lower()
+    skip = {int(pid) for pid in (exclude or [])}
+    found: list[int] = []
+    for item in processes or []:
+        try:
+            pid = int(item.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or pid in skip:
+            continue
+        exe = str(item.get("exe") or "").replace("\\", "/").lower()
+        cmdline = " ".join(str(part) for part in (item.get("cmdline") or [])).lower()
+        if exe.startswith(root_text + "/") and "roomwatch" in cmdline:
+            found.append(pid)
+    return found
+
+
+def _terminate_process(pid: int, *, timeout: float = 6.0) -> bool:
+    """结束一个进程并等它消失。相册/守护没有要收尾的写入，可以直接终止。"""
+    try:
+        import psutil
+    except Exception:  # noqa: BLE001
+        return procutil.kill_pid(pid, timeout=timeout)
+    try:
+        proc = psutil.Process(pid)
+    except Exception:  # noqa: BLE001
+        return True
+    for action in (proc.terminate, proc.kill):
+        try:
+            action()
+            proc.wait(timeout=timeout)
+            return True
+        except Exception:  # noqa: BLE001 - 换下一个更狠的手段
+            continue
+    return not procutil.pid_alive(pid)
+
+
+def stop_all(
+    root: Optional[Path] = None,
+    *,
+    grace: float = control.DEFAULT_GRACE,
+    watcher: Optional[int] = None,
+    processes: Optional[Callable[[Path], list[dict]]] = None,
+    terminate: Optional[Callable[[int], bool]] = None,
+    exclude: Optional[list[int]] = None,
+) -> dict:
+    """停掉所有占着安装目录的本程序进程（监控 / 相册 / 守护）。
+
+    为什么不能只停 watcher
+    ----------------------
+    Inno 装之前用 RestartManager 扫「谁占着我要替换的文件」。相册
+    （`python -m roomwatch gallery`）跑在包内 `runtime\\python` 上，正好占着
+    `python313.dll`；它是个没有消息循环的控制台进程，RestartManager 关不掉，
+    30 秒后按 Abort → 安装器返回 5 并整段回滚。**2026-10-19 真机就是这样：
+    0.1.9 装了两遍都失败，版本号原地不动，随后自动重开界面还撞上
+    解包被打断，弹了 "Failed to load Python DLL"。**
+
+    返回 {"watcher": 方法名, "stopped": [pid…], "failed": [pid…]}。
+    watcher 走优雅停止（等它把 mp4 收尾）；其余进程直接终止。
+    """
+    root = Path(root or paths.PROJECT_ROOT)
+    processes = processes or _roomwatch_processes
+    terminate = terminate or _terminate_process
+    result: dict = {"watcher": "", "stopped": [], "failed": []}
+
+    pid = _watcher_pid() if watcher is None else int(watcher)
+    if pid and procutil.pid_alive(pid):
+        outcome = control.stop_watcher(root, pid, grace=grace, force=True)
+        result["watcher"] = str(outcome.get("method") or "")
+        if result["watcher"] in ("graceful", "forced"):
+            result["stopped"].append(pid)
+
+    skip = [os.getpid(), *(exclude or [])]
+    for target in select_targets(processes(root), root, exclude=skip):
+        if target in result["stopped"]:
+            continue
+        if terminate(target):
+            result["stopped"].append(target)
+        else:
+            result["failed"].append(target)
+    return result
+
+
 def wait_pid_exit(pid: int, *, timeout: float = 30.0) -> bool:
     """等某个进程退出，返回「是否已退出」。
 
@@ -474,6 +592,9 @@ def _helper_script(mode: str, delay_seconds: int) -> str:
         ":failed",
         '>>"%LOG%" echo installer failed, reopening gui if present',
         'if not exist "%APP%\\room-watch.exe" goto done',
+        # 回滚可能还在收尾：立刻启动会撞上 PyInstaller 解包被打断
+        # （弹 "Failed to load Python DLL"），等两秒再开
+        "ping -n 3 127.0.0.1 >nul 2>&1",
         'start "" "%APP%\\room-watch.exe"',
         ":done",
         # 安装包留在 %TEMP% 里没用；正在被安装器读时删不掉，失败也无所谓

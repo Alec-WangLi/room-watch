@@ -14,6 +14,30 @@
 
 ---
 
+## [0.1.10] - 2026-10-19
+
+> 真机升级 0.1.9 失败后补的修复：安装器按 `rc=5` 回滚，版本号原地不动，
+> 随后自动重开界面弹出「Failed to load Python DLL」。
+
+### 修复
+
+- **相册服务开着时更新必然失败**：`rw update` 原来只停 watcher，而相册
+  （`python -m roomwatch gallery`）也跑在包内 `runtime\python` 上，占着
+  `python313.dll`。Inno 装前的 RestartManager 关不掉一个没有消息循环的控制台
+  进程，30 秒后按 Abort → 安装器返回 5 并整段回滚（实测 04:00:49 的日志）。
+  新增 `updater.stop_all()`：按安装目录挑出所有 roomwatch 进程，
+  watcher 走优雅停止（等录像收尾），相册/守护直接终止；`rw update` 改用它。
+- **安装失败后重开界面撞上解包被打断**：回滚还没收完尾脚本就 `start` 界面，
+  PyInstaller 的解包子进程被打断，弹原生错误框
+  `Failed to load Python DLL ... _MEIxxxx\python313.dll`。现在失败分支先等 2 秒。
+
+### 测试
+
+`test_updater.py::StopAllTest` 新增 6 项：按安装目录选进程、忽略同目录的
+ffmpeg、路径大小写不敏感、字段缺失不崩、停不掉要如实报告。
+
+---
+
 ## [0.1.9] - 2026-10-19
 
 > 三个实测反馈的修复：停止后按不了启动、系统音量被改、界面没有配置入口。

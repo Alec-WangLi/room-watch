@@ -78,7 +78,7 @@
 | `roomwatch/gui.py` | 桌面界面（主窗口） | 独立进程，不 import cv2 / yaml |
 | `roomwatch/gui_settings.py` | 设置窗口（四个页签） | 同样不 import tkinter/yaml，靠注入 |
 | `roomwatch/cli.py` | 全局命令表与参数翻译 | 新增命令先改这里 |
-| `roomwatch/updater.py` | 自动更新：Releases → 版本策略 → 下载校验 → 静默安装 | 下载域名有白名单；SHA256 不过不许装 |
+| `roomwatch/updater.py` | 自动更新：Releases → 版本策略 → 下载校验 → 停占用 → 静默安装 | 下载域名白名单；SHA256 不过不许装；装前必须 `stop_all()` |
 | `roomwatch/paths.py` | 项目根 / 运行时目录 / 解释器发现 | 路径基准的唯一来源 |
 | `roomwatch/config.py` | 配置加载：主配置 + `config.local.yaml` 深合并 + 路径归一 | 别在别处直接 `yaml.safe_load(config.yaml)` |
 
@@ -277,7 +277,7 @@ room-watch-<版本>\
 
 ## E. 测试
 
-24 个文件、538 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
+24 个文件、544 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
 
 | 文件 | 用例数 | 命令 | 需要什么 |
 |---|---:|---|---|
@@ -310,6 +310,7 @@ room-watch-<版本>\
 
 > 2026-10-19 v0.1.2 实测：19 个文件全部 `OK`，共 375 项。
 > 2026-10-19 v0.1.9 实测：24 个文件全部 `OK`，共 538 项。
+> 2026-10-19 v0.1.10 实测：24 个文件全部 `OK`，共 544 项。
 
 ---
 
@@ -494,6 +495,22 @@ room-watch-<版本>\
 - **正解**：配置文件里这类值加引号（`volume_mode: "off"`）；
   `resolve_mode()` 与 `settings.snapshot()` 也对布尔做了兜底解释。
   `yaml.safe_dump` 会自动给这种字符串加引号，所以界面写的 local 文件没问题。
+
+
+### F.22 更新前必须停掉所有占用安装目录的进程
+
+- **现象（2026-10-19 真机）**：从 0.1.7 升级 0.1.9，安装器返回 **rc=5** 并整段
+  回滚，`VERSION` 原地不动；随后脚本自动重开界面，弹出原生错误框
+  `Failed to load Python DLL ... _MEIxxxx\python313.dll`。
+- **原因**：`rw update` 只停了 watcher。相册（`python -m roomwatch gallery`）
+  同样跑在包内 `runtime\python` 上，占着 `python313.dll`；Inno 装前的
+  RestartManager 关不掉这种没有消息循环的控制台进程，30 秒后按 Abort。
+  失败分支立刻 `start` 界面，又和回滚收尾抢时间，于是 PyInstaller 解包被打断。
+- **正解**：装之前调 `updater.stop_all()` —— 按「可执行文件在安装目录下 +
+  命令行含 roomwatch」挑出所有进程，watcher 走优雅停止（`control.stop_watcher`），
+  相册/守护直接 `terminate → kill`；失败分支先 `ping -n 3` 等两秒再开界面。
+- **教训**：任何「会写 runtime\」的流程（安装、替换运行时）都要先把占用者数清楚，
+  不能只盯着 watcher。`select_targets()` 是纯函数，测试里直接喂进程列表。
 
 
 ---

@@ -300,6 +300,67 @@ class StopWatcherTest(unittest.TestCase):
                 self.assertFalse(updater.stop_watcher(p))
 
 
+class StopAllTest(unittest.TestCase):
+    """更新前必须把占着安装目录的进程全停掉。
+
+    2026-10-19 真机事故：只停了 watcher，相册（gallery）还在跑，
+    它占着 runtime\python\python313.dll，Inno 的 RestartManager 关不掉一个
+    没有消息循环的控制台进程 → 30 秒后 Abort（installer rc=5）并整段回滚，
+    版本号原地不动。所以这里钉住「按安装目录挑进程」的规则。
+    """
+
+    ROOT = Path("C:/Users/x/AppData/Local/Programs/room-watch")
+
+    def _proc(self, pid: int, exe: str, *cmd: str) -> dict:
+        return {"pid": pid, "exe": exe, "cmdline": list(cmd)}
+
+    def test_picks_roomwatch_processes_under_root(self) -> None:
+        py = str(self.ROOT / "runtime" / "python" / "python.exe")
+        procs = [
+            self._proc(10, py, py, "-m", "roomwatch", "gallery"),
+            self._proc(11, "C:/Other/python.exe", "python", "-m", "roomwatch", "start"),
+            self._proc(12, py, py, "-m", "roomwatch", "update"),
+        ]
+        self.assertEqual(updater.select_targets(procs, self.ROOT, exclude=[12]), [10])
+
+    def test_ignores_non_roomwatch_exe_in_same_dir(self) -> None:
+        """改完音轨的 ffmpeg 也在安装目录里，但它是 watcher 的子进程，不该单点。"""
+        ff = str(self.ROOT / "tools" / "ffmpeg.exe")
+        procs = [self._proc(20, ff, ff, "-i", "a.wav")]
+        self.assertEqual(updater.select_targets(procs, self.ROOT), [])
+
+    def test_path_match_is_case_insensitive(self) -> None:
+        py = str(self.ROOT).upper() + "\\RUNTIME\\PYTHON\\PYTHON.EXE"
+        procs = [self._proc(30, py, py, "-m", "roomwatch", "gallery")]
+        self.assertEqual(updater.select_targets(procs, self.ROOT), [30])
+
+    def test_missing_fields_do_not_crash(self) -> None:
+        procs = [{"pid": 40}, {"pid": 41, "exe": None, "cmdline": None}]
+        self.assertEqual(updater.select_targets(procs, self.ROOT), [])
+
+    def test_stop_all_reports_who_stopped(self) -> None:
+        py = str(self.ROOT / "runtime" / "python" / "python.exe")
+        procs = [self._proc(10, py, py, "-m", "roomwatch", "gallery"),
+                 self._proc(13, py, py, "-m", "roomwatch", "guard")]
+        terminated: list[int] = []
+
+        def terminate(pid: int) -> bool:
+            terminated.append(pid)
+            return pid != 13          # 13 杀不掉，要如实报告
+
+        result = updater.stop_all(
+            self.ROOT, watcher=None, processes=lambda root: procs,
+            terminate=terminate, exclude=[99])
+        self.assertEqual(sorted(terminated), [10, 13])
+        self.assertEqual(result["stopped"], [10])
+        self.assertEqual(result["failed"], [13])
+
+    def test_stop_all_skips_missing_watcher(self) -> None:
+        result = updater.stop_all(self.ROOT, watcher=None,
+                                  processes=lambda root: [], terminate=lambda pid: True)
+        self.assertEqual(result["watcher"], "")
+
+
 class CheckCacheTest(unittest.TestCase):
     """界面用的检查结果缓存（var/state/update.json）。"""
 

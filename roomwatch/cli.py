@@ -577,9 +577,14 @@ def _cmd_update(argv: Sequence[str]) -> int:
     else:
         say("⚠ 未提供 SHA256，跳过校验（update.require_checksum=false）")
 
-    was_running = updater.stop_watcher()
-    if was_running:
-        say("已停止正在运行的监控进程")
+    # 不能只停 watcher：相册也跑在包内 runtime 上，占着 python313.dll，
+    # RestartManager 关不掉它，安装器会 Abort（rc=5）并整段回滚。
+    stopped = updater.stop_all()
+    was_running = stopped["watcher"] in ("graceful", "forced")
+    if stopped["stopped"]:
+        say(f"已停止 {len(stopped['stopped'])} 个占着安装目录的进程（监控/相册/守护）")
+    if stopped["failed"]:
+        say(f"⚠ 有 {len(stopped['failed'])} 个进程没能停下，安装可能失败（详见日志）")
 
     # 交接给安装器：本进程就是包内 runtime\python，RestartManager 关不掉它，
     # 自己调 setup.exe 会被判 Abort（返回 5 并回滚）。详见 updater.handoff_install。
