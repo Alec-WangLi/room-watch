@@ -130,6 +130,11 @@ python -m venv .venv
 GitHub 匿名 API 限流 60 次/小时，被限流时走 `/releases/latest` 的 302 拿 tag。
 不要为此引入 token —— 客户端不该存任何凭据。
 
+2026-10-19 实测：这次真实网络下 API 正是被限流的，**回退路径连资产地址拼装与
+SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只在单测里成立。
+但回退路径拿不到 `assets` 列表，`Release.installer_asset()` 是按命名约定合成的，
+所以 G.4 的资产命名一旦改了，回退路径会静默找不到包。
+
 ---
 
 ## C. 全局命令
@@ -437,6 +442,43 @@ room-watch-<版本>\
 - `.ps1`（`build-exe.ps1` / `install-shortcut.ps1` / `install-autostart.ps1`）带 BOM，
   否则 PowerShell 5.1 按 ANSI 解码，中文乱码。
 
+### G.4 开源仓库与发版
+
+- 仓库：<https://github.com/Alec-WangLi/room-watch>（public，主分支 `main`）。
+- 许可证 **AGPL-3.0**，原因写在 `README.md`：`models/yolov8n.onnx` 来自 Ultralytics，
+  本身即 AGPL-3.0，主许可证与之一致才不会自相矛盾。`NOTICE` 逐项列第三方来源。
+- **发版一条命令**（幂等，重复跑只补缺失资产）：
+
+  ```
+  set GH_TOKEN=ghp_xxx        :: PowerShell: $env:GH_TOKEN="ghp_xxx"
+  python scripts/release.py
+  ```
+
+  它做：读 `VERSION` → 算 SHA256 并写 `.sha256` → 在 `main` 当前提交上建 tag
+  → 建 Release → 上传两个资产。仓库名可用 `RW_REPO` 覆盖（fork 后自己发版）。
+
+- **资产命名是硬约束**，自动更新靠正则 `room-watch-(\d+\.\d+\.\d+)-setup\.exe$` 匹配：
+  `room-watch-<版本>-setup.exe` + `room-watch-<版本>-setup.exe.sha256`。tag 必须 `v<版本>`。
+- **不要勾 prerelease**：`/releases/latest` 与 302 回退都不返回预发布，等于自动更新看不见它。
+- 打 tag = 对外发布，按第 12 条版本纪律需所有者批准。
+
+### G.5 推送权限与历史重写（2026-10-19 真机踩过）
+
+- **`workflow` scope 是硬门槛**：缺它的 token 推送 `.github/workflows/` 下任何文件，
+  GitHub 会让**整条 push 被拒**（不是该文件单独失败），报
+  `refusing to allow an OAuth App to create or update workflow ... without workflow scope`。
+  所以 CI 定义当前放 `docs/ci-tests.yml`，启用方式见 `docs/publishing.md` 0.1 节（网页粘贴即可）。
+- 换 token 不解决问题：本机 GCM 存的是 `gho_`（classic OAuth，有 `repo` 无 `workflow`）；
+  GitHub CLI 设备流拿到的是 `ghu_`（GitHub App 用户 token），对**未安装该 App 的仓库直接 403**。
+  真要用命令行改 CI，只能要一个带 `workflow` 的 classic PAT。
+- **`git filter-repo` 会删掉 remote**：每次 `--replace-text` / `--invert-paths` 之后必须
+  重新 `git remote add origin ...`，否则 `git push` 报「没有配置远程」。
+- filter-repo 的替换规则文件**必须用 Python 写**：bash heredoc 会把 `\U` 吃掉；
+  且 Windows 上 Python 的 `/tmp` 与 git-bash 的 `/tmp` 不是同一处（前者解析成 `C:\tmp`）。
+- 历史已重写多轮（清真实 webhook key、清 `C:\Users\<本机名>`）。**任何旧克隆都不得再推**，
+  否则会把清理掉的内容带回来；要重建就删库重建，别强推。
+
+
 ---
 
 ## H. 给 AI 的行为约定
@@ -460,6 +502,11 @@ room-watch-<版本>\
     越界会被 `tests/test_paths.py::VersionTest::test_minor_bump_requires_approval` 判红。
     改版本号须同步在 `CHANGELOG.md` 顶部加一节，并跑 `rw version` 与 `rw test` 验证。
 13. **不要替用户宣布「正式版」**。版本号里的 `0.x` 就是测试版，说「正式版」前先确认基线。
+14. **不要凭空往 `.github/workflows/` 加文件**。当前 token 缺 `workflow` scope，
+    加了会让整条 push 失败。CI 定义改 `docs/ci-tests.yml`，启用交给网页操作（G.5）。
+15. **不要用 `git credential fill` 之外的方式猜凭据，也不要把取到的 token 打印出来**。
+    2026-10-19 就因为脚本直接 echo 了凭据变量的值，把 token 打进了会话日志。
+    读凭据只落文件、不落 stdout，用完立即删除。
 
 ---
 
@@ -475,3 +522,12 @@ room-watch-<版本>\
 4. **~~`install-autostart.ps1` 硬编码绝对路径~~（已在 v0.1.0 修掉）** ——
    现在用 `$PSScriptRoot` 推导项目根，参数改为 `-m roomwatch guard --once`，并补了 BOM。
    保留这条记录，避免有人再「优化」回硬编码。
+5. **CI 未启用** —— 定义在 `docs/ci-tests.yml`，要所有者网页粘贴到
+   `.github/workflows/tests.yml` 才生效。**暂缓原因**：token 缺 `workflow` scope（G.5），
+   命令行推不上去。
+6. **旧企业微信 webhook 必须作废重建** —— 那个 key 曾进过 git 历史（已重写清除），
+   按泄露处理：企业微信后台删掉该群机器人重建，新 key 只进 `config.local.yaml`。
+   **待所有者本人操作**，代码侧已无需改动。
+7. **Watcher 每 30~63 分钟静默退出未根治** —— 现靠 guardian 常驻兜底；
+   验证需要本人双击 `scripts/start-guardian.bat` 脱离会话运行（`schtasks.exe` 在系统黑名单）。
+8. **未在干净机器上验证过安装包** —— 本机虽走包内解释器，但同机存在开发环境。
