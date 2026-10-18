@@ -85,7 +85,11 @@ COMMANDS: dict[str, Command] = {
     "volume-set": Command("直接设置系统主音量（0~100）", "watcher",
                           takes="--volume-set", requires_value=True),
     "storage": Command("查看磁盘占用、容量上限与最旧文件", "watcher", ("--storage",)),
+    "stop": Command("优雅停止监控：先让录像收尾，再退出"),
     "gallery": Command("启动本地相册（默认 127.0.0.1:8765）", "gallery"),
+    "config": Command("读取或修改界面设置（--json / --set 键=值 / --test）"),
+    "autostart": Command("开机自启：查看状态或开启/关闭（--json / --enable / --disable）"),
+    "identity": Command("查看或清除本人人脸模板（--json / --clear）"),
     "guard": Command("守护进程：保证监控进程一直活着", "guardian"),
     "push": Command("配置微信/Server酱推送渠道", "setup_push"),
     "setup": Command("首次配置向导：摄像头、微信推送、相册密码、开机自启", "wizard"),
@@ -595,6 +599,240 @@ def _cmd_update(argv: Sequence[str]) -> int:
     return done(0, handed_off=True, **found)
 
 
+# ---------------------------------------------------------------- 界面支撑命令
+#
+# 这四个命令是给桌面界面用的：界面进程（打包后）只有 tkinter + Pillow，
+# 读不了 YAML、跑不了 cv2、也不敢直接动注册表。所以一律由界面起子进程，
+# 这里输出**一行 JSON** 让它解析。JSON 全部 ensure_ascii=True：
+# 中文控制台是 GBK，直接吐中文可能抛 UnicodeEncodeError，把成功变成失败。
+
+
+def _status_pid() -> int:
+    """从 status.json 取 watcher 的 PID（读不到返回 0）。"""
+    path = paths.STATE_DIR / "status.json"
+    try:
+        return int(json.loads(path.read_text(encoding="utf-8")).get("pid") or 0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 0
+
+
+def _cmd_stop(argv: Sequence[str]) -> int:
+    """优雅停止：写 stop.request，等它自己收尾，超时再强杀。"""
+    from . import control, procutil
+
+    if argv:
+        raise UsageError(f"rw stop 不接受参数，收到：{' '.join(argv)}")
+
+    pid = _status_pid()
+    if not pid or not procutil.pid_alive(pid):
+        # 进程已经不在，顺手清掉可能残留的请求文件
+        control.clear_stop_request(paths.PROJECT_ROOT)
+        print("监控没有在运行。")
+        return 0
+
+    print(f"正在停止 PID {pid}（最多等 {control.DEFAULT_GRACE:.0f} 秒让录像收尾）…")
+    result = control.stop_watcher(
+        paths.PROJECT_ROOT, pid, grace=control.DEFAULT_GRACE, force=True)
+    labels = {
+        "graceful": "已收尾退出（录像完整）",
+        "already-stopped": "本来就没在跑",
+        "forced": "超时后强制结束（正在写的那段录像可能不完整）",
+        "timeout": "还没停下来",
+        "stuck": "强杀后仍未消失，请用任务管理器结束",
+    }
+    print(f"{labels.get(result['method'], result['method'])}，用时 {result['waited']:.0f} 秒")
+    return 0 if result["method"] in ("graceful", "already-stopped", "forced") else 1
+
+
+def _pairs_after(argv: Sequence[str], flag: str) -> dict:
+    """收集 `--set 键=值 键=值` 里的键值对。值里含 = 也安全（只按第一个 = 切）。"""
+    items: list[str] = []
+    idx = 0
+    while idx < len(argv):
+        if argv[idx] == flag:
+            idx += 1
+            while idx < len(argv) and not argv[idx].startswith("--"):
+                items.append(argv[idx])
+                idx += 1
+            continue
+        idx += 1
+    pairs: dict = {}
+    for item in items:
+        if "=" not in item:
+            raise UsageError(f"{flag} 之后每项都要写成 键=值，收到：{item}")
+        key, _, value = item.partition("=")
+        pairs[key.strip()] = value
+    return pairs
+
+
+def _cmd_config(argv: Sequence[str]) -> int:
+    """读设置 / 改设置 / 发测试消息。界面「设置」窗口的全部后端。"""
+    from . import settings
+
+    root = paths.PROJECT_ROOT
+    json_mode = "--json" in argv
+
+    if "--help" in argv or "-h" in argv:
+        print(
+            "用法：rw config [--json] [--set 键=值 …] [--test]\n"
+            "  --json       机器可读输出（界面用）\n"
+            "  --set        保存一批设置到 config.local.yaml（先全量校验再落盘）\n"
+            "  --test       用当前生效的凭据发一条测试消息"
+        )
+        return 0
+
+    if "--test" in argv:
+        return _config_test(root, json_mode)
+
+    if "--set" in argv:
+        changes = _pairs_after(argv, "--set")
+        if not changes:
+            raise UsageError("--set 后面要跟至少一个 键=值")
+        result = settings.apply(root, changes)
+        if json_mode:
+            print(json.dumps(result, ensure_ascii=True))
+        else:
+            for key in result.get("applied") or []:
+                print(f"✓ {key}")
+            for key, message in (result.get("errors") or {}).items():
+                print(f"✗ {key}: {message}")
+            if result["ok"]:
+                print("已保存到 config.local.yaml，重启监控后生效。")
+        return 0 if result["ok"] else 1
+
+    snap = settings.snapshot(root)
+    if json_mode:
+        print(json.dumps({"ok": True, **snap}, ensure_ascii=True))
+        return 0
+
+    for section in snap["sections"]:
+        print(f"[{section}]")
+        for key, meta in snap["labels"].items():
+            if meta["section"] != section:
+                continue
+            if meta.get("secret"):
+                info = snap["secrets"].get(key) or {}
+                shown = f"已设置 {info.get('tail')}" if info.get("set") else "未设置"
+            else:
+                shown = snap["values"].get(key)
+            print(f"  {meta['label']:<20s} {shown}")
+    return 0
+
+
+def _config_test(root: Path, json_mode: bool) -> int:
+    """用生效配置里的凭据发一条测试消息。"""
+    import io
+    from contextlib import redirect_stdout
+
+    from .config import load_config
+    from .setup_push import send_test
+
+    cfg = load_config(str(root / "config.yaml"))
+    notify = cfg.get("notify") or {}
+    channel = str(notify.get("channel") or "none")
+    creds: dict = {}
+    if channel == "wecom_bot":
+        creds = {"webhook": str((notify.get("wecom_bot") or {}).get("webhook") or "")}
+    elif channel == "wxpusher":
+        block = notify.get("wxpusher") or {}
+        creds = {"token": str(block.get("app_token") or ""), "uid": str(block.get("uid") or "")}
+    elif channel == "serverchan":
+        creds = {"sendkey": str((notify.get("serverchan") or {}).get("sendkey") or "")}
+
+    missing = [key for key, value in creds.items() if not value or "replace_me" in value.lower()]
+    if channel == "none" or missing:
+        payload = {"ok": False, "channel": channel,
+                   "message": "推送渠道是 none" if channel == "none"
+                   else f"凭据不完整：缺少 {', '.join(missing)}"}
+    else:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            ok = send_test(channel, creds)
+        detail = buffer.getvalue().strip()
+        payload = {"ok": bool(ok), "channel": channel,
+                   "message": "" if ok else (detail[-600:] or "发送失败，服务端没有返回原因")}
+
+    if json_mode:
+        print(json.dumps(payload, ensure_ascii=True))
+    else:
+        print(("✓ " if payload["ok"] else "✗ ") + f"{payload['channel']}："
+              + ("测试消息已发出" if payload["ok"] else payload["message"]))
+    return 0 if payload["ok"] else 1
+
+
+def _cmd_autostart(argv: Sequence[str]) -> int:
+    """开机自启：查状态、开启、关闭。"""
+    from . import autostart
+
+    root = paths.PROJECT_ROOT
+    json_mode = "--json" in argv
+    ok, message = True, ""
+
+    if "--help" in argv or "-h" in argv:
+        print(
+            "用法：rw autostart [--json] [--enable | --disable]\n"
+            "  --enable   写入 HKCU\\...\\Run\\RoomWatch（拉起守护进程）\n"
+            "  --disable  删除该注册表值"
+        )
+        return 0
+
+    if "--enable" in argv:
+        ok, message = autostart.enable(root, paths.find_python(), root / "config.yaml")
+    elif "--disable" in argv:
+        ok, message = autostart.disable()
+
+    info = autostart.status(root)
+    if json_mode:
+        print(json.dumps({"ok": ok, "message": message, "autostart": info}, ensure_ascii=True))
+        return 0 if ok else 1
+
+    if message:
+        print(("✓ " if ok else "✗ ") + message)
+    state = "已开启" if info["enabled"] else "未开启"
+    print(f"当前状态：{state}" + (f"（{info['command']}）" if info["command"] else ""))
+    if info["enabled"] and not info["points_to_this_install"]:
+        print("⚠ 注册表里的路径不是当前安装目录，建议关掉再重新开启。")
+    if not info["supported"]:
+        print("（非 Windows 系统，此功能不可用）")
+    return 0 if ok else 1
+
+
+def _cmd_identity(argv: Sequence[str]) -> int:
+    """查看/清除本人人脸模板（只回元信息，绝不输出特征）。"""
+    from .config import load_config
+    from .identity import clear_owner, owner_summary
+
+    root = paths.PROJECT_ROOT
+    json_mode = "--json" in argv
+    cfg = load_config(str(root / "config.yaml"))
+    owner = str((cfg.get("identity") or {}).get("owner_file") or
+                root / "data" / "identity" / "owner.npz")
+
+    message = ""
+    ok = True
+    if "--clear" in argv:
+        removed = clear_owner(owner)
+        ok = removed or not Path(owner).exists()
+        message = "已删除本人模板" if removed else "本来就没有本人模板"
+
+    info = owner_summary(owner)
+    if json_mode:
+        print(json.dumps({"ok": ok, "message": message, "identity": info}, ensure_ascii=True))
+        return 0 if ok else 1
+
+    if message:
+        print(("✓ " if ok else "✗ ") + message)
+    if info["registered"]:
+        print(f"本人模板：{info['path']}")
+        print(f"  {info['samples']} 个样本 · {info['dim']} 维 · 注册于 "
+              f"{info['created_at'] or info['mtime']} · {info['size']} 字节")
+        if info["error"]:
+            print(f"  ⚠ 读取有问题：{info['error']}")
+    else:
+        print("本人模板：未注册（所有脸都会按访客处理）")
+    return 0 if ok else 1
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -623,6 +861,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_version(rest)
         if name == "gui":
             return _cmd_gui(rest)
+        if name == "stop":
+            return _cmd_stop(rest)
+        if name == "config":
+            return _cmd_config(rest)
+        if name == "autostart":
+            return _cmd_autostart(rest)
+        if name == "identity":
+            return _cmd_identity(rest)
 
         spec = COMMANDS[name]
         translated = translate(name, rest)

@@ -70,8 +70,13 @@
 | `roomwatch/videopush.py` | 录像推送：ffmpeg 瘦身 → `upload_media` → 发文件 | 后台单线程队列，队列满即丢弃，不阻塞主循环 |
 | `roomwatch/gallery.py` | 本地相册 HTTP | 只用标准库，自实现 Range |
 | `roomwatch/guardian.py` | 守护进程（判活/退避/单实例锁） | |
+| `roomwatch/procutil.py` | 进程判活 / 等退出 / 结束 | 判活的唯一实现，updater 也用它 |
+| `roomwatch/control.py` | 停止协议：`stop.request` + 两段式停止 | 不许再用 taskkill 当主路径 |
+| `roomwatch/settings.py` | 界面设置的后端：读生效值、写 `config.local.yaml`、复读校验 | 凭据只回掩码 |
+| `roomwatch/autostart.py` | 开机自启（winreg + VBS） | 向导与界面设置共用 |
 | `roomwatch/setup_push.py` | 推送配置引导 | |
-| `roomwatch/gui.py` | 桌面界面 | 独立进程，不 import cv2 |
+| `roomwatch/gui.py` | 桌面界面（主窗口） | 独立进程，不 import cv2 / yaml |
+| `roomwatch/gui_settings.py` | 设置窗口（四个页签） | 同样不 import tkinter/yaml，靠注入 |
 | `roomwatch/cli.py` | 全局命令表与参数翻译 | 新增命令先改这里 |
 | `roomwatch/updater.py` | 自动更新：Releases → 版本策略 → 下载校验 → 静默安装 | 下载域名有白名单；SHA256 不过不许装 |
 | `roomwatch/paths.py` | 项目根 / 运行时目录 / 解释器发现 | 路径基准的唯一来源 |
@@ -170,6 +175,10 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 | 验证录像推送 | `rw push-video PATH`（需 webhook 已配好） |
 | 测试 | `rw test [--fast]` |
 | 版本 | `rw version`（带 git 短哈希） |
+| 停止监控（优雅） | `rw stop` |
+| 读/改设置 | `rw config`（`--json` / `--set 键=值` / `--test`） |
+| 开机自启 | `rw autostart`（`--json` / `--enable` / `--disable`） |
+| 本人模板 | `rw identity`（`--json` / `--clear`） |
 | 桌面界面 | `rw gui` |
 
 每个子命令都支持追加原模块参数（`--config config.local.yaml` 等）。
@@ -204,7 +213,7 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 | `data/captures/<日期>/` | 抓拍 jpg、录像 mp4、音频 wav | 否（隐私） |
 | `data/identity/owner.npz` | 本人人脸特征 | 否（生物特征） |
 | `var/logs/` | watcher / gallery / probe / gui-selftest | 否 |
-| `var/state/` | status.json / guardian_state.json / guardian.lock | 否 |
+| `var/state/` | status.json / guardian_state.json / guardian.lock / **stop.request** / **volume_backup.json** | 否 |
 | `var/db/events.db` | 事件库 | 否 |
 | `var/media/` | preview.jpg 等临时产物 | 否 |
 | `var/cache/voice/` | 语音缓存（可重建） | 否 |
@@ -268,7 +277,7 @@ room-watch-<版本>\
 
 ## E. 测试
 
-19 个文件、375 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
+24 个文件、538 项，全部可离线运行（`tests/` 下，均带 `unittest.main()`）：
 
 | 文件 | 用例数 | 命令 | 需要什么 |
 |---|---:|---|---|
@@ -291,10 +300,16 @@ room-watch-<版本>\
 | `test_gate.py` | 8 | `python tests/test_gate.py` | 合成图，钉住事件期间不跳帧 |
 | `test_onnx_detector.py` | 13 | `python tests/test_onnx_detector.py` | 合成张量，不加载模型 |
 | `test_gallery_auth.py` | 18 | `python tests/test_gallery_auth.py` | 真起 HTTP，约 2.5 秒 |
+| `test_procutil.py` | 8 | `python tests/test_procutil.py` | 纯逻辑，不真杀进程 |
+| `test_control.py` | 10 | `python tests/test_control.py` | 临时目录，注入假判活 |
+| `test_settings.py` | 16 | `python tests/test_settings.py` | 临时项目 + 临时配置 |
+| `test_autostart.py` | 12 | `python tests/test_autostart.py` | 不碰真注册表（读写注入） |
+| `test_volume_mode.py` | 15 | `python tests/test_volume_mode.py` | patch 掉 pycaw 调用 |
 
 全量：`rw test`（约 90 秒）；`rw test --fast` 跳过集成测试。
 
 > 2026-10-19 v0.1.2 实测：19 个文件全部 `OK`，共 375 项。
+> 2026-10-19 v0.1.9 实测：24 个文件全部 `OK`，共 538 项。
 
 ---
 
@@ -326,12 +341,16 @@ room-watch-<版本>\
   只在 `TorchDetector.__init__` 和 `export()` 内部惰性 import。
 - **验证**：`grep -rn "ultralytics" roomwatch/` 只应命中注释与这两个函数体。
 
-### F.4 判断是否活着必须重算心跳
+### F.4 判断是否活着 = 心跳新鲜 **且** PID 还在
 
 - **现象**：进程被强杀后，`status.json` 里的 `stale` 仍是 `false`，把死的报成在线。
 - **原因**：进程被杀前来不及再写状态。
 - **正解**：在读取那一刻重算 `now - last_frame_at > heartbeat.stale_after_seconds`。
-  `rw status`、相册页、桌面界面都按这个规则实现（`gui.read_state()`）。
+- **2026-10-19 补充（真机事故）**：只算心跳还不够。0.1.7 的界面在 `taskkill /F`
+  之后仍把进程报成在线，因为 `last_frame_at` 还很新（≤120 秒），
+  于是「启动监控」按钮一直禁用 —— 用户看到的是「停止只停到一半」。
+  现在 `gui.read_state()` 必须同时满足 `procutil.pid_alive(pid)` 与心跳新鲜；
+  判活的唯一实现是 `procutil.pid_alive()`（`updater` 已改为委托它）。
 
 ### F.5 本机 `Start-Process`（PowerShell）无法启动进程
 
@@ -424,6 +443,58 @@ room-watch-<版本>\
   且服务之后仍能回 200。把 `CLIENT_GONE` 清空即复现满屏堆栈。
 - **反例提醒**：别用 `except OSError: pass` 一把抓 —— 磁盘读失败也会被吞掉。
   文件打开错误单独回 500，只有发送阶段的断开才静默。
+
+### F.17 停止监控必须走 stop.request，不许回到 taskkill
+
+- **背景**：0.1.7 的界面停止按钮就是 `taskkill /F`。三个后果全在真机上出现过：
+  正在写的 mp4 头没写完（相册里点开是坏的）、音轨没合并、抬高过的主音量不还原。
+- **正解**：`control.stop_watcher()` 两段式 —— 先写 `var/state/stop.request`
+  （JSON，含目标 PID），watcher 主循环每秒查一次，命中就 `break`，
+  走既有的 `finally` 收尾；等 `control.DEFAULT_GRACE`（20 秒）还没退，
+  再由**用户确认**后强杀（`gui.force_kill_command`）。
+- 请求文件必须带 PID：PID 会复用，残留请求不许秒杀新进程；
+  watcher 启动时还会 `clear_stop_request()` 清一次残留。
+- 界面在停止过程中显示「正在停止…（录像收尾中）」，两个按钮同时锁住。
+- 实测（2026-10-19）：优雅停止 1 秒完成，`stop.request` 自动清理。
+
+### F.18 播报音量与录音无关，别拿系统主音量凑响度
+
+- **现象**：日志 `系统音量：主音量 2.0% → 70.0%`。用户每次开始监控，
+  电脑的系统音量就被改；强杀后还原不回来，音量永久停在 70%。
+- **原因**：`voice.ensure_system_volume: 70` 会调 `SetMasterVolumeLevelScalar`。
+  而**录音走麦克风输入**，与系统播放音量毫无关系——抬主音量只影响 TTS 播报。
+- **正解**：`voice.volume_mode` 三档，默认 `off`：
+  `off` 完全不碰 / `session` 只改本进程音轨（音量合成器里那条）/
+  `master` 旧行为（显式选择，界面有警示）。判定统一走 `audio_device.resolve_mode()`。
+  `master` 档改前会写 `var/state/volume_backup.json`，
+  下次启动发现记录里的进程已不在就自动补还原（`restore_backup()`）。
+
+### F.19 界面设置一律写 config.local.yaml
+
+- **原因**：安装包 `[Files]` 是 `Source: {#SourceDir}\*` + `ignoreversion`，
+  **升级会整体覆盖 `config.yaml`**。界面把用户设置写进主配置，下次更新就静默丢失，
+  症状是「明明存过又变回去了」。
+- **正解**：`settings.apply()` 只写 `config.local.yaml`（深合并、升级保留），
+  与 `rw push` / `rw setup` 一致；写完必须 `load_config()` 复读校验，
+  不一致就报错（不许静默成功）。
+- 界面进程（打包后）只有 tkinter + Pillow：读配置走 `rw config --json` 子进程，
+  **不要在 gui 里 import yaml**。
+
+### F.20 密钥只能回掩码
+
+- `settings.snapshot()` 对凭据只返回 `{set, tail}`（末 4 位），全文不出进程；
+  界面显示「已设置 …5179（留空＝不改）」，输入框留空表示不修改。
+- 判定「占位串」只看 `replace_me`（与 `setup_push` 一致）。
+  用前缀判定会把 Server酱真实 key（SCT 开头）当成占位符——踩过一次。
+
+### F.21 YAML 1.1 把裸 off/on 当布尔
+
+- **现象**：`config.yaml` 写 `volume_mode: off`，读出来是 `False`，
+  界面上那一项变成空、后端还以为模式未知。
+- **正解**：配置文件里这类值加引号（`volume_mode: "off"`）；
+  `resolve_mode()` 与 `settings.snapshot()` 也对布尔做了兜底解释。
+  `yaml.safe_dump` 会自动给这种字符串加引号，所以界面写的 local 文件没问题。
+
 
 ---
 
@@ -545,8 +616,8 @@ room-watch-<版本>\
    **暂缓原因**：需要用户确认机器安全策略（WMI 与 `Start-Process` 都被拦）。
 2. **录像在本人坐在电脑前时仍会录** —— `behavior.skip_when_user_active` 只抑制推送。
    实测约 65.6 MB/分钟，长期会吃满盘。**暂缓原因**：这是产品决策，需用户拍板。
-3. **桌面的「停止监控」不优雅** —— 用 `taskkill /F`，不保证 mp4 收尾。
-   可改成向进程发关闭信号并等待收尾（`watcher` 已有 KeyboardInterrupt 收尾路径）。
+3. ~~桌面的「停止监控」不优雅~~（**0.1.9 已修**）—— 改成 `stop.request` + 两段式停止，
+   见 F.17。保留这条记录，避免有人再「优化」回 `taskkill /F`。
 4. **~~`install-autostart.ps1` 硬编码绝对路径~~（已在 v0.1.0 修掉）** ——
    现在用 `$PSScriptRoot` 推导项目根，参数改为 `-m roomwatch guard --once`，并补了 BOM。
    保留这条记录，避免有人再「优化」回硬编码。

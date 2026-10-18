@@ -165,11 +165,17 @@ voice:
     lookahead_ms: 20        # 包络前瞻。没有它，音频开头的峰值会漏出压缩，白做
     smooth_ms: 15           # 增益平滑，防止音量一跳一跳
 
-  # —— 系统音量保底 ——
-  # 代码里做到满刻度只解决一半：Windows 主音量如果只有 10%，下游又砍掉 20 dB。
-  # 实测你这台机器主音量就是 10%，所以这里保底到 70%，退出时自动还原。
-  ensure_system_volume: 70      # 0 = 不碰系统音量
-  restore_system_volume: true   # 退出时还原成启动前的音量
+  # —— 播报音量策略 ——
+  # 先分清两件事：**录音走麦克风输入**，与系统播放音量完全无关。
+  # 抬系统主音量只是为了 TTS 播报能被听见，代价却是改掉了你自己的音量设置
+  # （0.1.7 实测：主音量从 2% 被改成 70%，强杀后还还原不回来）。
+  #   off     完全不碰系统音量（默认）。你的音量归你管
+  #   session 只把本程序在「音量合成器」里的那条拉到 100%，不动系统主音量
+  #   master  旧行为：主音量保底到 ensure_system_volume（会真的改你的系统音量）
+  # 界面「设置 → 声音」里可直接选；老配置只有 ensure_system_volume > 0 时按 master 解释。
+  volume_mode: "off"        # 加引号：YAML 1.1 会把裸 off 当成布尔 False
+  ensure_system_volume: 0       # 仅 master 档生效；0 = 不设保底
+  restore_system_volume: true   # master 档退出时还原成启动前的音量
 
 heartbeat:
   # 定时报平安。这是「监控还活着吗」最可靠的答案：

@@ -1,22 +1,21 @@
-"""桌面界面的状态层单测（不 import tkinter，任何解释器都能跑）。
+"""界面状态层的单测（不 import tkinter，任何解释器都能跑）。
 
     python tests/test_gui_state.py
 
 界面最容易骗人的地方是「在线」：进程被强杀后 status.json 里留下的
-stale 仍然是 false。所以判活必须在**读取的那一刻**重算，
-这里就是在钉住这个行为。
+stale 仍然是 false，`last_frame_at` 也还很新。0.1.7 的真实事故是——
+停止后最多 120 秒里界面仍报在线，于是「启动监控」一直按不动。
+所以判活必须**同时**看：心跳新鲜 + PID 还活着。
 """
 
 from __future__ import annotations
 
-# 直接运行 tests/xxx.py 时把项目根加入 sys.path；`rw test` / `-m unittest` 不需要这一步。
 import os as _os
 import sys as _sys
 
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import json
-import os
 import sqlite3
 import sys
 import tempfile
@@ -25,7 +24,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from roomwatch import gui
+from roomwatch import control, gui
+
+ALIVE = lambda pid: True      # noqa: E731 - 测试里的假判活
+DEAD = lambda pid: False      # noqa: E731
 
 
 def write_status(root: Path, seconds_ago: float, **extra) -> None:
@@ -49,24 +51,36 @@ def write_status(root: Path, seconds_ago: float, **extra) -> None:
 class ReadStateTest(unittest.TestCase):
     def test_missing_status_means_offline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            state = gui.read_state(Path(tmp))
+            state = gui.read_state(Path(tmp), alive=ALIVE)
         self.assertFalse(state.online)
         self.assertIn("未运行", state.caption)
+        self.assertEqual(state.phase, "stopped")
 
-    def test_fresh_heartbeat_is_online(self) -> None:
+    def test_fresh_heartbeat_with_live_pid_is_online(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_status(root, seconds_ago=1)
-            state = gui.read_state(root)
+            state = gui.read_state(root, alive=ALIVE)
         self.assertTrue(state.online)
+        self.assertEqual(state.phase, "running")
         self.assertEqual(state.pid, 1234)
         self.assertEqual(state.events_today, 3)
+
+    def test_fresh_heartbeat_but_dead_pid_is_offline(self) -> None:
+        """这就是「停止后点不了启动」的根因，必须判离线。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_status(root, seconds_ago=1)
+            state = gui.read_state(root, alive=DEAD)
+        self.assertFalse(state.online)
+        self.assertEqual(state.phase, "stopped")
+        self.assertIn("已停止", state.caption)
 
     def test_old_heartbeat_is_offline_even_if_file_says_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_status(root, seconds_ago=600)
-            state = gui.read_state(root)
+            state = gui.read_state(root, alive=ALIVE)
         self.assertFalse(state.online)
         self.assertGreater(state.stale_seconds, 120)
 
@@ -76,7 +90,7 @@ class ReadStateTest(unittest.TestCase):
             state_dir = root / "var" / "state"
             state_dir.mkdir(parents=True)
             (state_dir / "status.json").write_text("{not json", encoding="utf-8")
-            state = gui.read_state(root)
+            state = gui.read_state(root, alive=ALIVE)
         self.assertFalse(state.online)
         self.assertIn("读不了", state.caption)
 
@@ -84,8 +98,46 @@ class ReadStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_status(root, seconds_ago=1, recording=True)
-            state = gui.read_state(root)
+            state = gui.read_state(root, alive=ALIVE)
         self.assertTrue(state.recording)
+
+    def test_stop_request_puts_state_in_stopping_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_status(root, seconds_ago=1)
+            control.request_stop(root, 1234)
+            state = gui.read_state(root, alive=ALIVE)
+        self.assertEqual(state.phase, "stopping")
+        self.assertIn("正在停止", state.caption)
+        self.assertTrue(state.online)
+
+    def test_stale_stop_request_for_another_pid_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_status(root, seconds_ago=1)
+            control.request_stop(root, 999)
+            state = gui.read_state(root, alive=ALIVE)
+        self.assertEqual(state.phase, "running")
+
+
+class ButtonStateTest(unittest.TestCase):
+    def test_online_enables_stop_only(self) -> None:
+        state = gui.MonitorState(online=True, pid=1, phase="running")
+        self.assertEqual(gui.button_states(state), ("disabled", "normal"))
+
+    def test_offline_enables_start_only(self) -> None:
+        state = gui.MonitorState(online=False, phase="stopped")
+        self.assertEqual(gui.button_states(state), ("normal", "disabled"))
+
+    def test_busy_disables_both(self) -> None:
+        """启动/停止进行中，两个按钮都锁住：不给「再点一次」的机会。"""
+        for busy in ("starting", "stopping", "probe", "enroll"):
+            state = gui.MonitorState(online=False, phase="stopped")
+            self.assertEqual(gui.button_states(state, busy), ("disabled", "disabled"), busy)
+
+    def test_busy_overrides_online_state(self) -> None:
+        state = gui.MonitorState(online=True, pid=1, phase="stopping")
+        self.assertEqual(gui.button_states(state, "stopping"), ("disabled", "disabled"))
 
 
 class ReadEventsTest(unittest.TestCase):
@@ -142,6 +194,46 @@ class LatestSnapshotTest(unittest.TestCase):
             self.assertIsNone(gui.latest_snapshot(Path(tmp)))
 
 
+class PreviewImageTest(unittest.TestCase):
+    """预览图不能只看抓拍目录：probe 写的是 var/media/preview.jpg。"""
+
+    def test_preview_wins_when_newer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cap = root / "data" / "captures" / "2026-10-19" / "031100.jpg"
+            cap.parent.mkdir(parents=True)
+            cap.write_bytes(b"x")
+            preview = root / "var" / "media" / "preview.jpg"
+            preview.parent.mkdir(parents=True)
+            preview.write_bytes(b"y")
+            import os
+            os.utime(cap, (1_700_000_000, 1_700_000_000))
+            os.utime(preview, (1_700_000_600, 1_700_000_600))
+            path, kind = gui.preview_image(root)
+        self.assertEqual(path, preview)
+        self.assertEqual(kind, "preview")
+
+    def test_capture_wins_when_newer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cap = root / "data" / "captures" / "2026-10-19" / "031100.jpg"
+            cap.parent.mkdir(parents=True)
+            cap.write_bytes(b"x")
+            preview = root / "var" / "media" / "preview.jpg"
+            preview.parent.mkdir(parents=True)
+            preview.write_bytes(b"y")
+            import os
+            os.utime(preview, (1_700_000_000, 1_700_000_000))
+            os.utime(cap, (1_700_000_600, 1_700_000_600))
+            path, kind = gui.preview_image(root)
+        self.assertEqual(path, cap)
+        self.assertEqual(kind, "capture")
+
+    def test_nothing_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(gui.preview_image(Path(tmp)), (None, ""))
+
+
 class ControlTest(unittest.TestCase):
     def test_start_command_layout(self) -> None:
         cmd = gui.start_command("C:/py/python.exe", Path("C:/proj"), "C:/proj/config.yaml")
@@ -149,8 +241,13 @@ class ControlTest(unittest.TestCase):
         self.assertIn("start", cmd)
         self.assertIn("C:/proj/config.yaml", cmd)
 
-    def test_stop_command_uses_taskkill(self) -> None:
-        self.assertEqual(gui.stop_command(4321), ["taskkill", "/PID", "4321", "/F"])
+    def test_force_kill_command_is_the_fallback_only(self) -> None:
+        self.assertEqual(gui.force_kill_command(4321), ["taskkill", "/PID", "4321", "/F"])
+
+    def test_probe_command_asks_for_json(self) -> None:
+        cmd = gui.probe_command("C:/py/python.exe", "C:/proj/config.yaml")
+        self.assertIn("probe", cmd)
+        self.assertIn("--json", cmd)
 
 
 class ParseArgsTest(unittest.TestCase):

@@ -55,10 +55,25 @@ scripts\setup-hooks.bat
 4. 想放到桌面：右键运行 `scripts\install-shortcut.ps1`。
 
 窗口里能做的事：启动 / 停止监控、打开相册、拍预览图、注册本人、
-查看最近事件、打开最新抓拍与日志目录。状态每 2 秒刷新一次。
+**设置（四个页签）**、查看最近事件、打开最新抓拍与日志目录。状态每 2 秒刷新一次。
 
-> 停止正在录像的监控会让当前 mp4 缺少收尾索引（不可播放），
-> 界面在 `recording=true` 时会额外确认一次。
+> **停止是「优雅」的**：界面先让监控自己收尾（当前 mp4 写完整、音轨合上、
+> 音量还原），最多等 20 秒；只有超过这个时间才会问你要不要强制结束。
+> 停止过程中两个按钮都锁住，状态显示「正在停止…（录像收尾中）」。
+> 判活同时看心跳和进程号，所以停止后立刻就能再次「启动监控」。
+
+「设置」窗口里能改的东西（改动写在 `config.local.yaml`，升级不丢）：
+
+| 页签 | 内容 |
+|---|---|
+| 推送 | 渠道、企业微信 webhook、WxPusher、Server酱、录像推送开关、**发送测试消息** |
+| 身份 | 本人模板状态（样本数/时间/维度）、注册本人、用最新抓拍注册、清除模板、阈值与策略 |
+| 自启 | 开机自启的开/关与状态（指向别的安装目录时会警示） |
+| 声音 | 播报开关/文案/冷却、以及播报音量策略（默认**不碰系统音量**） |
+
+> 声音页里的三档：`off` 完全不碰系统音量（默认）；`session` 只把本程序的
+> 音轨拉到 100%（不动系统音量滑块）；`master` 才会改系统主音量。
+> **录音走麦克风，和系统播放音量无关** —— 所以录到的声音不会因为选 `off` 变小。
 
 ### 方式二：命令行
 
@@ -140,6 +155,10 @@ powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 | `rw whoami IMG` | 判断某张图是不是本人 |
 | `rw say` / `rw say-raw` / `rw ab` | 试听语音（处理后 / 原始 / 对比） |
 | `rw volume-check` / `rw volume-set 70` | 音量诊断 / 设置主音量 |
+| `rw stop` | 优雅停止（先收尾再退出，超时才强杀） |
+| `rw config [--json\|--set 键=值\|--test]` | 读/改界面设置、发测试消息 |
+| `rw autostart [--json\|--enable\|--disable]` | 开机自启 |
+| `rw identity [--json\|--clear]` | 查看/清除本人模板元信息 |
 | `rw storage` | 磁盘占用与最旧文件 |
 | `rw push` | 配置推送渠道 |
 | `rw setup` | 首次配置向导（摄像头 / webhook / 相册密码 / 开机自启） |
@@ -180,6 +199,9 @@ room-watch/
 全部在 `config.yaml`，每段都有注释。改完**必须重启监控**才生效
 （配置只在启动时读一次）。
 
+界面「设置」里保存的项会写到 `config.local.yaml`（与 `config.yaml` 深合并）。
+**为什么不写主配置**：安装包升级会整体覆盖 `config.yaml`，写那里的设置下次更新就丢了。
+
 几个最常调的：
 
 | 键 | 默认 | 说明 |
@@ -195,6 +217,7 @@ room-watch/
 | `record.codec` | avc1 | H.264，浏览器才放得动 |
 | `identity.threshold` | 0.45 | 人脸相似度阈值 |
 | `voice.require_face` | true | 看清脸才出声 |
+| `voice.volume_mode` | `"off"` | `off` 不碰系统音量 / `session` 只提本程序音轨 / `master` 改主音量 |
 | `notify.channel` | none | wxpusher / serverchan / wecom_bot |
 | `notify.wecom_bot.send_video` | true | 录像也发（先压缩到 `video.max_mb`） |
 | `gallery.token` | 空 | 相册访问密码；绑非回环地址时必填 |

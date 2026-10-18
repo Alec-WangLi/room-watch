@@ -1,0 +1,427 @@
+"""设置窗口：推送 / 身份 / 自启 / 声音 四个页签。
+
+设计约束（都很实在）
+--------------------
+1. **本模块不 import tkinter，也不 import yaml。**
+   tkinter 由 `RoomWatchApp` 传进来（`app.tk` / `app.ttk`），
+   这样 `tests/test_settings.py` 能在没有图形环境的解释器里校验页签与 SPEC 一致；
+   yaml 更不能有——打包后的 exe 里只有 tkinter + Pillow，读写配置一律走
+   `rw config` 子进程（`app._run_cli`）。
+2. **密钥只显示掩码。** 输入框是空的，占位提示写「已设置（…5179）」；
+   留空保存＝不改。想换就把整条新值粘进去。
+3. **保存 = 一次 `rw config --set`。** 后端先全量校验再落盘、落盘后复读，
+   界面只负责把结果念给用户听。
+4. 改动在**下次启动监控**时生效（watcher 不热加载配置），所以保存后明确提示。
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+
+# 页签顺序。必须与 settings.sections() 一致（tests/test_settings.py 钉住）。
+SECTIONS = ("推送", "身份", "自启", "声音")
+
+
+class SettingsDialog:
+    """一个 Toplevel。`autoload=False` 时只建骨架，供 --selftest 使用。"""
+
+    def __init__(self, app, autoload: bool = True) -> None:
+        self.app = app
+        self.tk = app.tk
+        self.ttk = app.ttk
+        self.labels: dict = {}
+        self.vars: dict = {}
+        self.secret_labels: dict = {}
+        self._built = False       # 控件是否已按快照建出来（只建一次）
+        self._populated = False   # 是否至少成功读过一次配置
+        self._saving = False
+
+        self.win = self.tk.Toplevel(app.win)
+        self.win.title("设置 · 房间监控")
+        self.win.geometry("640x600")
+        self.win.minsize(560, 500)
+        self.win.transient(app.win)
+
+        self.notebook = self.ttk.Notebook(self.win)
+        self.notebook.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+
+        self.tab_frames: dict = {}
+        self.rows_holder: dict = {}
+        for name in SECTIONS:
+            frame = self.ttk.Frame(self.notebook, padding=10)
+            self.notebook.add(frame, text=name)
+            self.tab_frames[name] = frame
+            # 先把底部按钮占好位，再让内容区吃掉剩余空间；顺序反了按钮会被挤到看不见
+            actions = self.ttk.Frame(frame)
+            actions.pack(side="bottom", fill="x", pady=(10, 0))
+            holder = self.ttk.Frame(frame)
+            holder.pack(fill="both", expand=True)
+            self.rows_holder[name] = holder
+
+        self._build_identity_block(self.rows_holder["身份"])
+        self._build_autostart_block(self.rows_holder["自启"])
+        self._build_push_actions(self.tab_frames["推送"])
+
+        footer = self.ttk.Frame(self.win)
+        footer.pack(fill="x", padx=12, pady=(0, 12))
+        self.status_label = self.tk.Label(footer, text="读取当前配置…", anchor="w",
+                                          font=app.font_small, fg="#666")
+        self.status_label.pack(side="left", fill="x", expand=True)
+        self.btn_close = self.ttk.Button(footer, text="关闭", command=self.close)
+        self.btn_close.pack(side="right", padx=(6, 0))
+        self.btn_save = self.ttk.Button(footer, text="保存", command=self.on_save)
+        self.btn_save.pack(side="right")
+
+        if autoload:
+            self.reload()
+            self.refresh_autostart()
+            self.refresh_identity()
+        else:
+            self.status_label.configure(text="（自检模式：未读取配置）")
+
+    # ---------------- 特殊区块 ----------------
+
+    def _build_identity_block(self, parent) -> None:
+        box = self.ttk.LabelFrame(parent, text="本人身份", padding=8)
+        box.pack(fill="x", pady=(0, 8))
+        self.identity_label = self.tk.Label(box, text="读取中…", anchor="w",
+                                            font=self.app.font_small, fg="#666")
+        self.identity_label.pack(fill="x")
+        bar = self.ttk.Frame(box)
+        bar.pack(fill="x", pady=(6, 0))
+        self.ttk.Button(bar, text="重新读取", command=self.refresh_identity).pack(side="left")
+        self.ttk.Button(bar, text="注册本人（现场）",
+                        command=self._enroll_live).pack(side="left", padx=6)
+        self.ttk.Button(bar, text="用最新抓拍",
+                        command=self._enroll_latest).pack(side="left")
+        self.ttk.Button(bar, text="清除模板", command=self.on_clear_identity).pack(side="left", padx=6)
+        self.ttk.Label(box, text="注册需要摄像头，且监控必须是停止状态（设备独占）。",
+                       font=self.app.font_small, foreground="#888").pack(fill="x", pady=(6, 0))
+
+    def _build_autostart_block(self, parent) -> None:
+        box = self.ttk.LabelFrame(parent, text="开机自启", padding=8)
+        box.pack(fill="x", pady=(0, 8))
+        self.autostart_label = self.tk.Label(box, text="读取中…", anchor="w",
+                                             font=self.app.font_small, fg="#666")
+        self.autostart_label.pack(fill="x")
+        bar = self.ttk.Frame(box)
+        bar.pack(fill="x", pady=(6, 0))
+        self.ttk.Button(bar, text="开启自启",
+                        command=lambda: self.on_autostart(True)).pack(side="left")
+        self.ttk.Button(bar, text="关闭自启",
+                        command=lambda: self.on_autostart(False)).pack(side="left", padx=6)
+        self.ttk.Button(bar, text="刷新状态", command=self.refresh_autostart).pack(side="left")
+        self.ttk.Label(box, text="开机自启拉起的是守护进程：监控意外退出时它会重新拉起。",
+                       font=self.app.font_small, foreground="#888").pack(fill="x", pady=(6, 0))
+
+    def _build_push_actions(self, parent) -> None:
+        bar = self.ttk.Frame(parent)
+        bar.pack(side="bottom", fill="x", pady=(6, 0))
+        self.ttk.Button(bar, text="发送测试消息", command=self.on_test_push).pack(side="left")
+        self.ttk.Label(bar, text="会先保存当前页面，再发一条测试消息",
+                       font=self.app.font_small, foreground="#888").pack(side="left", padx=8)
+
+    # ---------------- 读取 ----------------
+
+    def reload(self) -> None:
+        self.status_label.configure(text="读取当前配置…", fg="#666")
+
+        def work() -> dict:
+            return self.app._run_cli(["config", "--json"], timeout=60)
+
+        self.app._run_task(work, self._on_snapshot)
+
+    def _on_snapshot(self, data: dict) -> None:
+        if not data.get("ok") or not data.get("labels"):
+            self.status_label.configure(
+                text="读取配置失败：" + str(data.get("error") or "未知原因"), fg="#993C1D")
+            return
+        self.labels = data["labels"]
+        self._fill_rows(data.get("values") or {}, data.get("secrets") or {})
+        self.status_label.configure(text="已读取。改完点「保存」，重启监控后生效。", fg="#666")
+
+    def _fill_rows(self, values: dict, secrets: dict) -> None:
+        """第一次建控件；之后只刷新值。
+
+        重复建控件会让同一项出现两排，而且用户正打字的那一格会被替换掉，
+        所以「建」和「填」必须分开。
+        """
+        if not self._built:
+            for key, meta in self.labels.items():
+                holder = self.rows_holder.get(meta.get("section") or "")
+                if holder is None:
+                    continue
+                self._make_row(holder, key, meta, values.get(key), secrets.get(key) or {})
+            self._built = True
+        else:
+            for key, var in self.vars.items():
+                meta = self.labels.get(key) or {}
+                if meta.get("secret") or key not in values:
+                    continue
+                raw = values[key]
+                if meta.get("kind") == "bool":
+                    var.set(bool(raw))
+                else:
+                    var.set("" if raw is None else str(raw))
+
+        for key, label in self.secret_labels.items():
+            label.configure(text=self._secret_text(secrets.get(key) or {}))
+        self._populated = True
+
+    def _secret_text(self, info: dict) -> str:
+        if info.get("set"):
+            return f"已设置 {info.get('tail') or ''}（留空＝不改）"
+        return "未设置"
+
+    def _make_row(self, parent, key: str, meta: dict, value, secret_info: dict) -> None:
+        tk, ttk = self.tk, self.ttk
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=3)
+        ttk.Label(row, text=meta.get("label") or key, width=18, anchor="w").pack(side="left")
+
+        kind = meta.get("kind") or "text"
+        if kind == "bool":
+            var = tk.BooleanVar(value=bool(value))
+            ttk.Checkbutton(row, variable=var).pack(side="left")
+            self.vars[key] = var
+        elif kind == "choice":
+            var = tk.StringVar(value=str(value or ""))
+            ttk.Combobox(row, textvariable=var, values=list(meta.get("choices") or ()),
+                         state="readonly", width=18).pack(side="left")
+            self.vars[key] = var
+        elif meta.get("secret"):
+            var = tk.StringVar(value="")
+            ttk.Entry(row, textvariable=var, width=42).pack(side="left", fill="x", expand=True)
+            self.vars[key] = var
+            info = ttk.Label(row, text=self._secret_text(secret_info), foreground="#888")
+            info.pack(side="left", padx=6)
+            self.secret_labels[key] = info
+        else:
+            var = tk.StringVar(value="" if value is None else str(value))
+            ttk.Entry(row, textvariable=var, width=42).pack(side="left", fill="x", expand=True)
+            self.vars[key] = var
+
+        hint = meta.get("hint")
+        if hint:
+            ttk.Label(parent, text=hint, foreground="#888",
+                      font=self.app.font_small).pack(fill="x", padx=(140, 0))
+
+    # ---------------- 保存 ----------------
+
+    def _collect(self) -> dict:
+        changes: dict = {}
+        for key, var in self.vars.items():
+            meta = self.labels.get(key) or {}
+            if meta.get("secret"):
+                text = str(var.get() or "").strip()
+                if text:
+                    changes[key] = text
+                continue
+            if meta.get("kind") == "bool":
+                changes[key] = "true" if bool(var.get()) else "false"
+                continue
+            text = str(var.get() or "").strip()
+            if not text and meta.get("kind") in ("int", "float", "choice"):
+                continue      # 空值不提交：老配置缺这个键时不该因此存不进去
+            changes[key] = text
+        return changes
+
+    def _save_args(self) -> list[str]:
+        pairs = [f"{key}={value}" for key, value in self._collect().items()]
+        return ["config", "--set", *pairs, "--json"]
+
+    def on_save(self) -> None:
+        if self._saving or not self._populated:
+            return
+        self._saving = True
+        self.btn_save.configure(state="disabled")
+        self.status_label.configure(text="保存中…", fg="#666")
+        args = self._save_args()
+
+        def work() -> dict:
+            return self.app._run_cli(args, timeout=60)
+
+        self.app._run_task(work, self._on_saved)
+
+    def _on_saved(self, result: dict) -> None:
+        self._saving = False
+        self.btn_save.configure(state="normal")
+        if not result.get("ok"):
+            errors = result.get("errors") or {}
+            detail = "\n".join(f"· {msg}" for msg in errors.values()) or str(
+                result.get("error") or "未知原因")
+            self.status_label.configure(text="没有保存：有设置项不合法", fg="#993C1D")
+            self.app.messagebox.showerror("保存失败", detail)
+            return
+        self.status_label.configure(text="已保存。重启监控后生效。", fg="#0F6E56")
+        for key, var in self.vars.items():
+            if (self.labels.get(key) or {}).get("secret"):
+                var.set("")
+        self.reload()
+        self.app.refresh_identity()
+
+    def on_test_push(self) -> None:
+        if self._saving or not self._populated:
+            return
+        self._saving = True
+        self.btn_save.configure(state="disabled")
+        self.status_label.configure(text="保存并发送测试消息…", fg="#666")
+        args = self._save_args()
+
+        def work() -> dict:
+            saved = self.app._run_cli(args, timeout=60)
+            if not saved.get("ok"):
+                return {"ok": False, "stage": "save", "detail": saved}
+            tested = self.app._run_cli(["config", "--test", "--json"], timeout=60)
+            return {"ok": bool(tested.get("ok")), "stage": "test", "detail": tested}
+
+        self.app._run_task(work, self._on_test_push)
+
+    def _on_test_push(self, result: dict) -> None:
+        self._saving = False
+        self.btn_save.configure(state="normal")
+        detail = result.get("detail") or {}
+        if result.get("ok"):
+            self.status_label.configure(text="测试消息已发出，去手机看看。", fg="#0F6E56")
+            self.app.messagebox.showinfo("测试消息", "发送成功。手机上应该收到一条「推送测试」。")
+            for key, var in self.vars.items():
+                if (self.labels.get(key) or {}).get("secret"):
+                    var.set("")
+            self.reload()
+            return
+        if result.get("stage") == "save":
+            errors = detail.get("errors") or {}
+            message = "\n".join(errors.values()) or str(detail.get("error") or "保存失败")
+            self.app.messagebox.showerror("保存失败，未发送测试", message)
+        else:
+            message = str(detail.get("message") or detail.get("error") or detail.get("out") or "")
+            self.app.messagebox.showerror(
+                "测试消息没发出去",
+                (message[-600:] or "没有返回原因") +
+                "\n\n常见原因：webhook 粘错（应形如 .../webhook/send?key=xxx）、"
+                "机器人已被移出群、当前渠道没有填凭据。")
+        self.status_label.configure(text="测试未通过，配置已保存", fg="#993C1D")
+
+    # ---------------- 身份 ----------------
+
+    def refresh_identity(self) -> None:
+        def work() -> dict:
+            return self.app._run_cli(["identity", "--json"], timeout=40)
+
+        self.app._run_task(work, self._on_identity)
+
+    def _on_identity(self, result: dict) -> None:
+        info = result.get("identity") or {}
+        if not info:
+            self.identity_label.configure(text="读取失败", fg="#993C1D")
+            return
+        if not info.get("registered"):
+            self.identity_label.configure(
+                text="未注册。现在所有脸都按「访客」处理：会抓拍、会播报、会推送。", fg="#993C1D")
+            return
+        created = str(info.get("created_at") or info.get("mtime") or "").replace("T", " ")
+        self.identity_label.configure(
+            text=f"已注册 · {info.get('samples') or 0} 个样本 · {info.get('dim') or 0} 维特征"
+                 + (f" · {created}" if created else "")
+                 + f"\n文件：{info.get('path') or ''}",
+            fg="#0F6E56")
+
+    def _enroll_live(self) -> None:
+        # 交给主窗口：注册要抢摄像头，还得保证监控是停的，逻辑不能在这里再写一遍
+        self.win.lower()
+        self.app.on_enroll()
+
+    def _enroll_latest(self) -> None:
+        self.win.lower()
+        self.app.on_enroll_from_latest()
+
+    def on_clear_identity(self) -> None:
+        if not self.app.messagebox.askyesno(
+                "清除本人模板",
+                "删除后所有脸都会按访客处理（你自己进门也会被抓拍、推送）。\n\n确定清除吗？"):
+            return
+
+        def work() -> dict:
+            return self.app._run_cli(["identity", "--clear", "--json"], timeout=30)
+
+        self.app._run_task(work, self._on_cleared)
+
+    def _on_cleared(self, result: dict) -> None:
+        if result.get("ok"):
+            self.app.messagebox.showinfo("已清除", "本人模板已删除。需要时重新注册即可。")
+        else:
+            self.app.messagebox.showerror("清除失败",
+                                          str(result.get("error") or result.get("out") or ""))
+        self.refresh_identity()
+        self.app.refresh_identity()
+
+    # ---------------- 自启 ----------------
+
+    def refresh_autostart(self) -> None:
+        def work() -> dict:
+            return self.app._run_cli(["autostart", "--json"], timeout=30)
+
+        self.app._run_task(work, self._on_autostart)
+
+    def _on_autostart(self, result: dict) -> None:
+        info = result.get("autostart") or {}
+        if not info:
+            self.autostart_label.configure(text="读取失败", fg="#993C1D")
+            return
+        if not info.get("supported"):
+            self.autostart_label.configure(text="当前系统不支持（仅 Windows）", fg="#993C1D")
+            return
+        if not info.get("enabled"):
+            text = "未开启。开机后需要自己点「启动监控」。"
+            color = "#993C1D"
+        elif info.get("points_to_this_install"):
+            text = "已开启（指向当前安装目录）。"
+            color = "#0F6E56"
+        else:
+            text = ("已开启，但指向别处：" + str(info.get("command") or "")
+                    + "\n可能是旧安装目录留下的，建议关掉再重新开启。")
+            color = "#993C1D"
+        self.autostart_label.configure(text=text, fg=color)
+
+    def on_autostart(self, enable: bool) -> None:
+        action = "--enable" if enable else "--disable"
+
+        def work() -> dict:
+            return self.app._run_cli(["autostart", action, "--json"], timeout=30)
+
+        self.status_label.configure(text="处理中…", fg="#666")
+        self.app._run_task(work, self._on_autostart_changed)
+
+    def _on_autostart_changed(self, result: dict) -> None:
+        ok = bool(result.get("ok"))
+        message = str(result.get("message") or result.get("error") or "")
+        self.status_label.configure(text=message or ("完成" if ok else "失败"),
+                                    fg="#0F6E56" if ok else "#993C1D")
+        if not ok and message:
+            self.app.messagebox.showwarning("自启设置未生效", message)
+        self.refresh_autostart()
+
+    # ---------------- 关闭 ----------------
+
+    def close(self) -> None:
+        try:
+            self.win.destroy()
+        except Exception:  # noqa: BLE001 - 已销毁
+            pass
+
+
+def open_settings(app) -> Optional[SettingsDialog]:
+    """打开（或抬到前面）设置窗口。同一时间只留一个。"""
+    existing = getattr(app, "_settings_dialog", None)
+    if existing is not None:
+        try:
+            if existing.win.winfo_exists():
+                existing.win.lift()
+                existing.win.focus_force()
+                return existing
+        except Exception:  # noqa: BLE001
+            pass
+    dialog = SettingsDialog(app)
+    app._settings_dialog = dialog
+    return dialog

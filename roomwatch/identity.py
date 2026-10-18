@@ -44,6 +44,8 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
@@ -301,3 +303,65 @@ class Identity:
             return LABEL_OWNER, max(owners)
 
         return LABEL_UNKNOWN, 0.0
+
+
+# ---------------------------------------------------------------- 模板元信息
+#
+# 界面要回答「注册了没有、几个样本、什么时候注册的」，但**绝不能**把特征
+# 本身端出去：那是生物特征，只在本地存在。所以这里只回元信息。
+
+
+def owner_summary(owner_file: str) -> dict:
+    """读本人模板的元信息（样本数、维度、注册时间、文件大小）。
+
+    没注册时 registered=False；文件存在但读不动时 registered=True + error，
+    这样界面能区分「没注册」和「注册文件坏了」——两者的处理方式完全不同。
+    """
+    path = Path(owner_file)
+    info = {
+        "registered": False,
+        "path": str(path),
+        "samples": 0,
+        "dim": 0,
+        "created_at": "",
+        "mtime": "",
+        "size": 0,
+        "error": "",
+    }
+    if not path.is_file():
+        return info
+
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        info["error"] = str(exc)
+        return info
+
+    info["registered"] = True
+    info["size"] = stat.st_size
+    info["mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if "samples" in data:
+                info["samples"] = int(np.asarray(data["samples"]).ravel()[0])
+            if "embedding" in data:
+                info["dim"] = int(np.asarray(data["embedding"]).size)
+            if "created_at" in data:
+                info["created_at"] = str(np.asarray(data["created_at"]).ravel()[0])
+    except Exception as exc:  # noqa: BLE001 - 坏文件不该让界面崩
+        info["error"] = str(exc)
+    return info
+
+
+def clear_owner(owner_file: str) -> bool:
+    """删除本人模板。返回是否真的删掉了。"""
+    path = Path(owner_file)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning("删除本人模板失败: %s", exc)
+        return False
+    log.info("已删除本人模板：%s", path)
+    return True

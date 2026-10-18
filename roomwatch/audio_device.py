@@ -1,36 +1,43 @@
 """系统输出音量：查与调。
 
-## 为什么监控程序要管系统音量
+## 先分清两件事（0.1.7 踩过的坑）
 
-把音频在代码里做到满刻度（-1 dBFS）只解决了一半问题。实测发现一个更
-隐蔽的天花板：**Windows 主音量只有 10%**。
+**录音走麦克风输入，跟系统播放音量完全无关。** 0.1.7 把「提示音太小」的问题
+用「抬高系统主音量」来解决，结果用户发现每次开始监控自己电脑的音量就被改成
+70%（日志：`主音量 2.0% → 70.0%`），而进程被强杀时还原代码没机会跑，
+音量就永久停在那里。
 
-    代码侧：-11.8 dBFS  ──处理──>  -1.0 dBFS      （+10.8 dB）
-    系统侧：主音量 10% = 衰减约 20 dB
+所以现在分三档（`voice.volume_mode`）：
 
-也就是说，无论音频做得多满，下游都会被砍掉 20 dB。这解释了为什么
-"能想到的参数都调到最大了，声音还是小"——问题不在程序里。
+    off      完全不碰（默认）。你的音量归你管
+    session  只把本进程在「音量合成器」里的那条拉到 100%，不动系统主音量
+    master   旧行为：主音量保底到 ensure_system_volume。界面上有明确警示
 
-所以本模块做三件事：
-1. `describe()`  把主音量、静音状态、每个输出设备、应用级音量全列出来
-2. `set_master_percent()` 能改主音量
-3. `VolumeGuard` 监控运行时把主音量保底到设定值，退出时还原成原样
+## 模块职责
 
-第 3 条的"还原"很重要：偷偷改掉用户的全局音量而不还原，是种越界。
-（进程被强杀时不会还原，这一点在 README 里写明了。）
+1. `describe()`  把主音量、静音状态、输出设备、应用级音量全列出来
+2. `set_master_percent()` 改主音量
+3. `VolumeGuard` 按上面三档策略做事；`master` 档退出时还原，
+   并把原值先写进 `var/state/volume_backup.json`，万一被强杀，
+   下次启动能靠 `restore_backup()` 补还原。
 
 Windows 专有；非 Windows 或没装 pycaw 时所有函数安全降级为"不可用"。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
-from typing import List, Optional
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 log = logging.getLogger("room-watch")
 
 DEFAULT_ENSURE = 70.0
+MODES = ("off", "session", "master")
 
 
 def available() -> bool:
@@ -79,7 +86,7 @@ def set_master_percent(percent: float, force_unmute: bool = True) -> bool:
 RENDER_PREFIX = "{0.0.0."   # 输出设备；采集设备（麦克风）是 {0.0.1.
 
 
-def list_devices(only_active: bool = True) -> List[dict]:
+def list_devices(only_active: bool = True) -> list[dict]:
     """列出**输出**设备及其音量。
 
     只保留输出设备（id 形如 `{0.0.0.…}`）：这份列表是用来排查
@@ -88,7 +95,7 @@ def list_devices(only_active: bool = True) -> List[dict]:
     顺带能发现两个经典事故：默认设备是个没接音箱的 HDMI 显示器，
     或者默认设备被系统禁用了。
     """
-    out: List[dict] = []
+    out: list[dict] = []
     try:
         from pycaw.pycaw import AudioUtilities
 
@@ -131,12 +138,12 @@ def list_devices(only_active: bool = True) -> List[dict]:
     return out
 
 
-def list_app_sessions() -> List[dict]:
+def list_app_sessions() -> list[dict]:
     """各应用自己的音量条（Windows 音量合成器里那些）。
 
     python.exe 的那一条如果被调低或被静音，我们播什么都是白播。
     """
-    out: List[dict] = []
+    out: list[dict] = []
     try:
         from pycaw.pycaw import AudioUtilities
 
@@ -210,24 +217,161 @@ def describe() -> str:
     return "\n".join(lines)
 
 
-class VolumeGuard:
-    """监控运行期间把主音量保底到设定值，退出时还原。
+def resolve_mode(cfg: Optional[dict]) -> str:
+    """决定音量策略。
 
-    只在「当前音量低于保底值」时动手，不会去压低本来就很大的音量。
+    兼容老配置：只写了 `ensure_system_volume: 70`、没有 `volume_mode` 的，
+    按 `master` 解释——升级不该让老用户的行为悄悄变样。
+    """
+    cfg = cfg or {}
+    raw = cfg.get("volume_mode")
+    if isinstance(raw, bool):
+        # YAML 1.1 会把裸 off/on 解析成布尔，别让它变成 "false"
+        return "master" if raw else "off"
+    mode = str(raw or "").strip().lower()
+    if mode in MODES:
+        return mode
+    try:
+        ensure = float(cfg.get("ensure_system_volume") or 0)
+    except (TypeError, ValueError):
+        ensure = 0.0
+    return "master" if ensure > 0 else "off"
+
+
+def set_app_session_percent(pid: int, percent: float) -> int:
+    """把指定进程在「音量合成器」里的那条音轨设成 percent，返回改了几条。
+
+    这是「不碰系统音量」的关键：只动自己那条，用户的播放器音量不受影响。
+    进程还没播过声音时没有会话，返回 0 属正常——播报前会再试一次。
+    """
+    try:
+        from pycaw.pycaw import AudioUtilities
+    except Exception:
+        return 0
+
+    changed = 0
+    try:
+        for session in AudioUtilities.GetAllSessions():
+            proc = getattr(session, "Process", None)
+            if proc is None or getattr(proc, "pid", None) != int(pid):
+                continue
+            try:
+                volume = session.SimpleAudioVolume
+                volume.SetMasterVolume(max(0.0, min(1.0, percent / 100.0)), None)
+                if volume.GetMute():
+                    volume.SetMute(0, None)
+                changed += 1
+            except Exception:  # noqa: BLE001 - 单条会话失败不影响其它
+                continue
+    except Exception as exc:  # noqa: BLE001
+        log.debug("设置本程序音轨失败: %s", exc)
+    return changed
+
+
+def write_backup(path: Path, percent: float, muted: bool, pid: int) -> None:
+    """改主音量前先把原值记下来，给「被强杀」留一条后路。"""
+    payload = {
+        "percent": percent,
+        "muted": bool(muted),
+        "pid": int(pid),
+        "at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        log.debug("写音量备份失败: %s", exc)
+
+
+def restore_backup(path: Path, alive=None) -> str:
+    """上次被强杀留下的音量备份：确认那个进程真不在了，就还原并清理。
+
+    返回一句人话；没有可做的事（没备份 / 进程还在 / 还原失败）返回空串。
+    """
+    path = Path(path)
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return ""
+
+    pid = int(data.get("pid") or 0)
+    if alive is None:
+        from .procutil import pid_alive as alive_check
+
+        alive = alive_check
+    try:
+        if pid and alive(pid):
+            return ""      # 还在跑，说明它是当前实例，别动它
+    except Exception:  # noqa: BLE001
+        return ""
+
+    if not available():
+        return ""
+    try:
+        percent = float(data.get("percent") or 0)
+    except (TypeError, ValueError):
+        percent = 0.0
+    if not set_master_percent(percent, force_unmute=False):
+        return ""
+    if data.get("muted"):
+        try:
+            _endpoint().SetMute(True, None)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return f"上次异常退出，已把主音量还原为 {percent}%"
+
+
+class VolumeGuard:
+    """按 `voice.volume_mode` 决定要不要动音量，以及动哪一层。
+
+    三档的含义见模块头注释。无论哪档都不会「压低」用户本来就很大的音量；
+    master 档只在当前值低于保底值（或静音）时动手，并记住原值用于还原。
     """
 
-    def __init__(self, ensure_percent: float = DEFAULT_ENSURE, restore: bool = True):
+    def __init__(
+        self,
+        ensure_percent: float = 0.0,
+        restore: bool = True,
+        mode: str = "",
+        backup_path: Optional[Path] = None,
+    ):
+        if isinstance(mode, bool):
+            self.mode = "master" if mode else "off"
+        else:
+            self.mode = mode if mode in MODES else resolve_mode(
+                {"ensure_system_volume": ensure_percent})
         self.ensure_percent = float(ensure_percent)
         self.restore_enabled = bool(restore)
+        self.backup_path = Path(backup_path) if backup_path else None
         self.snapshot: Optional[dict] = None
         self.changed = False
 
     def apply(self) -> str:
         """返回一句人话，说明做了什么（或为什么没做）。"""
-        if self.ensure_percent <= 0:
-            return "未启用（voice.ensure_system_volume = 0）"
+        if self.mode == "off":
+            return "未启用（不碰系统音量）"
         if not available():
             return "跳过：未安装 pycaw"
+
+        if self.mode == "session":
+            changed = set_app_session_percent(os.getpid(), 100.0)
+            if changed:
+                return f"本程序音轨已设 100%（{changed} 条会话，不动系统音量）"
+            return "本程序暂无音频会话，播报时会再试（不动系统音量）"
+
+        if self.ensure_percent <= 0:
+            return "未启用（volume_mode = master 但 ensure_system_volume = 0）"
 
         master = get_master_percent()
         muted = is_muted()
@@ -235,10 +379,11 @@ class VolumeGuard:
             return "跳过：读不到主音量"
 
         self.snapshot = {"percent": master, "muted": bool(muted)}
-
         if master >= self.ensure_percent and not muted:
             return f"主音量 {master}% 已达标，未改动"
 
+        if self.backup_path is not None:
+            write_backup(self.backup_path, master, bool(muted), os.getpid())
         if not set_master_percent(self.ensure_percent):
             return "设置失败（可能被系统策略或独占模式拦住）"
 
@@ -248,8 +393,8 @@ class VolumeGuard:
         return f"主音量 {before} → {self.ensure_percent}%{tail}"
 
     def restore(self) -> str:
-        """还原成监控启动前的音量。"""
-        if not self.changed or self.snapshot is None:
+        """还原成监控启动前的音量（只有 master 档改过才需要）。"""
+        if self.mode != "master" or not self.changed or self.snapshot is None:
             return ""
         if not self.restore_enabled:
             return f"保持 {self.ensure_percent}%（voice.restore_system_volume = false）"
@@ -258,7 +403,12 @@ class VolumeGuard:
             if self.snapshot.get("muted"):
                 try:
                     _endpoint().SetMute(True, None)
-                except Exception:
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.backup_path is not None:
+                try:
+                    self.backup_path.unlink()
+                except OSError:
                     pass
             return f"主音量已还原为 {pct}%"
         return "还原失败"

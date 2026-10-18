@@ -264,12 +264,21 @@ pause
 Set-Content -Path (Join-Path $out "自检.bat") -Value $doctorBat -Encoding $batEncoding
 
 # ---------------------------------------------------------------- 6. 界面
+# 必须防「拿旧的 GUI 壳去打包」：界面壳是 PyInstaller 产物，改了 gui.py
+# 它不会自己更新，而它恰恰是客户最直接接触的东西。0.1.9 就踩过 ——
+# 源码改完只重跑本脚本，结果安装包里还是 0.1.7 的界面（停止、设置全都没有）。
 $guiExe = Join-Path $root "dist\room-watch.exe"
-if (Test-Path $guiExe) {
-    Copy-Item $guiExe (Join-Path $out "room-watch.exe") -Force
-} else {
-    Write-Host "[提示] 没有 dist\room-watch.exe，先跑 scripts\build-exe.ps1 生成界面壳" -ForegroundColor Yellow
+$guiSrc = Join-Path $root "roomwatch\gui.py"
+if (-not (Test-Path $guiExe)) {
+    Write-Host "[失败] 没有 dist\room-watch.exe，先跑 scripts\build-exe.ps1 生成界面壳" -ForegroundColor Red
+    exit 1
 }
+if ((Get-Item $guiExe).LastWriteTime -lt (Get-Item $guiSrc).LastWriteTime) {
+    Write-Host "[失败] dist\room-watch.exe 比 roomwatch\gui.py 旧：界面壳没重新打包。" -ForegroundColor Red
+    Write-Host "       先跑 scripts\build-exe.ps1，再重跑本脚本。" -ForegroundColor Yellow
+    exit 1
+}
+Copy-Item $guiExe (Join-Path $out "room-watch.exe") -Force
 
 # ---------------------------------------------------------------- 7. 自检
 Write-Host "`n运行包内自检 ..." -ForegroundColor Cyan

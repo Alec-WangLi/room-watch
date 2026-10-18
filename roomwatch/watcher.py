@@ -44,6 +44,7 @@ from .rules import (
     usage_bytes,
 )
 from . import audio_device
+from . import control
 from . import loudness
 from . import paths
 from . import speaker
@@ -144,6 +145,9 @@ class Watcher:
     def __init__(self, cfg: dict, dry_run: bool = False):
         self.cfg = cfg
         self.dry_run = dry_run
+        # 停止请求文件放在这个根下的 var/state/，与界面/`rw stop` 共用同一处
+        self.root = paths.runtime_root()
+        self.probe_json = False
 
         cam = cfg.get("camera") or {}
         self.cam_index = int(cam.get("index", 0))
@@ -197,9 +201,15 @@ class Watcher:
         self.speaker = Speaker(voice)
         # 代码里把音频做到满刻度只解决一半问题：如果 Windows 主音量只有 10%，
         # 下游照样砍掉 20 dB。所以运行时把主音量保底，退出时还原。
+        # 音量策略：默认 off，完全不碰系统音量（录音走麦克风，与播放音量无关）。
+        # master 档才需要 backup，用于「被强杀时下次补还原」。
+        self.volume_mode = audio_device.resolve_mode(voice)
+        self.volume_backup = paths.STATE_DIR / "volume_backup.json"
         self.volume_guard = audio_device.VolumeGuard(
-            float(voice.get("ensure_system_volume", 70)),
-            bool(voice.get("restore_system_volume", True)),
+            ensure_percent=float(voice.get("ensure_system_volume", 0) or 0),
+            restore=bool(voice.get("restore_system_volume", True)),
+            mode=self.volume_mode,
+            backup_path=self.volume_backup if self.volume_mode == "master" else None,
         )
 
         face_cfg = cfg.get("face") or {}
@@ -472,6 +482,10 @@ class Watcher:
         ):
             return
 
+        if self.volume_mode == "session":
+            # 音频会话要等进程第一次发声后才出现，启动时那次多半改不到，
+            # 所以每次播报前再试一遍（只动自己那条，不影响用户听歌）。
+            audio_device.set_app_session_percent(os.getpid(), 100.0)
         self.speaker.say()
         self.last_spoke_at = now
         self.spoke_this_event = True
@@ -695,13 +709,28 @@ class Watcher:
         self.started_at = datetime.now()
         interval = 1.0 / max(1, self.fps)
         last_status_write = 0.0
+        last_stop_check = 0.0
 
+        # 上一轮如果是被强杀的，master 档抬高过的主音量还没还原，这里补上
+        restored = audio_device.restore_backup(self.volume_backup)
+        if restored:
+            log.info("系统音量：%s", restored)
+        # 上一轮残留的停止请求必须先清掉，否则新进程一起来就自己退了
+        control.clear_stop_request(self.root)
         log.info("系统音量：%s", self.volume_guard.apply())
         if self.volume_guard.changed:
             log.info("提示：这段音量改动会在监控退出时还原（voice.restore_system_volume）")
 
         try:
             while True:
+                # 停止请求：界面/`rw stop` 写文件，这里每秒看一次。
+                # 走 break 而不是强杀，才能让 finally 把 mp4 收尾、音轨合上。
+                if time.time() - last_stop_check >= 1.0:
+                    last_stop_check = time.time()
+                    if control.stop_requested(self.root, os.getpid()):
+                        log.info("收到停止请求，正在收尾（录像/音轨/音量）…")
+                        break
+
                 # 按整轮耗时控速，而不是无条件 sleep：RTSP 的 read() 本身就会阻塞到
                 # 下一帧，再补 100ms 会把实际帧率压到 8fps 以下。
                 loop_start = time.monotonic()
@@ -870,18 +899,45 @@ class Watcher:
                 log.info("系统音量：%s", restored)
 
     def probe(self) -> None:
-        """打开摄像头拍一张 preview.jpg，用来确认画面角度对不对。"""
+        """打开摄像头拍一张 preview.jpg，用来确认画面角度对不对。
+
+        `probe_json=True`（命令行 `rw probe --json`）时只多输出**一行** JSON：
+        成功给尺寸与耗时，失败给 error。界面靠它知道「到底成没成」——
+        0.1.7 只把输出丢进 probe.log，用户看不到任何反馈。
+
+        JSON 一律 `ensure_ascii=True`：中文 Windows 的控制台是 GBK，
+        直接输出中文可能抛 UnicodeEncodeError，把成功也变成失败。
+        """
+        started = time.monotonic()
         if not self.open_camera():
-            sys.exit(2)
+            self._probe_fail("打不开采集源（被别的程序占用 / 编号不对 / 地址或密码错误）", 2)
+            return
+
         ok, frame = self.cap.read()
+        self.cap.release()
         if not ok:
-            log.error("读不到画面")
-            sys.exit(3)
+            self._probe_fail("设备已连上，但读不到画面", 3)
+            return
+
         os.makedirs(paths.MEDIA_DIR, exist_ok=True)
         out = paths.MEDIA_DIR / "preview.jpg"
-        cv2.imwrite(str(out), frame)
-        log.info("已保存 %s（%sx%s），打开看看角度对不对", out, frame.shape[1], frame.shape[0])
-        self.cap.release()
+        if not cv2.imwrite(str(out), frame):
+            self._probe_fail(f"写文件失败：{out}", 3)
+            return
+
+        height, width = frame.shape[:2]
+        ms = int((time.monotonic() - started) * 1000)
+        if self.probe_json:
+            print(json.dumps({"ok": True, "path": str(out), "width": width,
+                              "height": height, "ms": ms, "error": ""}))
+        log.info("已保存 %s（%sx%s，%d 毫秒），打开看看角度对不对", out, width, height, ms)
+
+    def _probe_fail(self, message: str, code: int) -> None:
+        log.error("%s", message)
+        if self.probe_json:
+            print(json.dumps({"ok": False, "path": "", "width": 0, "height": 0,
+                              "ms": 0, "error": message}))
+        sys.exit(code)
 
 
 def _full_frame_dets(frame) -> list:
@@ -972,7 +1028,7 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
             print("换个光线好、正对镜头的位置重试；或者用 --enroll-from 指定一张清晰的抓拍。")
         return 3
 
-    if not idn.save_owner(feats):
+    if not idn.save_owner(feats, extra={"created_at": datetime.now().isoformat(timespec="seconds")}):
         return 4
     print(f"注册完成：{idn.owner_file}（{len(feats)} 个样本，阈值 {idn.threshold}）")
     print("接下来可以验证一下：rw whoami <某张你自己的截图>")
@@ -1066,6 +1122,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", default=resolve("config.yaml"))
     parser.add_argument("--dry-run", action="store_true", help="抓拍但不推送")
     parser.add_argument("--probe", action="store_true", help="只拍一张预览图然后退出")
+    parser.add_argument("--json", action="store_true",
+                        help="配合 --probe：额外输出一行 JSON（界面用）")
     parser.add_argument("--status", action="store_true", help="打印监控是否还在线")
     parser.add_argument("--say", action="store_true", help="试听语音提示（响度处理后的版本）然后退出")
     parser.add_argument("--say-raw", action="store_true", help="试听未处理的原始语音，用来做对比")
@@ -1146,6 +1204,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     w = Watcher(cfg, dry_run=args.dry_run)
+    w.probe_json = bool(args.json)
     if args.probe:
         w.probe()
     else:

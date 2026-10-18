@@ -1,0 +1,127 @@
+"""开机自启的单测：不碰真注册表，读写全部注入。
+
+    python tests/test_autostart.py
+
+为什么不再用 `reg add`：本机策略与沙箱都会拦外部 reg.exe，
+而且返回值要靠解析 stdout，出错信息很难读。winreg 是进程内的，失败了有异常类型。
+"""
+
+from __future__ import annotations
+
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from roomwatch import autostart
+
+ROOT = Path("C:/Users/Alec/AppData/Local/Programs/room-watch")
+PYTHONW = "C:/Users/Alec/AppData/Local/Programs/room-watch/runtime/python/pythonw.exe"
+
+
+class ScriptTest(unittest.TestCase):
+    def test_script_sets_cwd_and_runs_guardian(self) -> None:
+        text = autostart.autostart_script(ROOT, PYTHONW, ROOT / "config.yaml")
+        self.assertIn(f'sh.CurrentDirectory = "{ROOT}"', text)
+        self.assertIn("pythonw.exe", text)
+        self.assertIn("-m roomwatch guard", text)
+        self.assertIn("guardian.log", text)
+
+    def test_command_line_quotes_script(self) -> None:
+        cmd = autostart.command_line(ROOT)
+        self.assertTrue(cmd.startswith("wscript.exe "), cmd)
+        self.assertIn("start-monitor.vbs", cmd)
+        self.assertIn('"', cmd)
+
+
+class StatusTest(unittest.TestCase):
+    def test_missing_value_is_disabled(self) -> None:
+        info = autostart.status(ROOT, read=lambda: None, platform="win32")
+        self.assertFalse(info["enabled"])
+        self.assertFalse(info["points_to_this_install"])
+
+    def test_value_pointing_here_is_enabled(self) -> None:
+        target = autostart.command_line(ROOT)
+        info = autostart.status(ROOT, read=lambda: target, platform="win32")
+        self.assertTrue(info["enabled"])
+        self.assertTrue(info["points_to_this_install"])
+        self.assertEqual(info["command"], target)
+
+    def test_value_pointing_elsewhere_is_enabled_but_flagged(self) -> None:
+        info = autostart.status(ROOT, read=lambda: 'wscript.exe "D:\\old\\start-monitor.vbs"',
+                                platform="win32")
+        self.assertTrue(info["enabled"])
+        self.assertFalse(info["points_to_this_install"])
+
+    def test_script_existence_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            info = autostart.status(root, read=lambda: None, platform="win32")
+            self.assertFalse(info["script_exists"])
+
+
+class EnableDisableTest(unittest.TestCase):
+    def test_enable_writes_script_and_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runtime" / "python").mkdir(parents=True)
+            pythonw = root / "runtime" / "python" / "pythonw.exe"
+            pythonw.write_bytes(b"x")
+            written = {}
+
+            ok, msg = autostart.enable(
+                root, str(pythonw), root / "config.yaml",
+                write=lambda value: written.setdefault("value", value) or True,
+                platform="win32",
+            )
+            self.assertTrue(ok, msg)
+            self.assertTrue((root / "start-monitor.vbs").is_file())
+            self.assertEqual(written["value"], autostart.command_line(root))
+
+    def test_enable_without_pythonw_fails_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ok, msg = autostart.enable(root, str(root / "nope" / "python.exe"),
+                                       root / "config.yaml",
+                                       write=lambda value: True, platform="win32")
+        self.assertFalse(ok)
+        self.assertIn("pythonw.exe", msg)
+
+    def test_enable_on_non_windows_degrades(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ok, msg = autostart.enable(Path(tmp), PYTHONW, Path(tmp) / "config.yaml",
+                                       write=lambda value: True, platform="linux")
+        self.assertFalse(ok)
+        self.assertIn("Windows", msg)
+
+    def test_registry_error_is_reported_not_raised(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runtime" / "python").mkdir(parents=True)
+            pythonw = root / "runtime" / "python" / "pythonw.exe"
+            pythonw.write_bytes(b"x")
+
+            def boom(value: str) -> bool:
+                raise OSError("拒绝访问")
+
+            ok, msg = autostart.enable(root, str(pythonw), root / "config.yaml",
+                                       write=boom, platform="win32")
+        self.assertFalse(ok)
+        self.assertIn("拒绝访问", msg)
+
+    def test_disable_reports_when_not_registered(self) -> None:
+        ok, msg = autostart.disable(delete=lambda: False, platform="win32")
+        self.assertFalse(ok)
+        self.assertIn("没有", msg)
+
+    def test_disable_success(self) -> None:
+        ok, msg = autostart.disable(delete=lambda: True, platform="win32")
+        self.assertTrue(ok, msg)
+
+
+if __name__ == "__main__":
+    unittest.main()

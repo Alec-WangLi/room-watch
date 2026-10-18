@@ -18,6 +18,8 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 import io
 import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -30,7 +32,7 @@ class CommandTableTest(unittest.TestCase):
             "start", "dry-run", "probe", "status", "enroll", "whoami",
             "say", "say-raw", "ab", "volume-check", "volume-set", "storage",
             "gallery", "guard", "push", "push-video", "setup", "test", "doctor",
-            "update", "version", "gui",
+            "update", "version", "gui", "stop", "config", "autostart", "identity",
         }
         self.assertEqual(set(cli.COMMANDS), expected)
 
@@ -41,6 +43,36 @@ class CommandTableTest(unittest.TestCase):
     def test_watcher_commands_point_at_watcher_module(self) -> None:
         for name in ("start", "probe", "status", "storage", "enroll"):
             self.assertEqual(cli.COMMANDS[name].module, "watcher", msg=name)
+
+
+class SupportCommandTest(unittest.TestCase):
+    """界面支撑命令：参数解析必须是纯逻辑，不能真的去改配置。"""
+
+    def test_pairs_after_keeps_webhook_with_equals(self) -> None:
+        pairs = cli._pairs_after(
+            ["--set", "notify.channel=wecom_bot",
+             "notify.wecom_bot.webhook=https://x/send?key=abc=def", "--json"],
+            "--set")
+        self.assertEqual(pairs["notify.channel"], "wecom_bot")
+        self.assertEqual(pairs["notify.wecom_bot.webhook"], "https://x/send?key=abc=def")
+
+    def test_pairs_after_rejects_item_without_equals(self) -> None:
+        with self.assertRaises(cli.UsageError):
+            cli._pairs_after(["--set", "notify.channel"], "--set")
+
+    def test_stop_rejects_arguments(self) -> None:
+        with self.assertRaises(cli.UsageError):
+            cli._cmd_stop(["--force"])
+
+    def test_status_pid_is_zero_when_missing(self) -> None:
+        """没有 status.json 时不许抛异常（界面启动时就会调它）。"""
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cli.paths, "STATE_DIR", Path(tmp)):
+            self.assertEqual(cli._status_pid(), 0)
+
+    def test_new_commands_need_no_module(self) -> None:
+        for name in ("stop", "config", "autostart", "identity"):
+            self.assertEqual(cli.COMMANDS[name].module, "", msg=name)
 
 
 class TranslateTest(unittest.TestCase):

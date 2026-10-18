@@ -140,30 +140,25 @@ class MergeLocalTest(unittest.TestCase):
 
 
 class AutostartTest(unittest.TestCase):
-    def test_script_sets_workdir_and_log(self) -> None:
-        """Run 注册表项不能设置工作目录，脚本里必须自己 cd —— 否则 -m roomwatch 找不到包。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            text = wizard.autostart_script(root, str(root / "runtime" / "python" / "pythonw.exe"),
-                                           root / "config.yaml")
-            self.assertIn("CurrentDirectory", text)
-            self.assertIn(str(root), text)
-            self.assertIn("-m roomwatch guard", text)
-            self.assertIn("--log", text)
-            self.assertIn("pythonw.exe", text)
+    """自启实现已搬到 autostart.py（界面设置共用）。这里只钉住「向导确实转发了」。"""
 
-    def test_non_windows_is_reported_not_crashed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(wizard, "IS_WINDOWS", False):
-            ok, msg = wizard.install_autostart(Path(tmp), sys.executable, Path(tmp) / "config.yaml")
-        self.assertFalse(ok)
-        self.assertIn("Windows", msg)
-
-    def test_missing_pythonw_is_reported(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(wizard, "IS_WINDOWS", True):
-            ok, msg = wizard.install_autostart(Path(tmp), str(Path(tmp) / "python.exe"),
+    def test_install_forwards_to_autostart_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(wizard, "enable_autostart",
+                                  return_value=(True, "ok")) as fake:
+            ok, msg = wizard.install_autostart(Path(tmp), "C:/x/python.exe",
                                                Path(tmp) / "config.yaml")
+        self.assertTrue(ok)
+        self.assertEqual(msg, "ok")
+        fake.assert_called_once()
+
+    def test_remove_forwards_to_autostart_module(self) -> None:
+        with mock.patch.object(wizard, "disable_autostart",
+                               return_value=(False, "本来就没有注册过")) as fake:
+            ok, msg = wizard.remove_autostart()
         self.assertFalse(ok)
-        self.assertIn("pythonw", msg)
+        self.assertIn("没有", msg)
+        fake.assert_called_once()
 
 
 class CheckModeTest(unittest.TestCase):

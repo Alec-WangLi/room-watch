@@ -5,16 +5,28 @@
 监控进程是「一直跑、不能崩」的；界面是「人点来点去、随时会关」的。
 两者放一个进程里，界面点崩就把录像带走了。所以这里只做**控制台**：
 
-- 读 `var/state/status.json` 判断在线（读取时重算心跳，不信文件里的 stale）
+- 读 `var/state/status.json` 判断在线：**心跳新鲜 + PID 还活着**，缺一不可
 - 读 `var/db/events.db` 显示最近事件
 - 启停监控用子进程（`python -m roomwatch start`），界面退出不影响它
-- 启停相册同上
+- 停止**不直接 taskkill**：先写 stop.request 让监控自己收尾（见 control.py）
+- 配置、自启、身份走 `rw config` / `rw autostart` / `rw identity` 子进程
+
+0.1.7 的三个真实事故（这次都钉住了）
+------------------------------------
+1. 停止后「启动监控」按不动：判活只看心跳，进程被杀后最长 120 秒仍报在线。
+   现在 PID 死了就是离线，停止中显示「正在停止…」，两个按钮都锁住。
+2. 拍预览图没反馈：probe 写 `var/media/preview.jpg`，界面只扫 `data/captures/`。
+   现在两处都看，按 mtime 取新的，并在标题里标明来源与时间。
+3. 注册本人不知道生不生效：原先弹一个黑框控制台，界面拿不到结果。
+   现在捕获输出、解析退出码，完成后弹结果，主窗口常驻显示模板状态。
 
 解释器说明
 ----------
 本机主环境（含 cv2）没有 tkinter，只有系统 Python 3.13.13 自带。
 所以 `rw gui` 在主环境执行时会自动改用带 tkinter 的解释器重启自己；
 打包成 exe 后 tkinter 随包分发，不再有这个问题。
+反过来，界面进程通常**没有 cv2**，所以拍预览图/注册要另找一个带 cv2 的解释器，
+见 `_media_python()`。
 """
 
 from __future__ import annotations
@@ -27,20 +39,26 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from . import __version__
+from . import control
 from . import paths
+from . import procutil
 from . import updater
 
 # 心跳超过这个秒数就算停了。与 config.yaml 的 heartbeat.stale_after_seconds 默认值一致；
 # 这里刻意不读 yaml，避免界面进程依赖 PyYAML（打包体积和启动速度都受益）。
 STALE_SECONDS = 120.0
-REFRESH_MS = 2000
+REFRESH_MS = 2000        # 状态刷新
+PUMP_MS = 250            # 异步任务/停止轮询
+START_TIMEOUT = 45.0     # 启动到出第一帧的容忍时间
+STOP_TIMEOUT = control.DEFAULT_GRACE   # 优雅停止的等待上限
 
 # Pillow 只用于把 jpg 画进窗口。没有它时界面照常可用，只是不显示缩略图。
 try:  # pragma: no cover - 取决于运行环境
@@ -52,9 +70,17 @@ except Exception:  # noqa: BLE001
 
 @dataclass
 class MonitorState:
-    """界面顶栏要显示的一屏状态。"""
+    """界面顶栏要显示的一屏状态。
+
+    phase 是给按钮用的粗粒度相位：
+        stopped   没在跑（或进程已死）
+        starting  进程在，但还没出画面 / 首次心跳
+        running   心跳新鲜且进程在
+        stopping  已发出停止请求，正在收尾
+    """
 
     online: bool = False
+    phase: str = "stopped"
     stale_seconds: float = 0.0
     pid: Optional[int] = None
     frames: Optional[int] = None
@@ -73,12 +99,17 @@ def _age_seconds(ts: Optional[str]) -> Optional[float]:
         return None
 
 
-def read_state(root: Path) -> MonitorState:
+def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> MonitorState:
     """读状态文件并**重算**在线判定。
 
     为什么不直接读 stale 字段：进程被强杀时来不及改写它，磁盘上留下的
-    最后一份快照里 stale 永远还是 false（AGENTS.md D.2 的真实事故）。
+    最后一份快照里 stale 永远还是 false（AGENTS.md F.4 的真实事故）。
+
+    0.1.7 还多了一个坑：`taskkill /F` 之后 `last_frame_at` 仍然很新，
+    界面在 120 秒里坚持「在线」，于是「启动监控」一直按不动。
+    所以现在必须再确认 PID 还活着。
     """
+    alive = alive or procutil.pid_alive
     path = Path(root) / "var" / "state" / "status.json"
     if not path.is_file():
         return MonitorState(caption="未运行（找不到状态文件）")
@@ -88,23 +119,55 @@ def read_state(root: Path) -> MonitorState:
     except (OSError, ValueError):
         return MonitorState(caption="状态文件读不了（可能正在写入）")
 
+    pid_raw = data.get("pid")
+    try:
+        pid = int(pid_raw) if pid_raw else None
+    except (TypeError, ValueError):
+        pid = None
+    pid_ok = bool(pid) and alive(pid)
+
     gap = _age_seconds(data.get("last_frame_at"))
-    online = gap is not None and gap <= STALE_SECONDS
+    online = pid_ok and gap is not None and gap <= STALE_SECONDS
     recording = bool(data.get("recording"))
-    caption = "在线" if online else "已停止 / 无画面"
-    if recording:
-        caption += " · 录制中"
+    stopping = online and control.stop_requested(Path(root), pid or 0)
+
+    if stopping:
+        phase = "stopping"
+        caption = "正在停止…（录像收尾中）"
+    elif online:
+        phase = "running"
+        caption = "在线" + (" · 录制中" if recording else "")
+    elif pid_ok:
+        phase = "starting"
+        caption = f"进程在，但已 {gap:.0f} 秒没有画面" if gap is not None else "启动中，暂无画面"
+    else:
+        phase = "stopped"
+        caption = "已停止"
 
     return MonitorState(
         online=online,
+        phase=phase,
         stale_seconds=gap or 0.0,
-        pid=data.get("pid"),
+        pid=pid,
         frames=data.get("frames"),
         events_today=data.get("events_today"),
         recording=recording,
         caption=caption,
         last_frame=str(data.get("last_frame_at") or ""),
     )
+
+
+def button_states(state: MonitorState, busy: str = "") -> tuple[str, str]:
+    """返回 (启动, 停止) 两个按钮该有的 state。
+
+    busy 期间两个都锁死：不给「再点一次」的机会——0.1.7 就是因为停止没有
+    中间态，用户连点几下，每次都在 taskkill 一个正在收尾或不存在的 PID。
+    """
+    if busy:
+        return "disabled", "disabled"
+    if state.online:
+        return "disabled", "normal"
+    return "normal", "disabled"
 
 
 def read_events(root: Path, limit: int = 10) -> list[dict]:
@@ -137,13 +200,44 @@ def latest_snapshot(root: Path) -> Optional[Path]:
     return max(files, key=lambda p: str(p))
 
 
+def preview_image(root: Path) -> tuple[Optional[Path], str]:
+    """要显示的那张图：最新抓拍与 probe 预览图里 mtime 更新的那张。
+
+    返回 (路径, 来源)，来源是 "capture" 或 "preview"；都没有时 (None, "")。
+    0.1.7 只认抓拍目录，导致「拍预览图」永远看不到东西。
+    """
+    candidates: list[tuple[float, Path, str]] = []
+    shot = latest_snapshot(root)
+    if shot is not None:
+        try:
+            candidates.append((shot.stat().st_mtime, shot, "capture"))
+        except OSError:
+            pass
+    preview = Path(root) / "var" / "media" / "preview.jpg"
+    if preview.is_file():
+        try:
+            candidates.append((preview.stat().st_mtime, preview, "preview"))
+        except OSError:
+            pass
+    if not candidates:
+        return None, ""
+    candidates.sort(key=lambda item: item[0])
+    _, path, kind = candidates[-1]
+    return path, kind
+
+
 def start_command(python: str, root: Path, config_path: str) -> list[str]:
     log = Path(root) / "var" / "logs" / "watcher.log"
     return [python, "-m", "roomwatch", "start", "--config", str(config_path), "--log", str(log)]
 
 
-def stop_command(pid: int) -> list[str]:
+def force_kill_command(pid: int) -> list[str]:
+    """兜底强杀。只在优雅停止超时、用户确认后才用。"""
     return ["taskkill", "/PID", str(pid), "/F"]
+
+
+def probe_command(python: str, config_path: str) -> list[str]:
+    return [python, "-m", "roomwatch", "probe", "--config", str(config_path), "--json"]
 
 
 def _port_open(port: int) -> bool:
@@ -200,17 +294,28 @@ def _relaunch_with_tk(argv: Sequence[str]) -> int:
 
 
 class RoomWatchApp:
-    """主窗口。所有耗时动作都起子进程，界面线程只负责画。"""
+    """主窗口。所有耗时动作都起子进程/后台线程，界面线程只负责画。"""
 
     def __init__(self, project: Path, tk_module, ttk_module, messagebox, font_module) -> None:
         self.project = Path(project)
         self.config = self.project / "config.yaml"
         self.python = paths.find_python()
         self.tk = tk_module
+        self.ttk = ttk_module
         self.messagebox = messagebox
         self._photo = None
-        self._last_snapshot_key = ""
+        self._preview_key = ""
+        self._preview_note = ""
         self._event_age = 0
+        self._state = MonitorState()
+        self._busy = ""            # "" | starting | stopping | probe | enroll | identity
+        self._busy_until = 0.0
+        self._stop_pid = 0
+        self._tasks: "queue.Queue[tuple[Callable, dict]]" = queue.Queue()
+        self._identity: dict = {}
+        self._media_py: Optional[str] = None
+        self._media_py_checked = False
+
         # 更新相关：缓存结果 + 后台检查的线程间队列
         self._update_info: dict = {}
         self._update_badge = ""
@@ -220,8 +325,8 @@ class RoomWatchApp:
 
         self.win = tk_module.Tk()
         self.win.title(f"房间监控 {__version__}")
-        self.win.geometry("620x560")
-        self.win.minsize(560, 480)
+        self.win.geometry("640x620")
+        self.win.minsize(580, 520)
 
         base = font_module.nametofont("TkDefaultFont")
         self.font_big = (base.actual("family"), 16, "bold")
@@ -229,7 +334,9 @@ class RoomWatchApp:
 
         self._build(ttk_module)
         self.refresh()
+        self._pump()
         self._init_update_state()
+        self.refresh_identity()
 
     # ---------------- 界面搭建 ----------------
 
@@ -246,34 +353,46 @@ class RoomWatchApp:
 
         # 按钮区
         bar = ttk.Frame(outer)
-        bar.pack(fill="x", pady=(0, 12))
+        bar.pack(fill="x", pady=(0, 8))
         self.btn_start = ttk.Button(bar, text="启动监控", command=self.on_start)
         self.btn_stop = ttk.Button(bar, text="停止监控", command=self.on_stop)
         self.btn_gallery = ttk.Button(bar, text="打开相册", command=self.on_gallery)
         self.btn_probe = ttk.Button(bar, text="拍预览图", command=self.on_probe)
-        for btn in (self.btn_start, self.btn_stop, self.btn_gallery, self.btn_probe):
-            btn.pack(side="left", padx=(0, 8))
-        ttk.Button(bar, text="注册本人", command=self.on_enroll).pack(side="left")
+        self.btn_enroll = ttk.Button(bar, text="注册本人", command=self.on_enroll)
+        for btn in (self.btn_start, self.btn_stop, self.btn_gallery,
+                    self.btn_probe, self.btn_enroll):
+            btn.pack(side="left", padx=(0, 6))
         self.btn_update = ttk.Button(bar, text="检查更新", command=self.on_update)
         self.btn_update.pack(side="right")
+        self.btn_settings = ttk.Button(bar, text="设置…", command=self.on_settings)
+        self.btn_settings.pack(side="right", padx=(0, 6))
 
-        # 最新抓拍
-        shot = ttk.LabelFrame(outer, text="最新抓拍", padding=8)
-        shot.pack(fill="x", pady=(0, 12))
-        self.shot_label = tk.Label(shot, text="暂无抓拍", anchor="center", height=8, bg="#f0f0ee")
+        # 身份状态（常驻一行：注册了没有、几个样本、什么时候）
+        self.identity_label = tk.Label(outer, text="本人模板：读取中…", font=self.font_small,
+                                       anchor="w", fg="#666")
+        self.identity_label.pack(fill="x", pady=(0, 10))
+
+        # 最新抓拍 / 预览图
+        self.shot_box = ttk.LabelFrame(outer, text="最新抓拍", padding=8)
+        self.shot_box.pack(fill="x", pady=(0, 10))
+        self.shot_label = tk.Label(self.shot_box, text="暂无抓拍", anchor="center",
+                                   height=7, bg="#f0f0ee")
         self.shot_label.pack(fill="both", expand=True)
         self.shot_label.bind("<Button-1>", lambda _e: self.on_open_latest())
-        tools = ttk.Frame(shot)
+        tools = ttk.Frame(self.shot_box)
         tools.pack(fill="x", pady=(8, 0))
-        ttk.Button(tools, text="打开最新抓拍", command=self.on_open_latest).pack(side="left")
-        ttk.Button(tools, text="抓拍目录", command=lambda: self._open_dir(self.project / "data" / "captures")).pack(side="left", padx=6)
-        ttk.Button(tools, text="日志", command=lambda: self._open_dir(self.project / "var" / "logs")).pack(side="left")
+        ttk.Button(tools, text="打开这张", command=self.on_open_latest).pack(side="left")
+        ttk.Button(tools, text="抓拍目录",
+                   command=lambda: self._open_dir(self.project / "data" / "captures")
+                   ).pack(side="left", padx=6)
+        ttk.Button(tools, text="日志",
+                   command=lambda: self._open_dir(self.project / "var" / "logs")).pack(side="left")
 
         # 事件列表
         box = ttk.LabelFrame(outer, text="最近事件", padding=8)
         box.pack(fill="both", expand=True)
         columns = ("ts", "conf", "video")
-        self.tree = ttk.Treeview(box, columns=columns, show="headings", height=6)
+        self.tree = ttk.Treeview(box, columns=columns, show="headings", height=5)
         for key, text, width in (("ts", "时间", 190), ("conf", "置信度", 80), ("video", "录像", 70)):
             self.tree.heading(key, text=text)
             self.tree.column(key, width=width, anchor="w")
@@ -291,26 +410,66 @@ class RoomWatchApp:
 
     def refresh(self) -> None:
         state = read_state(self.project)
+        self._state = state
         color = "#0F6E56" if state.online else "#993C1D"
-        self.status_label.configure(text=f"● {state.caption}", fg=color)
+        if self._busy == "starting":
+            self.status_label.configure(text="● 正在启动…（等第一帧）", fg="#666")
+        elif self._busy == "probe":
+            self.status_label.configure(text="● 正在拍预览图…", fg="#666")
+        elif self._busy == "enroll":
+            self.status_label.configure(text="● 正在注册本人…（请正对镜头）", fg="#666")
+        else:
+            self.status_label.configure(text=f"● {state.caption}", fg=color)
 
-        bits = [f"PID {state.pid}", f"最后画面 {state.stale_seconds:.0f} 秒前" if state.pid else "无进程"]
+        bits = [f"PID {state.pid}" if state.pid else "无进程"]
+        if state.pid:
+            bits.append(f"最后画面 {state.stale_seconds:.0f} 秒前")
         if state.events_today is not None:
             bits.append(f"今日 {state.events_today} 次")
         if state.frames is not None:
             bits.append(f"帧 {state.frames}")
         self.detail_label.configure(text=" · ".join(bits))
 
-        self.btn_start.configure(state="disabled" if state.online else "normal")
-        self.btn_stop.configure(state="normal" if state.online else "disabled")
+        start_state, stop_state = button_states(state, self._busy)
+        self.btn_start.configure(state=start_state)
+        self.btn_stop.configure(state=stop_state)
+        # 摄像头同一时间只能被一个进程占用，所以运行中/忙时不让探测与注册
+        # 只要还有进程在跑（哪怕没出画面），摄像头就被它占着
+        media_state = "disabled" if (state.pid or self._busy) else "normal"
+        self.btn_probe.configure(state=media_state)
+        self.btn_enroll.configure(state=media_state)
+
+        # 启动超时：45 秒还没出画面就提示，不要让人一直等
+        if self._busy == "starting":
+            if state.online:
+                self._finish_busy()
+            elif self._busy_until and time.monotonic() > self._busy_until:
+                self._finish_busy()
+                self.messagebox.showwarning(
+                    "启动超时",
+                    "45 秒内没有读到画面。常见原因：摄像头被别的程序占用、编号不对、\n"
+                    "RTSP 地址或密码错误。详细原因见 var\\logs\\watcher.log。")
 
         self._event_age += 1
         if self._event_age >= 3:
             self._event_age = 0
             self._refresh_events()
-        self._refresh_snapshot()
+        self._refresh_preview()
 
         self.win.after(REFRESH_MS, self.refresh)
+
+    def _pump(self) -> None:
+        """排空后台任务队列。tkinter 不是线程安全的，线程只往队列里放。"""
+        while True:
+            try:
+                callback, payload = self._tasks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(payload)
+            except Exception as exc:  # noqa: BLE001 - 回调异常不许打死界面
+                self.messagebox.showerror("界面错误", str(exc))
+        self.win.after(PUMP_MS, self._pump)
 
     def _refresh_events(self) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -320,29 +479,128 @@ class RoomWatchApp:
             conf_text = f"{conf:.2f}" if isinstance(conf, (int, float)) else "-"
             self.tree.insert("", "end", values=(ts, conf_text, "有" if row.get("video") else "-"))
 
-    def _refresh_snapshot(self) -> None:
-        path = latest_snapshot(self.project)
-        key = str(path or "")
-        if key == self._last_snapshot_key:
+    def _refresh_preview(self) -> None:
+        path, kind = preview_image(self.project)
+        try:
+            mtime = path.stat().st_mtime if path else 0.0
+        except OSError:
+            mtime = 0.0
+        key = f"{path}|{mtime:.3f}"
+        if key == self._preview_key:
             return
-        self._last_snapshot_key = key
+        self._preview_key = key
 
         if not path:
+            self.shot_box.configure(text="最新抓拍")
             self.shot_label.configure(image="", text="暂无抓拍")
             self._photo = None
             return
+
+        stamp = datetime.fromtimestamp(mtime).strftime("%H:%M:%S") if mtime else ""
+        title = "预览图" if kind == "preview" else "最新抓拍"
+        self.shot_box.configure(text=f"{title} · {stamp}" if stamp else title)
+
         if Image is None or ImageTk is None:
             self.shot_label.configure(image="", text=f"{path.name}\n（未安装 Pillow，无法内嵌预览）")
+            self._photo = None
             return
         try:
             img = Image.open(path)
-            img.thumbnail((520, 260))
+            width, height = img.size
+            img.thumbnail((520, 280))
             self._photo = ImageTk.PhotoImage(img)
-            self.shot_label.configure(image=self._photo, text="")
+            note = f"{path.name} · {width}×{height}"
+            self.shot_label.configure(image=self._photo, text=note, compound="top",
+                                      font=self.font_small)
         except Exception:  # noqa: BLE001 - 半写坏的 jpg 不该让界面崩
             self.shot_label.configure(image="", text=f"{path.name}（预览失败）")
+            self._photo = None
 
-    # ---------------- 动作 ----------------
+    # ---------------- 异步执行 ----------------
+
+    def _run_task(self, fn: Callable[[], dict], on_done: Callable[[dict], None]) -> None:
+        """后台线程跑 fn，结果回主线程交给 on_done。"""
+
+        def work() -> None:
+            try:
+                result = fn()
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "error": str(exc)}
+            self._tasks.put((on_done, result))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _run_cli(self, args: list[str], timeout: float = 60.0,
+                 need_cv2: bool = False) -> dict:
+        """跑 `rw` 子命令，解析最后一行 JSON。
+
+        子进程一律 UTF-8：中文 Windows 的默认管道编码是 GBK，
+        混着解码会得到乱码，比报错更难查。
+        """
+        exe = self._media_python() if need_cv2 else self.python
+        if not exe:
+            return {"ok": False, "error": "找不到带 OpenCV 的解释器（拍预览图/注册需要它）",
+                    "rc": -1, "out": ""}
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        try:
+            proc = subprocess.run(
+                [exe, "-m", "roomwatch", *args],
+                cwd=str(self.project), env=env, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"命令超时（{timeout:.0f} 秒）", "rc": -1, "out": ""}
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"ok": False, "error": str(exc), "rc": -1, "out": ""}
+
+        out = (proc.stdout or "")
+        err = (proc.stderr or "")
+        data: dict = {}
+        for line in reversed(out.strip().splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            break
+        data.setdefault("rc", proc.returncode)
+        data.setdefault("out", out)
+        data.setdefault("err", err)
+        if "ok" not in data:
+            data["ok"] = proc.returncode == 0
+        return data
+
+    def _media_python(self) -> Optional[str]:
+        """找一个带 cv2 的解释器（界面自己通常没有）。结果缓存。"""
+        if self._media_py_checked:
+            return self._media_py
+        self._media_py_checked = True
+
+        seen: list[str] = []
+        for item in (os.environ.get("ROOMWATCH_PYTHON", ""),
+                     paths.bundled_python() or "",
+                     self.python,
+                     sys.executable):
+            if item and item not in seen and Path(item).is_file():
+                seen.append(item)
+        for exe in seen:
+            try:
+                proc = subprocess.run([exe, "-c", "import cv2"], capture_output=True, timeout=25)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if proc.returncode == 0:
+                self._media_py = exe
+                break
+        return self._media_py
+
+    def _finish_busy(self) -> None:
+        self._busy = ""
+        self._busy_until = 0.0
+        self._stop_pid = 0
 
     def _spawn(self, args: list[str], console: bool = False) -> None:
         flags = 0
@@ -355,34 +613,103 @@ class RoomWatchApp:
             close_fds=True,
         )
 
+    # ---------------- 动作：启停 ----------------
+
     def on_start(self) -> None:
+        if self._busy:
+            return
         state = read_state(self.project)
         if state.online:
             self.messagebox.showinfo("已在运行", "监控已经在跑了，不用重复启动。")
             return
         (self.project / "var" / "logs").mkdir(parents=True, exist_ok=True)
-        self._spawn(start_command(self.python, self.project, str(self.config)))
-        self.status_label.configure(text="● 正在启动…", fg="#666")
-        self.win.after(2000, self.refresh)
+        # 清掉上一轮可能残留的停止请求，否则新进程一起来就自己退了
+        control.clear_stop_request(self.project)
+        try:
+            self._spawn(start_command(self.python, self.project, str(self.config)))
+        except OSError as exc:
+            self.messagebox.showerror("启动失败", str(exc))
+            return
+        self._busy = "starting"
+        self._busy_until = time.monotonic() + START_TIMEOUT
+        self.refresh_soon()
 
     def on_stop(self) -> None:
+        if self._busy:
+            return
         state = read_state(self.project)
         if not state.online or not state.pid:
             self.messagebox.showinfo("没有在跑", "监控当前没有运行。")
             return
         if state.recording:
+            question = ("当前正在录像。停止时会先让这段视频收尾（合并音轨、写完整 mp4），"
+                        f"最多等 {STOP_TIMEOUT:.0f} 秒。\n\n现在停止吗？")
+        else:
+            question = f"停止监控？会先让它自己收尾，最多等 {STOP_TIMEOUT:.0f} 秒。"
+        if not self.messagebox.askyesno("停止监控", question):
+            return
+
+        pid = int(state.pid)
+        self._busy = "stopping"
+        self._stop_pid = pid
+        self.refresh_soon()
+
+        def work() -> dict:
+            return control.stop_watcher(self.project, pid, grace=STOP_TIMEOUT, force=False)
+
+        self._run_task(work, self._on_stop_done)
+
+    def _on_stop_done(self, result: dict) -> None:
+        method = str(result.get("method") or "")
+        waited = float(result.get("waited") or 0.0)
+        # 先把 PID 取出来：_finish_busy() 会把它清零，而下面的强杀分支还要用
+        pid = self._stop_pid
+        self._finish_busy()
+        self.refresh_soon()
+
+        if method == "graceful":
+            self.messagebox.showinfo("已停止", f"监控已收尾退出（用时 {waited:.0f} 秒）。")
+            return
+        if method == "already-stopped":
+            return
+        if method == "timeout":
+            if not pid:
+                return
             ok = self.messagebox.askyesno(
-                "正在录像", "当前可能正在写 mp4。强停会让这段视频不可播放，仍然停止吗？")
+                "还没有停下来",
+                f"{STOP_TIMEOUT:.0f} 秒内没有收尾完成（可能卡在写盘或音轨合并）。\n\n"
+                "要强制结束吗？正在写的这段视频可能放不了。")
             if not ok:
                 return
-        elif not self.messagebox.askyesno("确认停止", f"终止监控进程 PID {state.pid}？"):
+            self._busy = "stopping"
+            self.refresh_soon()
+
+            def kill_work() -> dict:
+                try:
+                    subprocess.run(force_kill_command(pid), capture_output=True, timeout=15)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                gone = procutil.wait_pid_exit(pid, timeout=5.0)
+                control.clear_stop_request(self.project)
+                return {"ok": gone, "method": "forced" if gone else "stuck"}
+
+            self._run_task(kill_work, self._on_kill_done)
             return
-        try:
-            subprocess.run(stop_command(state.pid), capture_output=True, timeout=15)
-        except (OSError, subprocess.SubprocessError) as exc:
-            self.messagebox.showerror("停止失败", str(exc))
-            return
-        self.win.after(800, self.refresh)
+        self.messagebox.showwarning("停止结果未知", f"返回：{result}")
+
+    def _on_kill_done(self, result: dict) -> None:
+        self._finish_busy()
+        self.refresh_soon()
+        if result.get("ok"):
+            self.messagebox.showinfo("已强制结束", "进程已结束。正在写的那段录像可能不完整。")
+        else:
+            self.messagebox.showerror("强制结束失败", "进程还在。可打开任务管理器手动结束，"
+                                                    "或重启电脑。")
+
+    def refresh_soon(self) -> None:
+        self.win.after(200, self.refresh)
+
+    # ---------------- 动作：相册 / 预览 / 注册 ----------------
 
     def on_gallery(self) -> None:
         if not _port_open(8765):
@@ -392,21 +719,140 @@ class RoomWatchApp:
             webbrowser.open("http://127.0.0.1:8765/")
 
     def on_probe(self) -> None:
-        log = self.project / "var" / "logs" / "probe.log"
-        with open(log, "a", encoding="utf-8") as fh:
-            subprocess.Popen(
-                [self.python, "-m", "roomwatch", "probe", "--config", str(self.config)],
-                cwd=str(self.project), stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
-            )
-        self.messagebox.showinfo("拍摄中", "约 2 秒后刷新缩略图；失败可看 var/logs/probe.log。")
-        self._last_snapshot_key = ""
-        self.win.after(2500, self.refresh)
+        if self._busy:
+            return
+        if read_state(self.project).pid:
+            self.messagebox.showwarning("请先停止监控",
+                                        "摄像头同一时间只能被一个进程占用，先停止监控再拍预览图。")
+            return
+        self._busy = "probe"
+        self.refresh_soon()
+
+        def work() -> dict:
+            return self._run_cli(["probe", "--config", str(self.config), "--json"],
+                                 timeout=90, need_cv2=True)
+
+        self._run_task(work, self._on_probe_done)
+
+    def _on_probe_done(self, result: dict) -> None:
+        self._finish_busy()
+        self._preview_key = ""       # 强制重画缩略图
+        self.refresh_soon()
+        if result.get("ok"):
+            size = ""
+            if result.get("width") and result.get("height"):
+                size = f"{result['width']}×{result['height']}，"
+            ms = result.get("ms")
+            cost = f"，用时 {int(ms)} 毫秒" if isinstance(ms, (int, float)) else ""
+            self.messagebox.showinfo(
+                "摄像头可用",
+                f"已拍到画面：{size}保存在 var\\media\\preview.jpg{cost}。\n"
+                "上方缩略图就是刚拍的那张。")
+            return
+        tail = self._tail(result)
+        self.messagebox.showerror(
+            "拍预览图失败",
+            (result.get("error") or tail or "没有拿到原因") +
+            "\n\n常见原因：摄像头被别的程序占用（会议软件/相册）、编号不对、RTSP 地址或密码错误。\n"
+            "详细日志：var\\logs\\probe.log")
 
     def on_enroll(self) -> None:
-        if read_state(self.project).online:
-            self.messagebox.showwarning("请先停止监控", "摄像头同一时间只能被一个进程占用，先停止监控再注册。")
+        if self._busy:
             return
-        self._spawn([self.python, "-m", "roomwatch", "enroll", "--config", str(self.config)], console=True)
+        if read_state(self.project).pid:
+            self.messagebox.showwarning("请先停止监控",
+                                        "摄像头同一时间只能被一个进程占用，先停止监控再注册。")
+            return
+        ok = self.messagebox.askyesno(
+            "注册本人",
+            "接下来几秒请正对摄像头、保证光线够亮。\n\n"
+            "采集期间不要在画面里出现第二个人（会把别人注册成你）。\n\n开始吗？")
+        if not ok:
+            return
+        self._busy = "enroll"
+        self.refresh_soon()
+
+        def work() -> dict:
+            return self._run_cli(["enroll", "--config", str(self.config)],
+                                 timeout=180, need_cv2=True)
+
+        self._run_task(work, self._on_enroll_done)
+
+    def on_enroll_from_latest(self) -> None:
+        """没有摄像头/摄像头被占时的退路：用最新一张抓拍注册。"""
+        if self._busy:
+            return
+        shot = latest_snapshot(self.project)
+        if not shot:
+            self.messagebox.showinfo("还没有抓拍", "先让人进一次门，或拍一张正脸照放进抓拍目录。")
+            return
+        ok = self.messagebox.askyesno(
+            "用抓拍注册", f"用这张图注册本人？\n{shot}\n\n图里必须只有你一张脸。")
+        if not ok:
+            return
+        self._busy = "enroll"
+        self.refresh_soon()
+
+        def work() -> dict:
+            return self._run_cli(["enroll", "--from", str(shot), "--config", str(self.config)],
+                                 timeout=120, need_cv2=True)
+
+        self._run_task(work, self._on_enroll_done)
+
+    def _on_enroll_done(self, result: dict) -> None:
+        self._finish_busy()
+        self.refresh_soon()
+        self.refresh_identity()
+        if result.get("ok"):
+            line = ""
+            for text in str(result.get("out") or "").splitlines():
+                if "注册完成" in text:
+                    line = text.strip()
+            self.messagebox.showinfo("注册完成", line or "本人模板已更新。")
+            return
+        self.messagebox.showerror(
+            "注册失败",
+            (result.get("error") or self._tail(result) or "没有拿到原因") +
+            "\n\n如果提示「样本太少」：换个光线好、正对镜头的位置重试；"
+            "也可以先用「用抓拍注册」。")
+
+    @staticmethod
+    def _tail(result: dict, lines: int = 4) -> str:
+        text = (result.get("out") or "") + (result.get("err") or "")
+        rows = [row.strip() for row in text.strip().splitlines() if row.strip()]
+        return " / ".join(rows[-lines:])
+
+    # ---------------- 身份 / 设置 ----------------
+
+    def refresh_identity(self) -> None:
+        def work() -> dict:
+            return self._run_cli(["identity", "--json"], timeout=40)
+
+        self._run_task(work, self._on_identity)
+
+    def _on_identity(self, result: dict) -> None:
+        info = result.get("identity") or {}
+        self._identity = info
+        if not info:
+            self.identity_label.configure(text="本人模板：读取失败（可到「设置 → 身份」查看）",
+                                          fg="#993C1D")
+            return
+        if not info.get("registered"):
+            self.identity_label.configure(
+                text="本人模板：未注册 —— 现在所有脸都会按「访客」处理（会抓拍、会推送）",
+                fg="#993C1D")
+            return
+        samples = info.get("samples") or 0
+        created = str(info.get("created_at") or info.get("mtime") or "").replace("T", " ")
+        tail = f" · {created}" if created else ""
+        self.identity_label.configure(
+            text=f"本人模板：已注册 · {samples} 个样本{tail} —— 认出你时不抓拍、不推送",
+            fg="#0F6E56")
+
+    def on_settings(self) -> None:
+        from . import gui_settings
+
+        gui_settings.open_settings(self)
 
     # ---------------- 更新 ----------------
     #
@@ -547,7 +993,7 @@ class RoomWatchApp:
         self.win.after(800, self.win.destroy)
 
     def on_open_latest(self) -> None:
-        path = latest_snapshot(self.project)
+        path, _kind = preview_image(self.project)
         if not path:
             self.messagebox.showinfo("还没有抓拍", "等有人进门，或先点「拍预览图」。")
             return
@@ -628,7 +1074,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _trace("app built")
 
     if "--selftest" in argv:
-        # 不进入事件循环：建窗 → 校验关键控件 → 销毁。
+        # 不进入事件循环：建窗 → 校验关键控件 → 打开一次设置窗 → 销毁。
         # 用于构建后验证 exe 真的能起来，且版面没退化成空窗口。
         app.win.update()
         problems: list[str] = []
@@ -636,11 +1082,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             problems.append("状态标签没有渲染")
         for name, btn in (("启动", app.btn_start), ("停止", app.btn_stop),
                           ("相册", app.btn_gallery), ("预览", app.btn_probe),
+                          ("注册", app.btn_enroll), ("设置", app.btn_settings),
                           ("更新", app.btn_update)):
             if not btn.winfo_exists():
                 problems.append(f"{name}按钮不存在")
         if len(app.tree["columns"]) != 3:
             problems.append("事件表列数不对")
+        if "本人模板" not in app.identity_label.cget("text"):
+            problems.append("身份状态行没有渲染")
+
+        from . import gui_settings
+
+        dialog = gui_settings.SettingsDialog(app, autoload=False)
+        app.win.update()
+        tabs = dialog.notebook.tabs()
+        if len(tabs) != 4:
+            problems.append(f"设置页签数量是 {len(tabs)}，应为 4")
+        dialog.close()
+
         width = app.win.winfo_width()
         height = app.win.winfo_height()
         app.win.destroy()
@@ -661,6 +1120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
-    "MonitorState", "read_state", "read_events", "latest_snapshot",
-    "start_command", "stop_command", "RoomWatchApp", "main",
+    "MonitorState", "read_state", "read_events", "latest_snapshot", "preview_image",
+    "button_states", "start_command", "force_kill_command", "probe_command",
+    "RoomWatchApp", "main",
 ]

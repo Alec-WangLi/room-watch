@@ -30,26 +30,21 @@ from typing import Optional
 
 import yaml
 
+from .autostart import disable as disable_autostart
+from .autostart import enable as enable_autostart
 from .paths import PROJECT_ROOT, bundled_python, find_python
 from .setup_push import normalize_wecom_webhook
 
 LOCAL_NAME = "config.local.yaml"
 MAIN_NAME = "config.yaml"
-VBS_NAME = "start-monitor.vbs"
-RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_VALUE = "RoomWatch"
 
 LOCAL_HEADER = """# 本机配置覆盖（不入库、不要提交）
-# 由 `rw setup` / `rw push` 生成：只写与本机环境相关的差异，其余键仍以 config.yaml 为准。
+# 由界面「设置」/ `rw setup` / `rw push` 生成：只写与本机相关的差异，其余键仍以 config.yaml 为准。
+# 为什么不写进 config.yaml：升级安装包会整体覆盖主配置，写那里的设置会丢。
 # 想改检测灵敏度、录像时长这类参数，请改 config.yaml，不要在这里重复写。
 """
 
 _NET_PREFIXES = ("rtsp://", "rtmp://", "http://", "https://")
-
-# 平台判定单独提出来：直接 patch os.name 会连 pathlib 的行为一起改掉
-# （Path 会变成 PosixPath），测试里踩过一次，后果非常难查。
-IS_WINDOWS = os.name == "nt"
-
 
 def parse_camera_source(text: str) -> dict:
     """把用户输入翻译成 `camera` 覆盖块。
@@ -142,64 +137,16 @@ def merge_local(path: Path, data: dict) -> dict:
     return merged
 
 
-def autostart_script(root: Path, pythonw: str, config_path: Path) -> str:
-    """开机自启用的 VBS：静默拉起守护进程（无黑框）。
-
-    为什么要绕一层 VBS：Windows 的 Run 注册表项**不能设置工作目录**，
-    而 `python -m roomwatch` 依赖「当前目录进 sys.path」。直接写
-    `pythonw -m roomwatch` 会在系统目录下启动，找不到包，进程秒退——
-    现象是「开机自启开了但什么都没有」，日志也是空的。
-    """
-    log = root / "var" / "logs" / "guardian.log"
-    return (
-        "' room-watch 开机自启（由 rw setup 生成）\n"
-        "' 取消：rw setup --remove-autostart\n"
-        'Set sh = CreateObject("WScript.Shell")\n'
-        f'sh.CurrentDirectory = "{root}"\n'
-        f'sh.Run """{pythonw}"" -m roomwatch guard --config ""{config_path}"" '
-        f'--log ""{log}""", 0, False\n'
-    )
-
-
+# 自启的实现在 autostart.py（界面「设置 → 自启」共用同一份逻辑）。
+# 这里保留同名入口，历史调用方（`rw setup` 的交互流程）不用改。
 def install_autostart(root: Path, python_exe: str, config_path: Path) -> tuple[bool, str]:
     """注册开机自启（当前用户，不需要管理员权限）。返回 (是否成功, 说明)。"""
-    if not IS_WINDOWS:
-        return False, "开机自启目前只实现了 Windows；Linux 请用 systemd 单元"
-
-    pythonw = str(Path(python_exe).with_name("pythonw.exe"))
-    if not Path(pythonw).is_file():
-        return False, f"找不到 {pythonw}（内嵌解释器应自带 pythonw.exe）"
-
-    script = root / VBS_NAME
-    try:
-        script.write_text(autostart_script(root, pythonw, config_path), encoding="utf-8")
-    except OSError as exc:
-        return False, f"写启动脚本失败：{exc}"
-
-    cmd = [
-        "reg", "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ",
-        "/d", f'wscript.exe "{script}"', "/f",
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"注册表写入失败：{exc}"
-    if proc.returncode != 0:
-        return False, f"注册表写入失败：{(proc.stderr or proc.stdout).strip()[:200]}"
-    return True, f"已写入 {RUN_KEY}\\{RUN_VALUE} → {script.name}"
+    return enable_autostart(root, python_exe, config_path)
 
 
 def remove_autostart() -> tuple[bool, str]:
-    try:
-        proc = subprocess.run(
-            ["reg", "delete", RUN_KEY, "/v", RUN_VALUE, "/f"],
-            capture_output=True, text=True, timeout=20,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, str(exc)
-    if proc.returncode == 0:
-        return True, "已取消开机自启"
-    return False, "本来就没有注册过（或已被手动删除）"
+    """取消开机自启。"""
+    return disable_autostart()
 
 
 # ---------------------------------------------------------------- 交互
