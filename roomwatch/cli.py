@@ -269,6 +269,10 @@ def _check_owner(root: Path) -> Check:
 
 
 def _check_hooks(root: Path) -> Check:
+    # 分发包（安装包装出来的目录）没有 .git，提交钩子这项本来就无意义；
+    # 之前一律报 WARN，客户以为装坏了。
+    if not (root / ".git").exists():
+        return Check("提交钩子", True, "非源码目录，跳过（分发包无需此检查）", fatal=False)
     try:
         proc = subprocess.run(
             ["git", "config", "core.hooksPath"], cwd=str(root),

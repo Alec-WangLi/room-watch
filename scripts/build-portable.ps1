@@ -142,11 +142,12 @@ $pthFile = Join-Path $sitePackages "roomwatch-root.pth"
 Set-Content -Path $pthFile -Value "..\..\..\.." -Encoding ASCII
 
 # ---------------------------------------------------------------- 2b. 瘦身
-# pyttsx3 会拖进整套 pywin32，其中 IDE 与文档运行时用不到（约 7MB）。
-# 只删确定安全的三项：win32comext / win32\lib 里有 pyttsx3 依赖的 win32con，
-# 不要动（曾想省 3MB，结果语音直接不可用）。
+# pyttsx3 会拖进整套 pywin32，其中 IDE 与文档运行时用不到。
+# 实测（0.1.3）删掉 win32comext 后 pyttsx3.init() 仍能枚举 2 个语音：
+# win32comext 是 shell/mapi/bits/axscript 等独立扩展，SAPI5 只走 win32com + win32\lib。
+# 但 win32\lib\win32con.py 必须留 —— 删了语音直接不可用（踩过）。
 $trim = @(
-    "PyWin32.chm", "pythonwin", "numpy\tests", "cv2\samples", "bin"
+    "PyWin32.chm", "pythonwin", "win32comext", "numpy\tests", "cv2\samples", "bin"
 )
 foreach ($rel in $trim) {
     $target = Join-Path $sitePackages $rel

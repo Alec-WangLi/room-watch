@@ -66,13 +66,35 @@ scripts\setup-hooks.bat
 
 Windows 下把 `./rw` 换成 `rw`（`rw.cmd` 会自己找对解释器）。
 
-### 交付给客户：免安装分发包
+### 交付给客户：单文件安装包（推荐）
+
+```
+# 构建机上装一次 Inno Setup（客户机不需要）
+winget install -e --id JRSoftware.InnoSetup
+
+# 先出免安装目录，再打成安装包
+powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1
+```
+
+产物 `dist\room-watch-<版本>-setup.exe`（142MB）。客户双击下一步即可：
+
+- 装到 `%LocalAppData%\Programs\room-watch`，**不要管理员密码**；
+- 建开始菜单快捷方式，可选桌面图标；
+- 装完自动弹配置向导（摄像头 / webhook / 相册密码 / 开机自启）；
+- 卸载在「设置 → 应用」里，会取消开机自启，**保留** `config.local.yaml` 与 `data\`
+  （升级走的是旧卸载器，删配置等于每次升级都要重配）。
+
+安装包是中文界面。Inno 官方包不带简体中文，语言文件在
+`scripts\inno\ChineseSimplified.isl`（取自 issrc 的 Unofficial 目录）。
+
+### 备选：免安装分发包（zip）
 
 ```
 powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 ```
 
-产出 `dist\room-watch-<版本>\` 和同名 zip（约 150MB，解压后约 310MB）。
+产出 `dist\room-watch-<版本>\` 和同名 zip（176MB，解压后 368MB）。
 包里带了嵌入式 Python、运行依赖、ffmpeg 和模型，**客户机不需要装任何东西**：
 
 1. 解压到任意目录（不要放 `C:\Program Files`，那里普通用户不可写）；

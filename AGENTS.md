@@ -207,6 +207,29 @@ room-watch-<版本>\
 改 `python313._pth`（加一行 `Lib\site-packages` 并取消 `#import site` 的注释），
 这一步由构建脚本完成，手工重建 runtime 时别忘。
 
+### D.5 Inno Setup 安装包（0.1.3 起）
+
+`scripts/build-installer.ps1` + `scripts/room-watch.iss` 把 D.4 的目录打成
+单个 `setup.exe`。五个必须记住的点：
+
+1. **Inno 官方包不含简体中文。** `Languages\` 下只有 29 种官方语言，
+   写 `ChineseSimplified.isl` 会直接编译失败。语言文件放在
+   `scripts\inno\ChineseSimplified.isl`（取自 issrc 的 `Unofficial` 目录，
+   tag `is-6_7_3`），且**必须带 UTF-8 BOM**，否则中文界面是乱码。
+2. **`[UninstallRun]` 必须给 `RunOnceId`。** 没有它，升级时新旧两个卸载器
+   各执行一次 `reg delete`，编译器也会报 warning。
+3. **卸载不要删 `config.local.yaml` / `data\` / `var\db`。** Inno 升级流程是
+   「先跑旧卸载器，再装新版」；卸载器一删配置，客户每次升级都要重配摄像头和
+   webhook。只删 `var\logs`。
+4. **`runtime\` 要用 `filesandordirs` 强删。** `comtypes` 会在
+   `site-packages\comtypes\gen\` 运行时生成 `SpeechLib.py` 等 5 个文件，
+   它们不在安装清单里，不显式删就留下残骸、目录也删不掉。
+5. **开机自启不要放 `[Tasks]` 再传给向导。** 勾选任务和向导第 4 问会互相矛盾
+   （取消勾选仍自启）。统一交给 `rw setup` 的第 4 问，安装器只负责拉起向导。
+
+**瘦身边界**：`win32comext` 可整棵删（pyttsx3 的 SAPI5 只走 `win32com`，
+实测删后仍能枚举 2 个语音）；`win32\lib\win32con.py` **不能删**，删了语音直接不可用。
+
 ---
 
 ## E. 测试

@@ -22,6 +22,14 @@
   内含嵌入式 Python 3.13、运行依赖、ffmpeg、模型与源码。客户解压后
   **不需要装 Python、不需要装 ffmpeg、不需要联网**，双击 `配置.bat` → `启动.bat` 即可。
   同目录再打一个 zip（约 150MB，解压后约 310MB）。
+- **单文件安装包**（`scripts/build-installer.ps1` + `scripts/room-watch.iss`）：
+  把上述目录打成 `dist/room-watch-<版本>-setup.exe`（142MB），双击即装，
+  **装到 `%LocalAppData%\Programs\room-watch`，不需要管理员权限**。
+  自动建开始菜单快捷方式、可选桌面图标，装完直接弹配置向导；
+  卸载器会取消开机自启。中文界面用 `scripts/inno/ChineseSimplified.isl`
+  （Inno 官方包里没有中文，取自 issrc 的 Unofficial 目录）。
+  卸载保留 `config.local.yaml` 与 `data\`、`var\`——Inno 升级时先跑旧卸载器，
+  删了就等于每次升级都要重配摄像头和 webhook。
 - **首次配置向导**（`roomwatch/wizard.py`，命令 `rw setup`）：四个问题配好
   摄像头（编号 / `rtsp://` / 视频文件）、企业微信 webhook、相册密码、开机自启；
   写完立刻**探测摄像头**并发一条**测试消息**，失败时直接说清怎么改。
@@ -40,11 +48,19 @@
 - `guardian` 新增 `--log PATH`：用 `pythonw` 静默启动时也有日志可查
   （此前 stderr 被丢弃，守护日志完全不可见）。
 - 移除 `cli._PASSTHROUGH_MODULES`（定义了但从未被引用）。
+- `rw doctor` 的「提交钩子」在非 git 目录（分发包）下改为「跳过」，
+  不再对着客户报一条无意义的 WARN。
+- 分发包多删一个 `win32comext`（pyttsx3 的 SAPI5 只走 `win32com`，
+  实测删掉后仍能枚举 2 个语音）；`win32\lib\win32con.py` 保留。
 
 ### 实测
 
-- 分发包体积：目录约 310MB，zip 约 150MB；包内 `import cv2` 正常，`rw version` 与
-  `rw doctor` 全部通过。
+- 分发包体积：目录 367.9MB，zip 176.0MB；安装包 142.1MB（lzma2/max，编译约 51 秒）。
+- **端到端验证过一遍**：`setup.exe /VERYSILENT` 装到临时目录 → 包内 `rw version`
+  与 `room-watch.exe --selftest` 均为 0（窗口 620×560）；`rw doctor` 六项核心全 OK，
+  解释器、ffmpeg 都指向安装目录自身 → 静默卸载 exitcode=0，
+  **目录被完全删除、HKCU Run 无残留**。
+- 包内 `import cv2` 正常，`rw version` / `rw doctor` 全部通过。
 - 测试 20 个文件 400 项全绿（新增 `test_wizard.py` 25 项）。
 
 ---
