@@ -146,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 | `rw push-video PATH` | 把一段录像发到企业微信（验证视频推送） |
 | `rw test [--fast]` | 跑全部测试（`--fast` 跳过集成测试） |
 | `rw doctor` | 环境自检 |
-| `rw update [--check\|--yes\|--force]` | 检查并安装更新（见「自动更新」） |
+| `rw update [--check\|--yes\|--force\|--json]` | 检查并安装更新（见「自动更新」） |
 | `rw version` | 版本号 + 当前 git 提交 |
 | `rw gui` | 打开桌面界面 |
 
@@ -306,11 +306,20 @@ rw test --fast   # 跳过最慢的集成测试（约 55 秒）
 
 ### 自动更新
 
+界面右上角有「检查更新」：有新版时按钮会变成「有新版本 0.1.x」，
+点一下确认即可更新（界面自动关闭 → 独立控制台里下载并安装 → 装完自动重开界面）。
+界面启动时也会按 `update.check_interval_hours`（默认 24 小时）在后台静默查一次，
+结果缓存在 `var/state/update.json`；**只提示，不自动安装**。
+
+命令行等价写法：
+
 ```bash
 rw update            # 检查并在允许时直接安装
 rw update --check    # 只看有没有新版，不下载
 rw update --yes      # 允许跨次版本（0.1.4 → 0.2.0）
 rw update --force    # 允许降级（回滚排障用）
+rw update --json     # 机器可读（一行 JSON，隐含 --check，界面用）
+rw update --wait-exit 1234 --relaunch-gui   # 等界面退出再装、装完自动开界面
 ```
 
 行为按版本纪律分流，不是「有新版就闷头装」：

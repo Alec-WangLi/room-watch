@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
 import subprocess
 import sys
@@ -391,141 +392,208 @@ def _cmd_update(argv: Sequence[str]) -> int:
     """检查 / 安装更新。
 
     退出码：0 已是最新或已完成；1 失败；10 有更新但需要确认（脚本可据此判断）。
+
+    `--json` 是给界面用的：只输出**一行** JSON，过程信息一律不打印，
+    并且隐含 `--check`（界面拿到结果后自己决定要不要更新）。
     """
+    from datetime import datetime
+
     from . import updater
     from .config import load_config
 
-    unknown = [a for a in argv if a not in
-               ("--check", "--yes", "--force", "--no-restart", "--help", "-h")]
-    if unknown:
-        raise UsageError(f"rw update 不认识这些参数：{' '.join(unknown)}")
     if "--help" in argv or "-h" in argv:
         print(
             "用法：rw update [--check] [--yes] [--force] [--no-restart]\n"
-            "  --check       只检查，不下载不安装\n"
-            "  --yes         允许跨次版本/主版本升级（版本纪律要求显式确认）\n"
-            "  --force       允许降级（一般只用于回滚到旧版排障）\n"
-            "  --no-restart  装完不自动把监控拉起来"
+            "                [--json] [--wait-exit PID] [--relaunch-gui]\n"
+            "  --check        只检查，不下载不安装\n"
+            "  --yes          允许跨次版本/主版本升级（版本纪律要求显式确认）\n"
+            "  --force        允许降级（一般只用于回滚到旧版排障）\n"
+            "  --no-restart   装完不自动把监控拉起来\n"
+            "  --json         机器可读输出，隐含 --check（界面用）\n"
+            "  --wait-exit    先等这个进程号退出再安装（界面自己触发更新时用）\n"
+            "  --relaunch-gui 装完自动重新打开界面"
         )
         return 0
 
-    check_only = "--check" in argv
+    flags = {"--check", "--yes", "--force", "--no-restart", "--json", "--relaunch-gui"}
+    json_mode = "--json" in argv
+    check_only = "--check" in argv or json_mode
     assume_yes = "--yes" in argv
     force = "--force" in argv
     do_restart = "--no-restart" not in argv
+    relaunch_gui = "--relaunch-gui" in argv
+
+    wait_pid = 0
+    unknown: list[str] = []
+    idx = 0
+    while idx < len(argv):
+        item = argv[idx]
+        if item == "--wait-exit":
+            if idx + 1 >= len(argv) or not argv[idx + 1].isdigit():
+                raise UsageError("--wait-exit 后面要跟一个进程号（数字）")
+            wait_pid = int(argv[idx + 1])
+            idx += 2
+            continue
+        if item not in flags:
+            unknown.append(item)
+        idx += 1
+    if unknown:
+        raise UsageError(f"rw update 不认识这些参数：{' '.join(unknown)}")
 
     cfg_path = paths.PROJECT_ROOT / "config.yaml"
     cfg = load_config(str(cfg_path)) if cfg_path.is_file() else {}
     opt = updater.update_config(cfg)
 
     current = updater.Version.parse(__version__)
-    print(f"本地版本  {current}")
-    if not opt["enabled"]:
-        print("自动更新已关闭（update.enabled=false），跳过。")
-        return 0
+    payload: dict = {
+        "current": str(current),
+        "latest": "",
+        "policy": "",
+        "tag": "",
+        "notes": "",
+        "error": "",
+        "checked_at": "",
+        "check_interval_hours": opt["check_interval_hours"],
+        "installed": False,
+    }
 
-    print(f"检查仓库  {opt['repo']}")
+    def say(*parts: object) -> None:
+        """`--json` 模式下静默，保证 stdout 只有那一行 JSON。"""
+        if not json_mode:
+            print(*parts)
+
+    def done(code: int, **fields: object) -> int:
+        payload.update(fields)
+        if payload["latest"]:
+            if not payload["checked_at"]:
+                payload["checked_at"] = datetime.now().isoformat(timespec="seconds")
+            # 检查结果落盘，界面下次启动按 check_interval_hours 复用，不用每次联网
+            updater.save_check_cache({key: payload[key] for key in (
+                "checked_at", "current", "latest", "policy", "tag", "notes",
+                "check_interval_hours")})
+        if json_mode:
+            print(json.dumps(payload, ensure_ascii=False))
+        return code
+
+    say(f"本地版本  {current}")
+    if not opt["enabled"]:
+        say("自动更新已关闭（update.enabled=false），跳过。")
+        return done(0, policy="disabled")
+
+    say(f"检查仓库  {opt['repo']}")
     try:
         release = updater.fetch_latest(opt["repo"])
     except updater.UpdateError as exc:
-        print(f"✗ {exc}")
-        return 1
+        say(f"✗ {exc}")
+        return done(1, error=str(exc))
 
     latest = release.version
     when = (release.published_at or "")[:10]
-    print(f"远端版本  {latest}" + (f"（发布 {when}）" if when else ""))
+    say(f"远端版本  {latest}" + (f"（发布 {when}）" if when else ""))
 
     policy = updater.decide(current, latest,
                             allow_downgrade=force or opt["allow_downgrade"])
+    found = {"latest": str(latest), "policy": policy, "tag": release.tag,
+             "notes": (release.notes or "").strip()}
 
     if policy == "up-to-date":
-        print("\n已是最新版本。")
-        return 0
+        say("\n已是最新版本。")
+        return done(0, **found)
     if policy == "blocked-downgrade":
-        print(f"\n远端 {latest} 比本地 {current} 旧，默认不降级。"
-              "确认要回滚请加 --force。")
-        return 0
+        say(f"\n远端 {latest} 比本地 {current} 旧，默认不降级。"
+            "确认要回滚请加 --force。")
+        return done(0, **found)
     if policy == "downgrade":
-        print(f"\n注意：这是降级（{current} → {latest}），因为给了 --force 才继续。")
+        say(f"\n注意：这是降级（{current} → {latest}），因为给了 --force 才继续。")
 
     if policy in ("confirm-minor", "confirm-major"):
         kind = "次版本" if policy == "confirm-minor" else "主版本"
-        print(f"\n这是一个{kind}升级（{current} → {latest}）。")
-        print("按项目版本纪律，跨次版本要显式确认，不会自动安装。")
+        say(f"\n这是一个{kind}升级（{current} → {latest}）。")
+        say("按项目版本纪律，跨次版本要显式确认，不会自动安装。")
         if not (assume_yes or opt["allow_minor"]):
-            print("确认升级请重跑：rw update --yes")
-            return 10
+            say("确认升级请重跑：rw update --yes")
+            return done(10, **found)
 
     if release.notes.strip():
-        print("\n更新说明：")
+        say("\n更新说明：")
         for line in release.notes.strip().splitlines()[:20]:
-            print("  " + line)
+            say("  " + line)
 
     if check_only:
-        print("\n有新版本可用（--check 模式，未安装）。")
-        return 10
+        say("\n有新版本可用（--check 模式，未安装）。")
+        return done(10, **found)
+
+    # 界面自己点「立即更新」时，界面进程还占着 room-watch.exe，
+    # 安装器换不掉正在运行的可执行文件 —— 先等它退出。
+    if wait_pid and not updater.wait_pid_exit(wait_pid, timeout=30.0):
+        say(f"✗ 进程 {wait_pid} 在 30 秒内没有退出，已取消安装。")
+        return done(1, error="等待界面退出超时", **found)
 
     asset = release.installer_asset()
     if not asset:
-        print(f"\n✗ release {release.tag} 里没有 room-watch-<版本>-setup.exe，无法自动更新。")
-        return 1
+        say(f"\n✗ release {release.tag} 里没有 room-watch-<版本>-setup.exe，无法自动更新。")
+        return done(1, error="release 里没有安装包资产", **found)
 
     expected = updater.expected_sha256(release)
     if not expected:
         # release 说明里没写摘要时，再看有没有 <安装包>.sha256 这个资产
         expected = updater.fetch_sha256_asset(release)
     if not expected and opt["require_checksum"]:
-        print("\n✗ 该 release 没有提供 SHA256（*.sha256 资产或说明里的 sha256:），")
-        print("  为安全起见拒绝安装。可临时在配置里设 update.require_checksum=false。")
-        return 1
+        say("\n✗ 该 release 没有提供 SHA256（*.sha256 资产或说明里的 sha256:），")
+        say("  为安全起见拒绝安装。可临时在配置里设 update.require_checksum=false。")
+        return done(1, error="缺少 SHA256 摘要", **found)
 
     dest = updater.cache_dir() / asset["name"]
-    print(f"\n下载 {asset['name']}（{int(asset.get('size') or 0) / 1048576:.1f} MB）…")
+    say(f"\n下载 {asset['name']}（{int(asset.get('size') or 0) / 1048576:.1f} MB）…")
 
-    def _bar(done: int, total: int) -> None:
-        if total:
-            pct = done * 100 // total
-            print(f"\r  {pct:3d}%  {done / 1048576:.1f}/{total / 1048576:.1f} MB", end="", flush=True)
+    def _bar(step: int, total: int) -> None:
+        if total and not json_mode:
+            pct = step * 100 // total
+            print(f"\r  {pct:3d}%  {step / 1048576:.1f}/{total / 1048576:.1f} MB", end="", flush=True)
 
     try:
         updater.download(asset["browser_download_url"], dest, progress=_bar)
     except updater.UpdateError as exc:
-        print(f"\n✗ {exc}")
-        return 1
-    print()
+        say(f"\n✗ {exc}")
+        return done(1, error=str(exc), **found)
+    say()
 
     if expected:
         if not updater.verify_sha256(dest, expected):
             dest.unlink(missing_ok=True)
-            print("✗ SHA256 校验失败，已删除下载文件。")
-            print(f"  期望 {expected}")
-            print(f"  实际 {updater.sha256_of(dest) if dest.exists() else '文件已删'}")
-            return 1
-        print("✓ SHA256 校验通过")
+            say("✗ SHA256 校验失败，已删除下载文件。")
+            say(f"  期望 {expected}")
+            return done(1, error="SHA256 校验失败", **found)
+        say("✓ SHA256 校验通过")
     else:
-        print("⚠ 未提供 SHA256，跳过校验（update.require_checksum=false）")
+        say("⚠ 未提供 SHA256，跳过校验（update.require_checksum=false）")
 
     was_running = updater.stop_watcher()
     if was_running:
-        print("已停止正在运行的监控进程")
+        say("已停止正在运行的监控进程")
 
-    print("正在安装（静默，约 30~60 秒）…")
+    say("正在安装（静默，约 30~60 秒）…")
     try:
         code = updater.run_installer(dest)
     except updater.UpdateError as exc:
-        print(f"✗ {exc}")
-        return 1
+        say(f"✗ {exc}")
+        return done(1, error=str(exc), **found)
     if code != 0:
-        print(f"✗ 安装器返回 {code}，更新未完成。安装包保留在 {dest}")
-        return 1
+        say(f"✗ 安装器返回 {code}，更新未完成。安装包保留在 {dest}")
+        return done(1, error=f"安装器返回 {code}", **found)
 
-    print(f"✓ 已更新到 {latest}")
+    say(f"✓ 已更新到 {latest}")
     if was_running and do_restart:
         if updater.restart_monitor():
-            print("已重新拉起监控进程。")
+            say("已重新拉起监控进程。")
         else:
-            print("⚠ 监控没能自动重启，请手动打开 room-watch。")
-    return 0
+            say("⚠ 监控没能自动重启，请手动打开 room-watch。")
+    if relaunch_gui:
+        if updater.relaunch_gui():
+            say("已重新打开界面。")
+        else:
+            say("⚠ 没能自动打开界面，请双击桌面上的 room-watch。")
+    return done(0, installed=True, **found)
 
 
 # ---------------------------------------------------------------- 入口

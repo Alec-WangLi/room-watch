@@ -300,5 +300,91 @@ class StopWatcherTest(unittest.TestCase):
                 self.assertFalse(updater.stop_watcher(p))
 
 
+class CheckCacheTest(unittest.TestCase):
+    """界面用的检查结果缓存（var/state/update.json）。"""
+
+    def test_roundtrip(self) -> None:
+        from datetime import datetime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(updater.load_check_cache(root), {})
+            stamp = datetime.now().isoformat(timespec="seconds")
+            updater.save_check_cache({"latest": "0.1.5", "checked_at": stamp}, root)
+            self.assertEqual(updater.load_check_cache(root)["latest"], "0.1.5")
+
+    def test_corrupt_cache_is_empty_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = updater.check_cache_path(root)
+            path.parent.mkdir(parents=True)
+            path.write_text("{not json", encoding="utf-8")
+            self.assertEqual(updater.load_check_cache(root), {})
+            path.write_text('["a", "b"]', encoding="utf-8")
+            self.assertEqual(updater.load_check_cache(root), {})
+
+    def test_missing_timestamp_counts_as_stale(self) -> None:
+        self.assertIsNone(updater.check_age_hours({}))
+        self.assertTrue(updater.should_auto_check({}, 24))
+
+    def test_zero_interval_disables_auto_check(self) -> None:
+        self.assertFalse(updater.should_auto_check({}, 0))
+
+    def test_fresh_cache_skips_auto_check(self) -> None:
+        from datetime import datetime
+
+        data = {"checked_at": datetime.now().isoformat(timespec="seconds")}
+        self.assertFalse(updater.should_auto_check(data, 24))
+
+    def test_old_cache_triggers_auto_check(self) -> None:
+        from datetime import datetime, timedelta
+
+        data = {"checked_at": (datetime.now() - timedelta(hours=25)).isoformat(timespec="seconds")}
+        self.assertTrue(updater.should_auto_check(data, 24))
+
+
+class AvailableVersionTest(unittest.TestCase):
+    def test_newer_patch_is_detected(self) -> None:
+        self.assertEqual(str(updater.available_version({"latest": "0.1.5"}, "0.1.4")), "0.1.5")
+        self.assertEqual(str(updater.available_version({"latest": "0.2.0"}, "0.1.9")), "0.2.0")
+
+    def test_same_or_older_is_none(self) -> None:
+        self.assertIsNone(updater.available_version({"latest": "0.1.4"}, "0.1.4"))
+        self.assertIsNone(updater.available_version({"latest": "0.1.3"}, "0.1.4"))
+
+    def test_garbage_is_none(self) -> None:
+        self.assertIsNone(updater.available_version({}, "0.1.4"))
+        self.assertIsNone(updater.available_version({"latest": "n/a"}, "0.1.4"))
+
+
+class WaitPidExitTest(unittest.TestCase):
+    def test_zero_pid_exits_immediately(self) -> None:
+        self.assertTrue(updater.wait_pid_exit(0, timeout=0.5))
+
+    def test_live_pid_times_out(self) -> None:
+        import os as _os
+
+        self.assertFalse(updater.wait_pid_exit(_os.getpid(), timeout=0.6))
+
+
+class GuiLauncherTest(unittest.TestCase):
+    def test_missing_root_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(updater.gui_launcher(Path(tmp)))
+
+    def test_prefers_packaged_exe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "room-watch.exe").write_bytes(b"")
+            self.assertEqual(updater.gui_launcher(root), [str(root / "room-watch.exe")])
+
+    def test_falls_back_to_module_without_exe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.yaml").write_text("update: {}\n", encoding="utf-8")
+            cmd = updater.gui_launcher(root)
+            self.assertTrue(cmd and cmd[-2:] == ["roomwatch", "gui"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

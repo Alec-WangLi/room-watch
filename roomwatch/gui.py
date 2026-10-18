@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +35,7 @@ from typing import Optional, Sequence
 
 from . import __version__
 from . import paths
+from . import updater
 
 # 心跳超过这个秒数就算停了。与 config.yaml 的 heartbeat.stale_after_seconds 默认值一致；
 # 这里刻意不读 yaml，避免界面进程依赖 PyYAML（打包体积和启动速度都受益）。
@@ -208,6 +211,12 @@ class RoomWatchApp:
         self._photo = None
         self._last_snapshot_key = ""
         self._event_age = 0
+        # 更新相关：缓存结果 + 后台检查的线程间队列
+        self._update_info: dict = {}
+        self._update_badge = ""
+        self._checking = False
+        self._check_manual = False
+        self._check_queue: "queue.Queue[dict]" = queue.Queue()
 
         self.win = tk_module.Tk()
         self.win.title(f"房间监控 {__version__}")
@@ -220,6 +229,7 @@ class RoomWatchApp:
 
         self._build(ttk_module)
         self.refresh()
+        self._init_update_state()
 
     # ---------------- 界面搭建 ----------------
 
@@ -244,6 +254,8 @@ class RoomWatchApp:
         for btn in (self.btn_start, self.btn_stop, self.btn_gallery, self.btn_probe):
             btn.pack(side="left", padx=(0, 8))
         ttk.Button(bar, text="注册本人", command=self.on_enroll).pack(side="left")
+        self.btn_update = ttk.Button(bar, text="检查更新", command=self.on_update)
+        self.btn_update.pack(side="right")
 
         # 最新抓拍
         shot = ttk.LabelFrame(outer, text="最新抓拍", padding=8)
@@ -396,6 +408,144 @@ class RoomWatchApp:
             return
         self._spawn([self.python, "-m", "roomwatch", "enroll", "--config", str(self.config)], console=True)
 
+    # ---------------- 更新 ----------------
+    #
+    # 界面不自己实现版本比对，一律走 `rw update --json`：版本纪律（同「主.次」
+    # 只升修订号才自动装、跨次版本必须确认）只有 updater.decide 一处实现，
+    # 界面再写一遍就会漂移。
+
+    def _init_update_state(self) -> None:
+        """启动先用缓存定按钮文字，缓存过期再后台查一次（不弹窗、不挡人）。"""
+        cache = updater.load_check_cache(self.project)
+        self._apply_update_cache(cache)
+        raw = cache.get("check_interval_hours")
+        interval = float(raw) if isinstance(raw, (int, float)) else 24.0
+        if updater.should_auto_check(cache, interval):
+            self._start_check(manual=False)
+
+    def _apply_update_cache(self, cache: dict) -> None:
+        if not cache:
+            return
+        self._update_info = cache
+        newer = updater.available_version(cache, __version__)
+        if newer:
+            self._update_badge = str(newer)
+            self.btn_update.configure(text=f"有新版本 {newer}")
+        else:
+            self._update_badge = ""
+            self.btn_update.configure(text="检查更新")
+
+    def _start_check(self, manual: bool) -> None:
+        if self._checking:
+            return
+        self._checking = True
+        self._check_manual = manual
+        if manual:
+            self.btn_update.configure(text="检查中…", state="disabled")
+
+        def work() -> None:
+            data: dict
+            try:
+                proc = subprocess.run(
+                    [self.python, "-m", "roomwatch", "update", "--json"],
+                    cwd=str(self.project), capture_output=True, text=True, timeout=180,
+                )
+                lines = [ln for ln in (proc.stdout or "").strip().splitlines() if ln.strip()]
+                data = json.loads(lines[-1]) if lines else {}
+                data.setdefault("error", "")
+            except (OSError, subprocess.SubprocessError) as exc:
+                data = {"error": f"检查失败：{exc}"}
+            except ValueError:
+                data = {"error": "检查失败：输出不是有效 JSON"}
+            self._check_queue.put(data)
+
+        threading.Thread(target=work, daemon=True).start()
+        self.win.after(400, self._poll_check)
+
+    def _poll_check(self) -> None:
+        """主线程轮询检查结果（tkinter 不是线程安全的，线程只往队列里放）。"""
+        try:
+            data = self._check_queue.get_nowait()
+        except queue.Empty:
+            self.win.after(400, self._poll_check)
+            return
+
+        self._checking = False
+        self.btn_update.configure(state="normal")
+        manual, self._check_manual = self._check_manual, False
+
+        error = str(data.get("error") or "")
+        if error:
+            self.btn_update.configure(
+                text=f"有新版本 {self._update_badge}" if self._update_badge else "检查更新")
+            if manual:
+                self.messagebox.showwarning("检查更新失败", error)
+            return
+
+        cache = {key: data.get(key) for key in (
+            "checked_at", "current", "latest", "policy", "tag", "notes",
+            "check_interval_hours")}
+        self._apply_update_cache(cache)
+
+        newer = updater.available_version(cache, __version__)
+        if not newer:
+            if manual:
+                self.messagebox.showinfo("已是最新", f"当前版本 {__version__} 就是最新版本。")
+            return
+        if manual:
+            self._ask_install(cache, newer)
+
+    def on_update(self) -> None:
+        if self._update_badge:
+            newer = updater.available_version(self._update_info, __version__)
+            if not newer:
+                self._update_badge = ""
+                self.btn_update.configure(text="检查更新")
+                return
+            self._ask_install(self._update_info, newer)
+            return
+        self._start_check(manual=True)
+
+    def _ask_install(self, info: dict, newer) -> None:
+        policy = str(info.get("policy") or "")
+        if policy in ("confirm-minor", "confirm-major"):
+            kind = "次版本" if policy == "confirm-minor" else "主版本"
+            ok = self.messagebox.askyesno(
+                f"确认{kind}升级",
+                f"这是跨{kind}升级（{__version__} → {newer}）。\n"
+                "按项目版本纪律，跨次版本必须由人确认，不会自动安装。\n\n继续升级吗？")
+            if not ok:
+                return
+
+        notes = str(info.get("notes") or "").strip()
+        tail = f"\n\n更新说明（节选）：\n{notes[:600]}" if notes else ""
+        ok = self.messagebox.askyesno(
+            f"发现新版本 {newer}",
+            f"当前 {__version__} → {newer}。{tail}\n\n"
+            "点「是」立即更新：界面会关闭，更新完成后自动重新打开；\n"
+            "监控进程会被短暂停止（约 1 分钟）。")
+        if not ok:
+            return
+        self._apply_update()
+
+    def _apply_update(self) -> None:
+        """交给独立控制台进程去装。
+
+        界面进程自己占着 `room-watch.exe`，安装器换不掉正在运行的可执行文件，
+        所以必须先把 PID 交给子进程、自己退出（`--wait-exit` + `--relaunch-gui`）。
+        """
+        args = [self.python, "-m", "roomwatch", "update", "--yes",
+                "--wait-exit", str(os.getpid()), "--relaunch-gui"]
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
+        try:
+            subprocess.Popen(args, cwd=str(self.project), creationflags=flags, close_fds=True)
+        except OSError as exc:
+            self.messagebox.showerror("更新启动失败", str(exc))
+            return
+        self.status_label.configure(text="● 正在更新，界面即将关闭…", fg="#666")
+        self.btn_update.configure(state="disabled")
+        self.win.after(800, self.win.destroy)
+
     def on_open_latest(self) -> None:
         path = latest_snapshot(self.project)
         if not path:
@@ -485,7 +635,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if "●" not in app.status_label.cget("text"):
             problems.append("状态标签没有渲染")
         for name, btn in (("启动", app.btn_start), ("停止", app.btn_stop),
-                          ("相册", app.btn_gallery), ("预览", app.btn_probe)):
+                          ("相册", app.btn_gallery), ("预览", app.btn_probe),
+                          ("更新", app.btn_update)):
             if not btn.winfo_exists():
                 problems.append(f"{name}按钮不存在")
         if len(app.tree["columns"]) != 3:

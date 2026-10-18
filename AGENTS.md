@@ -135,6 +135,16 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 但回退路径拿不到 `assets` 列表，`Release.installer_asset()` 是按命名约定合成的，
 所以 G.4 的资产命名一旦改了，回退路径会静默找不到包。
 
+**界面自己触发更新时，必须先退出界面进程**（0.1.5 起的 `--wait-exit <PID>`）：
+界面是 `room-watch.exe`（PyInstaller），进程活着时安装器替换不掉这个文件，
+表现为「提示更新成功、版本号却没变」。所以 GUI 的做法是 —— 把自身 PID 交给
+`rw update --wait-exit <PID> --relaunch-gui`，自己销毁窗口，装完由子进程重开界面
+（`updater.gui_launcher()` 优先用包内 `room-watch.exe`，内嵌解释器没有 tkinter）。
+
+界面里**不重写版本比对**：一律走 `rw update --json`，让 `updater.decide()` 保持
+唯一真相。检查结果缓存在 `var/state/update.json`，按 `update.check_interval_hours`
+复用（0 = 关闭后台自检），启动自检只改按钮文字，不弹窗、不自动安装。
+
 ---
 
 ## C. 全局命令

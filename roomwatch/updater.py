@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -371,6 +372,23 @@ def stop_watcher(status_path: Optional[Path] = None, *, grace: float = 8.0) -> b
     return True
 
 
+def wait_pid_exit(pid: int, *, timeout: float = 30.0) -> bool:
+    """等某个进程退出，返回「是否已退出」。
+
+    界面里点「立即更新」时必须用：界面进程自己占着 `room-watch.exe`，
+    安装器替换不了正在运行的可执行文件，于是界面向更新子进程传自己的 PID，
+    子进程先等它退出再动手。
+    """
+    if pid <= 0:
+        return True
+    deadline = time.monotonic() + max(1.0, timeout)
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.2)
+    return not _pid_alive(pid)
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -422,6 +440,109 @@ def restart_monitor(root: Optional[Path] = None) -> bool:
         return True
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------- 界面重启
+
+
+def gui_launcher(root: Optional[Path] = None) -> Optional[list[str]]:
+    """返回「打开界面」的命令行。
+
+    分发包里界面是 PyInstaller 打出来的 `room-watch.exe`（tkinter 随包分发），
+    内嵌解释器并不带 tkinter，所以不能直接 `python -m roomwatch gui`。
+    """
+    root = Path(root or paths.PROJECT_ROOT)
+    exe = root / "room-watch.exe"
+    if exe.is_file():
+        return [str(exe)]
+    if not (root / "config.yaml").is_file():
+        return None
+    return [paths.find_python(), "-m", "roomwatch", "gui"]
+
+
+def relaunch_gui(root: Optional[Path] = None) -> bool:
+    """更新装完后把界面重新开起来（后台、脱离当前进程）。"""
+    root = Path(root or paths.PROJECT_ROOT)
+    cmd = gui_launcher(root)
+    if not cmd:
+        return False
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        subprocess.Popen(cmd, cwd=str(root), creationflags=flags,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True)
+        return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- 检查结果缓存
+
+# 界面每次启动都去问 GitHub 太浪费（匿名 API 每小时只有 60 次），
+# 所以检查结果落在 var/state/update.json，按 update.check_interval_hours 复用。
+CHECK_CACHE_NAME = "update.json"
+
+
+def check_cache_path(root: Optional[Path] = None) -> Path:
+    root = Path(root or paths.PROJECT_ROOT)
+    return root / "var" / "state" / CHECK_CACHE_NAME
+
+
+def load_check_cache(root: Optional[Path] = None) -> dict:
+    """读上次检查结果；读不到就返回空 dict（从不抛异常）。"""
+    path = check_cache_path(root)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_check_cache(data: dict, root: Optional[Path] = None) -> None:
+    """原子写：先写 .tmp 再 replace，界面读到半个文件也不会炸。"""
+    path = check_cache_path(root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def check_age_hours(data: dict, *, now: Optional[datetime] = None) -> Optional[float]:
+    """缓存多久以前写的（小时）；没有时间戳返回 None。"""
+    from datetime import datetime as _dt
+
+    raw = str((data or {}).get("checked_at") or "")
+    if not raw:
+        return None
+    try:
+        stamp = _dt.fromisoformat(raw)
+    except ValueError:
+        return None
+    return max(0.0, ((now or _dt.now()) - stamp).total_seconds() / 3600.0)
+
+
+def should_auto_check(data: dict, interval_hours: float) -> bool:
+    """按 check_interval_hours 判断要不要再查一次；0 表示关闭后台自检。"""
+    if interval_hours <= 0:
+        return False
+    age = check_age_hours(data)
+    return age is None or age >= interval_hours
+
+
+def available_version(data: dict, current: str) -> Optional[Version]:
+    """缓存里的远端版本比本地新就返回它，否则 None。"""
+    try:
+        latest = Version.parse(str((data or {}).get("latest") or ""))
+        local = Version.parse(current)
+    except UpdateError:
+        return None
+    return latest if latest > local else None
 
 
 # ---------------------------------------------------------------- 配置
