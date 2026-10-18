@@ -66,6 +66,26 @@ scripts\setup-hooks.bat
 
 Windows 下把 `./rw` 换成 `rw`（`rw.cmd` 会自己找对解释器）。
 
+### 交付给客户：免安装分发包
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
+```
+
+产出 `dist\room-watch-<版本>\` 和同名 zip（约 150MB，解压后约 310MB）。
+包里带了嵌入式 Python、运行依赖、ffmpeg 和模型，**客户机不需要装任何东西**：
+
+1. 解压到任意目录（不要放 `C:\Program Files`，那里普通用户不可写）；
+2. 双击 `配置.bat`，回答四个问题：摄像头、企业微信 webhook、相册密码、开机自启；
+   向导会当场探测摄像头并发一条测试消息，失败会说明怎么改；
+3. 双击 `启动.bat` 打开界面，点「启动监控」。
+
+再次修改配置不用重装：重跑 `配置.bat`（或 `rw.cmd setup`），
+已有的键会保留，只覆盖这次填的项。
+
+> 打包脚本不会把本机的 `config.local.yaml` 带进去（里面有你的 webhook 和密码）。
+> 改完源码只想换代码、不重装依赖：加 `-SkipDeps`，几秒完成。
+
 ### 重新打包桌面程序
 
 ```
@@ -95,6 +115,7 @@ Windows 下把 `./rw` 换成 `rw`（`rw.cmd` 会自己找对解释器）。
 | `rw volume-check` / `rw volume-set 70` | 音量诊断 / 设置主音量 |
 | `rw storage` | 磁盘占用与最旧文件 |
 | `rw push` | 配置推送渠道 |
+| `rw setup` | 首次配置向导（摄像头 / webhook / 相册密码 / 开机自启） |
 | `rw push-video PATH` | 把一段录像发到企业微信（验证视频推送） |
 | `rw test [--fast]` | 跑全部测试（`--fast` 跳过集成测试） |
 | `rw doctor` | 环境自检 |

@@ -28,9 +28,57 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# 包目录：<root>/roomwatch；项目根：<root>
+# 包目录：<root>/roomwatch（源码与分发包同一个布局）
 PACKAGE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = PACKAGE_DIR.parent
+
+# 分发包布局（免安装目录，用户拷走整个文件夹即可）：
+#
+#   room-watch\                      ← PROJECT_ROOT
+#     room-watch.exe                 启动器（tkinter 界面）
+#     rw.cmd / 配置.bat / 启动.bat     命令行入口
+#     config.yaml                    入库默认配置
+#     config.local.yaml              用户配置（向导写这里，不入库）
+#     roomwatch\...                  源码
+#     models\*.onnx                  权重
+#     runtime\python\python.exe      内嵌解释器 + 依赖（客户机不需要装 Python）
+#     tools\ffmpeg.exe               转码/合音轨
+#     data\ var\                     运行产物
+#
+# 刻意**不**把源码放进 app\ 子目录：`python -m roomwatch` 依赖
+# 「当前目录在 sys.path 里」，多套一层就得额外维护 PYTHONPATH，
+# 计划任务/开机自启那种拿不到工作目录的场景会静默失败。
+
+
+def _layout_root() -> Path:
+    """根据包位置推导项目根（不依赖 CWD）。"""
+    return PACKAGE_DIR.parent
+
+
+def _frozen_root() -> Path:
+    """打包成 exe 后：从 exe 所在目录往上找第一个含 config.yaml 的目录。
+
+    onefile 模式下 `__file__` 指向临时解包目录（_MEIPASS），
+    所以这里必须以 `sys.executable` 为基准，否则数据会写到临时目录里
+    然后随进程退出被删掉。
+    """
+    exe_dir = Path(sys.executable).resolve().parent
+    for candidate in (exe_dir, *exe_dir.parents):
+        if (candidate / "config.yaml").is_file():
+            return candidate
+    return exe_dir
+
+
+def _runtime_root() -> Path:
+    explicit = os.environ.get("ROOMWATCH_ROOT")
+    if explicit:
+        return Path(explicit).resolve()
+    if getattr(sys, "frozen", False):
+        return _frozen_root()
+    return _layout_root()
+
+
+# 项目根 —— 全项目唯一基准。导入期就定下来，后续所有相对路径都挂在它下面。
+PROJECT_ROOT = _runtime_root()
 
 # 运行时目录约定（全部不入库，见 .gitignore）
 DATA_DIR = PROJECT_ROOT / "data"
@@ -69,18 +117,68 @@ _KNOWN_PYTHONS = (
     Path.home() / ".workbuddy" / "binaries" / "python" / "envs" / "default" / "Scripts" / "python.exe",
 )
 
+# 分发包内的相对位置（与是否 frozen 无关，统一挂在项目根下）
+RUNTIME_DIR = PROJECT_ROOT / "runtime"
+TOOLS_DIR = PROJECT_ROOT / "tools"
+
+# 内嵌解释器可能的落点：Windows 是 python.exe，Linux/macOS 是 bin/python3
+_BUNDLED_CANDIDATES = (
+    Path("runtime") / "python" / "python.exe",
+    Path("runtime") / "python" / "bin" / "python3",
+    Path("runtime") / "python" / "bin" / "python",
+)
+
+FFMPEG_CANDIDATES = (
+    Path("tools") / "ffmpeg.exe",
+    Path("tools") / "ffmpeg",
+)
+
+
+def bundled_python() -> Optional[str]:
+    """分发包内嵌的解释器路径；源码环境下返回 None。
+
+    这是「客户机不用装 Python」的关键：整个 runtime/python 目录随包分发。
+    """
+    for rel in _BUNDLED_CANDIDATES:
+        candidate = PROJECT_ROOT / rel
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def is_portable() -> bool:
+    """当前是不是在免安装分发包里跑（有内嵌解释器）。"""
+    return bundled_python() is not None
+
+
+def ffmpeg_exe() -> Optional[str]:
+    """分发包内自带的 ffmpeg；没有则 None（回落到 PATH）。"""
+    for rel in FFMPEG_CANDIDATES:
+        candidate = PROJECT_ROOT / rel
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
 
 def find_python() -> str:
     """挑一个能跑本项目的解释器。
 
-    顺序：ROOMWATCH_PYTHON →（打包成 exe 时）已知可用路径 → 当前进程解释器
-          → 已知可用路径 → "python"。
+    顺序：ROOMWATCH_PYTHON → 内嵌解释器 →（打包成 exe 时）已知可用路径
+          → 当前进程解释器 → 已知可用路径 → "python"。
+
+    内嵌解释器排在 frozen 分支之前，是因为分发包里**必须**用它：
+    客户机上通常没有第二个装了 cv2 的 Python，落到已知路径只会失败。
+
     打包后的 exe 里 `sys.executable` 是 exe 自己，不能拿来跑监控，
-    所以 frozen 时必须先看已知路径。
+    所以 frozen 时必须先看内嵌/已知路径。
     """
     explicit = os.environ.get("ROOMWATCH_PYTHON")
     if explicit and Path(explicit).exists():
         return explicit
+
+    bundled = bundled_python()
+    if bundled:
+        return bundled
 
     frozen = bool(getattr(sys, "frozen", False))
     if frozen:
@@ -102,23 +200,10 @@ def find_python() -> str:
 def runtime_root() -> Path:
     """界面（可能是打包后的 exe）该把哪个目录当作项目根。
 
-    - `ROOMWATCH_ROOT` 显式指定优先；
-    - 打包后：从 exe 所在目录向上找第一个含 `config.yaml` 的目录
-      （exe 通常放在 dist/，项目根在上一级）；
-    - 源码运行：就是 `PROJECT_ROOT`。
+    与导入期的 `PROJECT_ROOT` 同源，只是每次调用重新求值，
+    方便测试注入 `ROOMWATCH_ROOT` 或在同一进程里临时切换目录。
     """
-    explicit = os.environ.get("ROOMWATCH_ROOT")
-    if explicit:
-        return Path(explicit).resolve()
-
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        for candidate in (exe_dir, *exe_dir.parents):
-            if (candidate / "config.yaml").is_file():
-                return candidate
-        return exe_dir
-
-    return PROJECT_ROOT
+    return _runtime_root()
 
 
 def has_module(name: str, python: Optional[str] = None) -> bool:

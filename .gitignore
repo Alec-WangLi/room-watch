@@ -83,3 +83,8 @@ desktop.ini
 *.spec
 # 界面打包用的独立虚拟环境（由系统 Python 创建，含 tkinter）
 /.venv-gui/
+# 免安装分发包在本机就地展开时留下的目录（正常都生成在 dist/ 下）
+/runtime/
+/tools/
+# `rw setup --autostart` 生成的开机自启脚本，含本机绝对路径
+/start-monitor.vbs

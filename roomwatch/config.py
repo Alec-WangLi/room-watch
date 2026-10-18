@@ -23,7 +23,7 @@ from typing import Optional
 
 import yaml
 
-from .paths import resolve
+from .paths import ffmpeg_exe, resolve
 
 LOCAL_NAME = "config.local.yaml"
 
@@ -71,7 +71,27 @@ def normalize_paths(cfg: dict) -> dict:
         block = cfg.get(section)
         if isinstance(block, dict) and block.get(key):
             block[key] = resolve(block[key])
+    _prefer_bundled_ffmpeg(cfg)
     return cfg
+
+
+def _prefer_bundled_ffmpeg(cfg: dict) -> None:
+    """分发包里带了 tools/ffmpeg.exe 时，配置写 `ffmpeg` 也能直接用。
+
+    客户机上大概率没有装 ffmpeg，也不会去改 PATH。这里的规则是：
+    **只有配置里的值是裸命令名**（不含路径分隔符）时才替换，
+    用户显式写了绝对路径就原样尊重 —— 否则「我明明指定了却没用」同样是坑。
+    """
+    block = cfg.get("record")
+    audio = block.get("audio") if isinstance(block, dict) else None
+    if not isinstance(audio, dict):
+        return
+    configured = str(audio.get("ffmpeg") or "ffmpeg")
+    if "/" in configured or "\\" in configured:
+        return
+    bundled = ffmpeg_exe()
+    if bundled:
+        audio["ffmpeg"] = bundled
 
 
 def load_config(path: str) -> dict:

@@ -13,6 +13,7 @@
     rw say / ab / volume-check / volume-set 语音与音量
     rw storage                              磁盘占用
     rw push / push-video PATH              推送配置 / 验证录像推送
+    rw setup                               首次配置向导（摄像头/推送/自启）
     rw test [--fast] / doctor / version     工程自检
     rw gui                                  桌面界面
 
@@ -86,6 +87,7 @@ COMMANDS: dict[str, Command] = {
     "gallery": Command("启动本地相册（默认 127.0.0.1:8765）", "gallery"),
     "guard": Command("守护进程：保证监控进程一直活着", "guardian"),
     "push": Command("配置微信/Server酱推送渠道", "setup_push"),
+    "setup": Command("首次配置向导：摄像头、微信推送、相册密码、开机自启", "wizard"),
     "push-video": Command("把一段录像发到企业微信（验证视频推送）：rw push-video PATH",
                           "videopush", prefix=("--video",), takes="--video",
                           requires_value=True),
@@ -94,10 +96,6 @@ COMMANDS: dict[str, Command] = {
     "version": Command("打印版本号"),
     "gui": Command("打开桌面界面"),
 }
-
-# 这些子命令需要把用户输入原样交给实现模块
-_PASSTHROUGH_MODULES = {"gallery", "guardian", "setup_push"}
-
 
 def translate(name: str, argv: Sequence[str]) -> list[str]:
     """把 `rw <name> <argv>` 翻译成实现模块能吃的 argv。
@@ -298,14 +296,41 @@ def _check_port(port: int = 8765) -> Check:
         sock.close()
 
 
+def _check_runtime() -> Check:
+    """分发包里必须走内嵌解释器；源码环境下这项只是提示。"""
+    from .paths import bundled_python
+
+    exe = bundled_python()
+    if exe:
+        return Check("内嵌运行时", True, f"{exe}（客户机无需安装 Python）", fatal=False)
+    return Check("内嵌运行时", True, "源码环境：使用本机 Python（分发包才需要 runtime/python）",
+                 fatal=False)
+
+
+def _check_ffmpeg() -> Check:
+    """ffmpeg 缺席不是致命错误：录像照录，只是没有音轨、视频推送发不出去。"""
+    import shutil
+
+    from .paths import ffmpeg_exe
+
+    found = ffmpeg_exe() or shutil.which("ffmpeg")
+    if found:
+        return Check("ffmpeg", True, str(found), fatal=False)
+    return Check("ffmpeg", False,
+                 "没找到：录像会缺音轨、企业微信发视频会失败（纯图片推送不受影响）",
+                 fatal=False)
+
+
 def run_checks(project_root: Optional[Path] = None) -> list[Check]:
     """跑全部自检项。返回列表而不是直接打印，方便单测。"""
     root = Path(project_root) if project_root else paths.PROJECT_ROOT
     return [
         _check_python(),
+        _check_runtime(),
         _check_config(root),
         _check_deps(),
         _check_models(root),
+        _check_ffmpeg(),
         _check_dirs(root),
         _check_owner(root),
         _check_hooks(root),

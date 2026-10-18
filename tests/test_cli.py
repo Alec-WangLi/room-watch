@@ -29,7 +29,8 @@ class CommandTableTest(unittest.TestCase):
         expected = {
             "start", "dry-run", "probe", "status", "enroll", "whoami",
             "say", "say-raw", "ab", "volume-check", "volume-set", "storage",
-            "gallery", "guard", "push", "push-video", "test", "doctor", "version", "gui",
+            "gallery", "guard", "push", "push-video", "setup", "test", "doctor",
+            "version", "gui",
         }
         self.assertEqual(set(cli.COMMANDS), expected)
 

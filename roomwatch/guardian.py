@@ -443,12 +443,22 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--once", action="store_true", help="只检查一次就退出（给计划任务用）")
     ap.add_argument("--status", action="store_true", help="打印当前状态与重启历史")
     ap.add_argument("--dry-run", action="store_true", help="只报告该做什么，不真的重启")
+    ap.add_argument("--log", help="日志文件路径（用 pythonw 静默启动时必填，否则日志无处可去）")
     args = ap.parse_args(argv)
+
+    handlers: list[logging.Handler] = []
+    if args.log:
+        log_path = _abs(args.log)
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+    if sys.stderr is not None:  # pythonw 下 stderr 为 None，写 console handler 会抛异常
+        handlers.append(logging.StreamHandler(sys.stderr))
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers or [logging.NullHandler()],
     )
 
     cfg_path = _abs(args.config)

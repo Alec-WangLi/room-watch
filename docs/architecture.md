@@ -1,4 +1,4 @@
-# 项目结构（v0.1.2）
+# 项目结构（v0.1.3）
 
 > 这一页回答「东西该放哪」。改代码前先看它，能避免 90% 的「放错地方」。
 > 行为约定与踩坑记录在 `../AGENTS.md`，使用说明在 `../README.md`。
@@ -31,8 +31,9 @@ room-watch/
 │  ├─ gallery.py            # 本地相册 HTTP（标准库，自实现 Range）
 │  ├─ guardian.py           # 守护进程（判活、退避、单实例锁）
 │  ├─ setup_push.py         # 推送配置引导
+│  ├─ wizard.py             # 首次配置向导（摄像头/webhook/自启）
 │  └─ gui.py                # 桌面界面（Tkinter，独立进程）
-├─ tests/                   # 11 个测试文件，全部可离线运行
+├─ tests/                   # 20 个测试文件，全部可离线运行
 ├─ scripts/                 # 启动、钩子、开机自启、打包
 ├─ docs/                    # 本文件
 ├─ assets/                  # 图标

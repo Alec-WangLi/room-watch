@@ -100,5 +100,48 @@ class FindPythonTest(unittest.TestCase):
             self.assertTrue(Path(paths.find_python()).exists())
 
 
+class BundledRuntimeTest(unittest.TestCase):
+    """分发包里必须优先用内嵌解释器，而不是客户机上碰巧存在的 Python。
+
+    这是「客户机不用装 Python」的唯一保证：一旦顺序写反，
+    客户机上会走到 PATH 里的 python 或已知路径，报 No module named 'cv2'。
+    """
+
+    def _fake_root(self, tmp: str) -> Path:
+        root = Path(tmp)
+        (root / "config.yaml").write_text("camera:\n  index: 0\n", encoding="utf-8")
+        exe = root / "runtime" / "python" / "python.exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("", encoding="utf-8")
+        return root
+
+    def test_bundled_python_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._fake_root(tmp)
+            with mock.patch.object(paths, "PROJECT_ROOT", root):
+                self.assertEqual(paths.bundled_python(), str(root / "runtime" / "python" / "python.exe"))
+                self.assertTrue(paths.is_portable())
+
+    def test_find_python_prefers_bundled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._fake_root(tmp)
+            with mock.patch.object(paths, "PROJECT_ROOT", root), \
+                    mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("ROOMWATCH_PYTHON", None)
+                self.assertEqual(paths.find_python(),
+                                 str(root / "runtime" / "python" / "python.exe"))
+
+    def test_bundled_ffmpeg(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(paths, "PROJECT_ROOT", root):
+                self.assertIsNone(paths.ffmpeg_exe())
+            exe = root / "tools" / "ffmpeg.exe"
+            exe.parent.mkdir(parents=True)
+            exe.write_text("", encoding="utf-8")
+            with mock.patch.object(paths, "PROJECT_ROOT", root):
+                self.assertEqual(paths.ffmpeg_exe(), str(exe))
+
+
 if __name__ == "__main__":
     unittest.main()

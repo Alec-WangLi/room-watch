@@ -176,6 +176,37 @@ sounddevice / psutil / pycaw。
 | `var/cache/voice/` | 语音缓存（可重建） | 否 |
 | `models/` + `yolov8n.pt` | 权重 | **是**（下载极慢，属稀缺资产） |
 
+### D.4 分发布局（0.1.3 起）
+
+`scripts/build-portable.ps1` 产出的免安装目录，**根就是 `PROJECT_ROOT`**：
+
+```
+room-watch-<版本>\
+├─ room-watch.exe          界面壳（PyInstaller 打的，只有 tkinter）
+├─ rw.cmd / 配置.bat / 启动.bat / 自检.bat
+├─ config.yaml             占位串
+├─ roomwatch\              源码
+├─ models\                 权重
+├─ runtime\python\         嵌入式 Python + Lib\site-packages
+├─ tools\ffmpeg.exe
+└─ data\ var\
+```
+
+三条硬约束：
+
+1. **不要把源码放进 `app\` 子目录。** `python -m roomwatch` 依赖「当前目录在
+   `sys.path` 里」；多一层就得维护 `PYTHONPATH`，而计划任务 / Run 注册表这类
+   拿不到工作目录的启动方式会静默失败（进程秒退、日志为空）。
+2. **`config.local.yaml` 绝不打进分发包。** 里面是本机的 webhook 与相册密码。
+   构建脚本会显式跳过并打印提示。
+3. **客户机上不能出现只有本机才有的路径。** `paths.find_python()` 的顺序是
+   `ROOMWATCH_PYTHON → 包内 runtime/python → 本机已知环境 → PATH`，
+   所以打包后一律走内嵌解释器；不要在业务代码里写死 `C:\Users\...`。
+
+内嵌发行版默认把 `Lib\site-packages` 排除在 `sys.path` 之外，装依赖前必须
+改 `python313._pth`（加一行 `Lib\site-packages` 并取消 `#import site` 的注释），
+这一步由构建脚本完成，手工重建 runtime 时别忘。
+
 ---
 
 ## E. 测试

@@ -14,6 +14,41 @@
 
 ---
 
+## [0.1.3] - 2026-10-19
+
+### 新增
+
+- **免安装分发包**（`scripts/build-portable.ps1`）：产出 `dist/room-watch-<版本>/`，
+  内含嵌入式 Python 3.13、运行依赖、ffmpeg、模型与源码。客户解压后
+  **不需要装 Python、不需要装 ffmpeg、不需要联网**，双击 `配置.bat` → `启动.bat` 即可。
+  同目录再打一个 zip（约 150MB，解压后约 310MB）。
+- **首次配置向导**（`roomwatch/wizard.py`，命令 `rw setup`）：四个问题配好
+  摄像头（编号 / `rtsp://` / 视频文件）、企业微信 webhook、相册密码、开机自启；
+  写完立刻**探测摄像头**并发一条**测试消息**，失败时直接说清怎么改。
+  只写 `config.local.yaml`，主配置的注释与占位串原样保留。
+- **开机自启**（`rw setup --autostart`）：写 HKCU Run 注册表项 + 生成
+  `start-monitor.vbs` 静默拉起守护进程，**不需要管理员权限**、不闪黑框。
+  `rw setup --remove-autostart` 取消。
+- `rw doctor` 增加「内嵌运行时」「ffmpeg」两项检查。
+
+### 变更
+
+- `paths.py` 支持分发布局：`find_python()` 优先用包内 `runtime/python/python.exe`，
+  其次是本机已知环境；`PROJECT_ROOT` 从包位置推导，与当前工作目录无关。
+- 配置里 `record.audio.ffmpeg` 写裸名 `ffmpeg` 时，若包内有 `tools/ffmpeg.exe`
+  则自动改用它；显式写了绝对路径则原样尊重。
+- `guardian` 新增 `--log PATH`：用 `pythonw` 静默启动时也有日志可查
+  （此前 stderr 被丢弃，守护日志完全不可见）。
+- 移除 `cli._PASSTHROUGH_MODULES`（定义了但从未被引用）。
+
+### 实测
+
+- 分发包体积：目录约 310MB，zip 约 150MB；包内 `import cv2` 正常，`rw version` 与
+  `rw doctor` 全部通过。
+- 测试 20 个文件 400 项全绿（新增 `test_wizard.py` 25 项）。
+
+---
+
 ## [0.1.2] - 2026-10-19
 
 ### 新增
