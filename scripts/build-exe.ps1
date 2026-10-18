@@ -12,11 +12,32 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$sys = "C:\Users/user\AppData\Local\Programs\Python\Python313\python.exe"
-if (-not (Test-Path $sys)) {
-    Write-Host "[错误] 找不到带 tkinter 的 Python：$sys" -ForegroundColor Red
+# 找一个「带 tkinter」的 Python。机器上常装多个解释器，靠版本号猜不可靠，
+# 直接逐个 import tkinter 验证；py.exe 启动器能解析出真实 exe 路径。
+$sys = $null
+$candidates = @()
+foreach ($name in @("py.exe", "python.exe")) {
+    $cmd = Get-Command $name -ErrorAction SilentlyContinue
+    if ($cmd) { $candidates += $cmd.Source }
+}
+$candidates += @(
+    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
+    "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+    "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
+    "C:\Python313\python.exe",
+    "C:\Python312\python.exe"
+)
+foreach ($c in $candidates) {
+    if (-not (Test-Path $c)) { continue }
+    $resolved = & $c -c "import tkinter,sys; print(sys.executable)" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $resolved) { $sys = $resolved.Trim(); break }
+}
+if (-not $sys) {
+    Write-Host "[错误] 找不到带 tkinter 的 Python（需要 3.10+）。" -ForegroundColor Red
+    Write-Host "装一个官方安装包并勾选 tcl/tk，或把带 tkinter 的 python.exe 加进 PATH。"
     exit 1
 }
+Write-Host "界面构建用解释器：$sys" -ForegroundColor Cyan
 if (-not (Test-Path ".venv-gui\Scripts\python.exe")) {
     Write-Host "创建 .venv-gui ..." -ForegroundColor Cyan
     & $sys -m venv .venv-gui

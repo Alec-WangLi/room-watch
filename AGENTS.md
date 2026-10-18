@@ -82,34 +82,37 @@
 
 ### B.1 主环境（跑监控）
 
+项目要求 **Python ≥ 3.10**，开发与打包实测用 3.13。依赖以 `requirements.txt` 为准：
+
 ```
-C:\Users/user\.workbuddy\binaries\python\envs\default\Scripts\python.exe
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
 
-Python 3.13.14，已装 cv2 5.0.0 / numpy 2.5.4 / ultralytics 8.4.178 / PyYAML / pyttsx3 /
-sounddevice / psutil / pycaw。
+主要依赖：`opencv-python`（含 `cv2.dnn`）、`numpy`、`PyYAML`、`requests`、
+`sounddevice`、`pyttsx3`、`psutil`。**不需要 torch / ultralytics** ——
+人体检测走 ONNX + `cv2.dnn`，`requirements.txt` 里已移除。
 
-本机 PATH 上还有**另外三个** python，全都跑不了本项目（缺 cv2）：
+把本项目跑起来后，`rw doctor` 会打印它实际选中的解释器；若与预期不符，
+用环境变量 `ROOMWATCH_PYTHON` 显式指定。
 
-| 解释器 | 版本 | 用途 |
-|---|---|---|
-| `...\binaries\python\versions\3.13.12\python.exe` | 3.13.14（目录名是 3.13.12） | git-bash 敲 `python` 默认解析到它，最常踩 |
-| `...\AppData\Local\Programs\Python\Python313\python.exe` | 3.13.13 | **有 tkinter 8.6，没 cv2**：桌面界面与打包用它 |
-| `...\AppData\Local\Python\bin\python.exe` | **3.14.5** | 看到 3.14.5 就知道选错了 |
+**常见陷阱**：机器上往往装了多个 Python，其中一部分没有 `cv2`（监控跑不起来）
+或没有 `tkinter`（界面打不出来）。判断依据只有 `rw doctor` 的输出，不要凭
+`python --version` 猜。
 
 验证：`rw doctor`（会打印解释器、依赖、模型、目录、端口、钩子）。
 
 ### B.2 界面环境（打 exe）
 
-`scripts\build-exe.ps1` 用系统 Python 3.13.13 建 `.venv-gui`（自带 tkinter），
+`scripts\build-exe.ps1` 会自动找系统里**带 tkinter** 的 Python（3.10+）建 `.venv-gui`，
 只装 Pillow + PyInstaller。产物 `dist\room-watch.exe`（单文件，内嵌 tkinter）。
-**不要试图用主环境打 GUI**：它没有 tkinter，PyInstaller 会失败。
+**不要试图用主环境打 GUI**：缺 tkinter 时 PyInstaller 会失败。
 
 ### B.3 `rw` 如何选解释器
 
-`paths.find_python()` 顺序：`ROOMWATCH_PYTHON` →（frozen 时）已知路径 → 当前解释器 → `python`。
-`rw.cmd` 在 Windows 上先试 `%USERPROFILE%\.workbuddy\...\envs\default`，
-所以双击和命令行都不需要配 PATH。
+`paths.find_python()` 顺序：`ROOMWATCH_PYTHON` →（分发包内）`runtime\python`
+→ 当前解释器 → `python`。`rw.cmd` 在 Windows 上会优先试项目内的内嵌运行时，
+所以双击和命令行都不需要配置 PATH。
 
 ---
 

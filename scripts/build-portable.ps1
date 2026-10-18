@@ -86,24 +86,42 @@ if (-not (Test-Path $pyExe)) {
 # ---------------------------------------------------------------- 2. 依赖
 $sitePackages = Join-Path $pyDir "Lib\site-packages"
 if (-not $SkipDeps) {
-    # 用外面装了 pip 的 3.13 往目标目录装：内嵌版没有 pip，
+    # 用外面装了 pip 的同版本 Python 往目标目录装：内嵌版没有 pip，
     # 而 get-pip 引导又要额外联网一步，不如直接把 wheel 解到目标目录。
+    # wheel 与解释器 ABI 强绑定，所以必须挑到 $PythonVersion 同一个小版本。
     $pipPy = $null
-    $candidates = @(
-        "C:\Users/user\.workbuddy\binaries\python\versions\3.13.12\python.exe",
-        "C:\Users/user\.workbuddy\binaries\python\envs\default\Scripts\python.exe",
-        "python"
+    $candidates = @()
+    $mm = ($PythonVersion -split '\.')[0..1] -join ''    # 313
+    $mf = ($PythonVersion -split '\.')[0..1] -join '.'   # 3.13
+
+    # py 启动器最可靠：能按版本号挑，且解析出真实 exe 路径
+    $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($launcher) {
+        try {
+            $resolved = & $launcher.Source "-$mf" -c "import sys;print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $resolved) { $candidates += $resolved.Trim() }
+        } catch { }
+    }
+    $onPath = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($onPath) { $candidates += $onPath.Source }
+    $candidates += @(
+        "$env:LOCALAPPDATA\Programs\Python\Python$mm\python.exe",
+        "C:\Python$mm\python.exe"
     )
+
     foreach ($c in $candidates) {
+        if (-not (Test-Path $c)) { continue }
         try {
             $v = & $c -c "import sys;print(sys.version_info[:2])" 2>$null
-            if ($LASTEXITCODE -eq 0 -and $v -match "3, 13") { $pipPy = $c; break }
+            if ($LASTEXITCODE -eq 0 -and $v -match ($mf -replace '\.', ', ')) { $pipPy = $c; break }
         } catch { }
     }
     if (-not $pipPy) {
-        Write-Host "[失败] 找不到 Python 3.13 来装依赖（wheel 必须与解释器 ABI 一致）" -ForegroundColor Red
+        Write-Host "[失败] 找不到 Python $PythonVersion 来装依赖（wheel 必须与解释器 ABI 一致）" -ForegroundColor Red
+        Write-Host "提示：装一个 Python $PythonVersion 并加入 PATH，或用 py 启动器注册该版本。"
         exit 1
     }
+    Write-Host "依赖安装用解释器：$pipPy" -ForegroundColor Cyan
 
     New-Item -ItemType Directory -Force -Path $sitePackages | Out-Null
     $pkgs = @(
