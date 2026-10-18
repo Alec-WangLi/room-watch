@@ -3,6 +3,46 @@
 自动更新（`rw update`）不是「随便传个 exe」就能工作的：它按固定规则找 release、
 按固定名字找安装包、按固定格式校验摘要。这份文档就是那些规则。
 
+## 0. 首次推送到 GitHub
+
+仓库已在本地初始化，主分支为 `main`，remote 指向
+`https://github.com/Alec-WangLi/room-watch.git`。
+
+在网页上新建仓库时：
+
+- 名字 `room-watch`，**不要**勾「Add a README / .gitignore / license」——
+  本地已经有内容，初始化了反而要处理冲突；
+- 可见性按需要（公开即开源）。
+
+然后三选一推送：
+
+```bash
+# 方式 A：PAT（把 <TOKEN> 换掉；建议用完就撤销该 token）
+git push https://<TOKEN>@github.com/Alec-WangLi/room-watch.git main
+
+# 方式 B：SSH（提前把公钥加到 GitHub）
+git remote set-url origin git@github.com:Alec-WangLi/room-watch.git
+git push -u origin main
+
+# 方式 C：让 Git 凭据管理器弹窗
+git push -u origin main     # 首次会弹出登录窗口
+```
+
+首次推送约 **52MB**（主要是 `models/` 的三个权重），慢一点正常。
+
+推送前确认：
+
+```bash
+git log --oneline | wc -l          # 19 个提交
+git status --short                  # 应该为空
+git remote -v
+```
+
+> 历史在开源前用 `git-filter-repo` 重写过（清除真实 webhook key 与本机用户名路径），
+> 因此所有 commit hash 与重写前不同。如果之前推送过，需要 `git push --force`，
+> 且要意识到旧对象在 GitHub 上仍可能通过 API 访问到 —— 这种情况下正确答案是
+> 删库重建，而不是强推。
+
 ## 1. 发版前检查
 
 ```bash
