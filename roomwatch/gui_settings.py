@@ -39,8 +39,8 @@ class SettingsDialog:
 
         self.win = self.tk.Toplevel(app.win)
         self.win.title("设置 · 房间监控")
-        self.win.geometry("640x600")
-        self.win.minsize(560, 500)
+        self.win.geometry("800x660")
+        self.win.minsize(720, 580)
         self.win.transient(app.win)
 
         self.notebook = self.ttk.Notebook(self.win)
@@ -87,7 +87,11 @@ class SettingsDialog:
     def _build_identity_block(self, parent) -> None:
         box = self.ttk.LabelFrame(parent, text="本人身份", padding=8)
         box.pack(fill="x", pady=(0, 8))
+        self._owner_photo = None
+        self.identity_photo = self.tk.Label(box, text="", anchor="w")
+        self.identity_photo.pack(fill="x", pady=(0, 4))
         self.identity_label = self.tk.Label(box, text="读取中…", anchor="w",
+                                            justify="left", wraplength=700,
                                             font=self.app.font_small, fg="#666")
         self.identity_label.pack(fill="x")
         bar = self.ttk.Frame(box)
@@ -105,6 +109,7 @@ class SettingsDialog:
         box = self.ttk.LabelFrame(parent, text="开机自启", padding=8)
         box.pack(fill="x", pady=(0, 8))
         self.autostart_label = self.tk.Label(box, text="读取中…", anchor="w",
+                                             justify="left", wraplength=700,
                                              font=self.app.font_small, fg="#666")
         self.autostart_label.pack(fill="x")
         bar = self.ttk.Frame(box)
@@ -128,7 +133,7 @@ class SettingsDialog:
         box = self.ttk.LabelFrame(parent, text="验证", padding=8)
         box.pack(fill="x", pady=(0, 8))
         self.camera_label = self.tk.Label(box, text="改完先保存，再点「测试摄像头」。",
-                                          anchor="w", justify="left",
+                                          anchor="w", justify="left", wraplength=700,
                                           font=self.app.font_small, fg="#666")
         self.camera_label.pack(fill="x")
         bar = self.ttk.Frame(box)
@@ -144,9 +149,11 @@ class SettingsDialog:
         box = self.ttk.LabelFrame(parent, text="如何用手机访问", padding=8)
         box.pack(fill="x", pady=(0, 8))
         self.gallery_label = self.tk.Label(box, text="读取中…", anchor="w", justify="left",
+                                           wraplength=700,
                                            font=self.app.font_small, fg="#666")
         self.gallery_label.pack(fill="x")
         self.ttk.Label(box, text="手机与电脑要连同一个 Wi-Fi；首次访问可能需要在 Windows 防火墙里放行。",
+                       wraplength=700, justify="left",
                        font=self.app.font_small, foreground="#888").pack(fill="x", pady=(6, 0))
 
     def _show_gallery_info(self, info: dict) -> None:
@@ -175,7 +182,8 @@ class SettingsDialog:
                 fg="#993C1D")
             return
         self.gallery_label.configure(
-            text="手机访问（同一 Wi-Fi，密码是上面设置的相册密码）：\n" + "\n".join(lines),
+            text="手机访问（同一 Wi-Fi，用户名随意，密码就是上面设置的相册密码）：\n"
+                 + "\n".join(lines),
             fg="#0F6E56")
 
     # ---------------- 读取 ----------------
@@ -235,7 +243,7 @@ class SettingsDialog:
         tk, ttk = self.tk, self.ttk
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=3)
-        ttk.Label(row, text=meta.get("label") or key, width=18, anchor="w").pack(side="left")
+        ttk.Label(row, text=meta.get("label") or key, width=24, anchor="w").pack(side="left")
 
         kind = meta.get("kind") or "text"
         if kind == "bool":
@@ -247,22 +255,24 @@ class SettingsDialog:
             ttk.Combobox(row, textvariable=var, values=list(meta.get("choices") or ()),
                          state="readonly", width=18).pack(side="left")
             self.vars[key] = var
-        elif meta.get("secret"):
-            var = tk.StringVar(value="")
-            ttk.Entry(row, textvariable=var, width=42).pack(side="left", fill="x", expand=True)
-            self.vars[key] = var
-            info = ttk.Label(row, text=self._secret_text(secret_info), foreground="#888")
-            info.pack(side="left", padx=6)
-            self.secret_labels[key] = info
         else:
             var = tk.StringVar(value="" if value is None else str(value))
-            ttk.Entry(row, textvariable=var, width=42).pack(side="left", fill="x", expand=True)
+            ttk.Entry(row, textvariable=var, width=40).pack(side="left", fill="x", expand=True)
             self.vars[key] = var
+
+        # 密钥状态放在输入框下一行：放右边会被窗口边缘裁掉，
+        # 用户就会以为「明明配过却什么都没有」。
+        if meta.get("secret"):
+            info = ttk.Label(parent, text=self._secret_text(secret_info),
+                             foreground="#888", justify="left")
+            info.pack(fill="x", padx=(200, 0), pady=(0, 2))
+            self.secret_labels[key] = info
 
         hint = meta.get("hint")
         if hint:
             ttk.Label(parent, text=hint, foreground="#888",
-                      font=self.app.font_small).pack(fill="x", padx=(140, 0))
+                      wraplength=560, justify="left",
+                      font=self.app.font_small).pack(fill="x", padx=(200, 0))
 
     # ---------------- 保存 ----------------
 
@@ -365,8 +375,12 @@ class SettingsDialog:
     def on_test_camera(self) -> None:
         if self._saving or not self._populated:
             return
-        state = getattr(self.app, "_state", None)
-        if state is not None and state.pid:
+        # 用实时状态，别用主窗口每 2 秒刷一次的缓存：用户刚点完停止就进来测试，
+        # 缓存里可能还留着已经死掉的 PID。
+        from . import gui as gui_module
+
+        state = gui_module.read_state(self.app.project)
+        if state.pid:
             self.app.messagebox.showwarning(
                 "请先停止监控", "摄像头同一时间只能被一个进程占用，先停止监控再测试。")
             return
@@ -450,18 +464,37 @@ class SettingsDialog:
     def _on_identity(self, result: dict) -> None:
         info = result.get("identity") or {}
         if not info:
+            self._show_owner_photo("")
             self.identity_label.configure(text="读取失败", fg="#993C1D")
             return
         if not info.get("registered"):
+            self._show_owner_photo("")
             self.identity_label.configure(
                 text="未注册。现在所有脸都按「访客」处理：会抓拍、会播报、会推送。", fg="#993C1D")
             return
+        self._show_owner_photo(str(info.get("photo") or ""))
         created = str(info.get("created_at") or info.get("mtime") or "").replace("T", " ")
         self.identity_label.configure(
             text=f"已注册 · {info.get('samples') or 0} 个样本 · {info.get('dim') or 0} 维特征"
                  + (f" · {created}" if created else "")
                  + f"\n文件：{info.get('path') or ''}",
             fg="#0F6E56")
+
+    def _show_owner_photo(self, path: str) -> None:
+        """显示注册时留下的现场照片；没有就说明原因，不占位。"""
+        self._owner_photo = None
+        if not path:
+            self.identity_photo.configure(
+                image="", text="还没有本人照片；重新注册一次后这里会显示。")
+            return
+        try:
+            img = self.tk.PhotoImage(file=path)
+            factor = max(1, img.width() // 180)
+            self._owner_photo = img.subsample(factor, factor)
+            self.identity_photo.configure(image=self._owner_photo, text="")
+        except Exception:  # noqa: BLE001 - 照片坏了不影响注册信息
+            self.identity_photo.configure(
+                image="", text="本人照片读取失败；重新注册可修复。")
 
     def _enroll_live(self) -> None:
         # 交给主窗口：注册要抢摄像头，还得保证监控是停的，逻辑不能在这里再写一遍

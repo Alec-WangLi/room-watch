@@ -61,7 +61,7 @@ from .audio_recorder import AudioRecorder, pre_roll_delay_ms
 from .detector import FaceFinder
 from .gate import MotionGate
 from .onnx_detector import build_detector
-from .identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker
+from .identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker, save_owner_photo
 from .labels import identity_text
 from .notifier import Notifier
 from .recorder import Recorder, video_path_for
@@ -1124,6 +1124,9 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
 
     ff = FaceFinder(cfg.get("face") or {})
     feats = []
+    best_frame = None
+    best_row = None
+    best_area = 0.0
 
     if image_path:
         img = cv2.imread(image_path)
@@ -1138,6 +1141,9 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
             feat = idn.embedder.embed(img, hit.row)
             if feat is not None:
                 feats.append(feat)
+                area = float((hit.row[2] - hit.row[0]) * (hit.row[3] - hit.row[1]))
+                if area > best_area:
+                    best_area, best_frame, best_row = area, img, hit.row
         if not feats:
             print("这张图里没提取到可用的人脸特征（可能太小/太糊/侧脸）")
             return 3
@@ -1175,6 +1181,12 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
                     feat = idn.embedder.embed(frame, hits[0].row)
                     if feat is not None:
                         feats.append(feat)
+                        area = float(
+                            (hits[0].row[2] - hits[0].row[0])
+                            * (hits[0].row[3] - hits[0].row[1])
+                        )
+                        if area > best_area:
+                            best_area, best_frame, best_row = area, frame.copy(), hits[0].row
                         print(f"  已采集 {len(feats)}/{samples}")
                 time.sleep(0.5)
         finally:
@@ -1190,6 +1202,10 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
 
     if not idn.save_owner(feats, extra={"created_at": datetime.now().isoformat(timespec="seconds")}):
         return 4
+    if best_frame is not None and best_row is not None:
+        photo = save_owner_photo(idn.owner_file, best_frame, best_row)
+        if photo:
+            print(f"已保存本人照片：{photo}")
     print(f"注册完成：{idn.owner_file}（{len(feats)} 个样本，阈值 {idn.threshold}）")
     print("接下来可以验证一下：rw whoami <某张你自己的截图>")
     return 0

@@ -15,7 +15,9 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -264,6 +266,40 @@ class TestFindFullReturnsRow(unittest.TestCase):
         self.assertIsNotNone(feat, "提取不到特征，注册和识别都会失效")
         self.assertEqual(feat.shape[0], I.FEATURE_DIM)
         self.assertAlmostEqual(float(np.linalg.norm(feat)), 1.0, places=4)
+
+
+class TestOwnerPhoto(unittest.TestCase):
+    def test_save_photo_and_report_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owner = Path(tmp) / "owner.npz"
+            np.savez(owner, embedding=np.zeros(I.FEATURE_DIM, dtype=np.float32),
+                     samples=np.array(3, dtype=np.int32))
+            frame = np.zeros((200, 200, 3), dtype=np.uint8)
+            row = np.array([50, 50, 150, 150], dtype=np.float32)
+            photo = I.save_owner_photo(str(owner), frame, row)
+
+            self.assertTrue(photo)
+            self.assertTrue(Path(photo).is_file())
+            info = I.owner_summary(str(owner))
+            self.assertEqual(info["photo"], photo)
+
+    def test_clear_removes_template_and_photo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owner = Path(tmp) / "owner.npz"
+            owner.write_bytes(b"x")
+            photo = I.owner_photo_path(str(owner))
+            photo.write_bytes(b"x")
+
+            self.assertTrue(I.clear_owner(str(owner)))
+            self.assertFalse(owner.exists())
+            self.assertFalse(photo.exists())
+
+    def test_missing_photo_is_reported_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owner = Path(tmp) / "owner.npz"
+            owner.write_bytes(b"x")
+            info = I.owner_summary(str(owner))
+        self.assertEqual(info["photo"], "")
 
 
 if __name__ == "__main__":

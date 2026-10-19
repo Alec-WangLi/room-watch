@@ -14,9 +14,11 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import json
+import socket
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import yaml
@@ -64,8 +66,12 @@ class SpecTest(unittest.TestCase):
     def test_credentials_are_flagged_secret(self) -> None:
         for key in ("notify.wecom_bot.webhook", "notify.wxpusher.app_token",
                     "notify.wxpusher.uid", "notify.serverchan.sendkey",
-                    "gallery.token", "camera.source"):
+                    "camera.source"):
             self.assertTrue(settings.SPEC[key].secret, key)
+
+    def test_gallery_password_is_visible_on_purpose(self) -> None:
+        """相册密码要输到手机上，藏起来只会让人没法登录。"""
+        self.assertFalse(settings.SPEC["gallery.token"].secret)
 
 
 class SectionConsistencyTest(unittest.TestCase):
@@ -249,6 +255,29 @@ class GallerySettingsTest(unittest.TestCase):
             self.assertTrue(result["ok"], result)
             data = yaml.safe_load((root / "config.local.yaml").read_text(encoding="utf-8"))
         self.assertNotIn("camera", data)
+
+    def test_gallery_password_is_returned_in_plain_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            settings.apply(root, {"gallery.token": "a-strong-passphrase"})
+            snap = settings.snapshot(root)
+        self.assertEqual(snap["values"]["gallery.token"], "a-strong-passphrase")
+        self.assertNotIn("gallery.token", snap["secrets"])
+
+    def test_lan_addresses_skip_virtual_and_public_interfaces(self) -> None:
+        addrs = {
+            "WLAN": [SimpleNamespace(family=socket.AF_INET, address="192.168.1.3")],
+            "vEthernet (Default Switch)": [
+                SimpleNamespace(family=socket.AF_INET, address="172.28.208.1")],
+            "FlClash": [SimpleNamespace(family=socket.AF_INET, address="28.0.0.1")],
+            "vEthernet (WSL)": [
+                SimpleNamespace(family=socket.AF_INET, address="192.168.112.1")],
+        }
+        stats = {name: SimpleNamespace(isup=True) for name in addrs}
+        with mock.patch("psutil.net_if_addrs", return_value=addrs), \
+                mock.patch("psutil.net_if_stats", return_value=stats):
+            found = settings._lan_addresses()
+        self.assertEqual(found, [("WLAN", "192.168.1.3")])
 
 
 if __name__ == "__main__":

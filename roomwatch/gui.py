@@ -151,6 +151,10 @@ def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> Mon
     except (TypeError, ValueError):
         pid = None
     pid_ok = bool(pid) and alive(pid)
+    # status.json 会留下上一次的 PID。进程已经不在了就不能再把它当成
+    # 「还有进程」——否则停止监控后预览/注册按钮会一直灰着。
+    if not pid_ok:
+        pid = None
 
     gap = _age_seconds(data.get("last_frame_at"))
     online = pid_ok and gap is not None and gap <= STALE_SECONDS

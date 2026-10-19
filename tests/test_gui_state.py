@@ -77,6 +77,7 @@ class ReadStateTest(unittest.TestCase):
         self.assertFalse(state.online)
         self.assertEqual(state.phase, "stopped")
         self.assertIn("已停止", state.caption)
+        self.assertIsNone(state.pid, "死掉的 PID 不能再让预览/注册按钮变灰")
 
     def test_old_heartbeat_is_offline_even_if_file_says_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -25,6 +25,7 @@ import json
 import os
 import socket
 from dataclasses import dataclass, field as dc_field
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict
 
@@ -94,14 +95,15 @@ _add(Field("notify.wecom_bot.send_video", "录像也推送", "推送", "bool",
            hint="收尾后压缩到 18MB 以内再发，压不到就只发文字"))
 _add(Field("notify.wxpusher.app_token", "WxPusher appToken", "推送", "secret", secret=True))
 _add(Field("notify.wxpusher.uid", "WxPusher UID", "推送", "secret", secret=True))
-_add(Field("notify.serverchan.sendkey", "Server酱 SendKey", "推送", "secret", secret=True))
+_add(Field("notify.serverchan.sendkey", "ServerChan SendKey", "推送", "secret", secret=True,
+           hint="第三方推送服务 Server酱；只保存在本机"))
 
 # ---- 相册 ----
 _add(Field("gallery.host", "允许局域网访问", "相册", "choice",
            ("127.0.0.1", "0.0.0.0"),
            hint="127.0.0.1＝仅本机；0.0.0.0＝手机/局域网可访问（必须设置密码）"))
-_add(Field("gallery.token", "相册访问密码", "相册", "secret", secret=True, min_len=12,
-           hint="至少 12 位；留空＝不改。手机访问时用户名随意，密码填这个"))
+_add(Field("gallery.token", "相册访问密码", "相册", min_len=12,
+           hint="至少 12 位；手机访问时用户名随意，密码就填这个。这里明文显示，方便输入"))
 
 # ---- 身份 ----
 _add(Field("identity.threshold", "相似度阈值", "身份", "float", lo=0.1, hi=0.99,
@@ -178,7 +180,15 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 def _lan_addresses() -> list[tuple[str, str]]:
-    """网卡名 + IPv4，排除回环与 169.254；常见家用网段优先。"""
+    """网卡名 + IPv4，排除回环、169.254、虚拟网卡与公网地址。
+
+    虚拟网卡（WSL、Hyper-V、FlClash/Tailscale 等）也会列出私有地址，
+    但手机通常连不上；列出来只会让人选错。只保留真正接入局域网的那几条。
+    """
+    virtual_hints = (
+        "vethernet", "wsl", "flclash", "clash", "vmware", "virtualbox",
+        "tailscale", "zerotier", "loopback", "bluetooth", "tap",
+    )
     try:
         import psutil
 
@@ -187,11 +197,18 @@ def _lan_addresses() -> list[tuple[str, str]]:
         for name, addrs in psutil.net_if_addrs().items():
             if not (stats.get(name) and stats[name].isup):
                 continue
+            if any(hint in name.lower() for hint in virtual_hints):
+                continue
             for addr in addrs:
                 if addr.family != socket.AF_INET:
                     continue
                 ip = str(addr.address)
                 if ip.startswith(("127.", "169.254.")):
+                    continue
+                try:
+                    if not ip_address(ip).is_private:
+                        continue
+                except ValueError:
                     continue
                 result.append((name, ip))
     except Exception:  # noqa: BLE001 - 网卡枚举失败不该影响设置读取
