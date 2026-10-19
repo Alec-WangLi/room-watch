@@ -74,6 +74,12 @@ record:
   max_seconds: 300         # 单段 5 分钟，720p 实测约 330MB（按 65.6 MB/分钟折算）
   max_total_seconds: 1800  # 一次在场最多录 30 分钟
 
+  # 本人在电脑前（键鼠有活动）时怎么处理：
+  #   keep 照录照推 / mute 照录不推（默认，与旧版一致）/ skip 不录不推
+  # skip 更省磁盘，但如果你坐在电脑前时有人进来，可能漏录——按需选择。
+  # 旧的 behavior.skip_when_user_active 仍兼容：true=mute，false=keep。
+  owner_at_computer: mute
+
   queue_size: 120          # 编码跟不上时的缓冲。满了宁可丢帧，也不让主循环卡顿
   draw_boxes: false        # 录像里画不画人形框。回看时跳动的框会挡住脸和手部动作
 
@@ -209,6 +215,7 @@ storage:
   min_free_gb: 3          # 磁盘剩余低于这个值，就额外逼近清理到上限的一半
   check_minutes: 10       # 多久检查一次容量
   protect_seconds: 300    # 最近 5 分钟内写过的文件不删（可能正在录）
+  warn_days: 7            # 按最近增速预计不足这么多天时，日志/界面给出容量预警
 
 outbox:
   # 持久化发件箱：通知先落盘，断网/重启后继续投递。

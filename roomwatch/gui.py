@@ -93,6 +93,9 @@ class MonitorState:
     pending_outbox: int = 0
     last_push_success_at: Optional[str] = None
     notify_channels: Optional[int] = None
+    storage_status: Optional[str] = None
+    storage_days_left: Optional[float] = None
+    storage_used_gb: Optional[float] = None
 
 
 def _age_seconds(ts: Optional[str]) -> Optional[float]:
@@ -100,6 +103,16 @@ def _age_seconds(ts: Optional[str]) -> Optional[float]:
         return None
     try:
         return max(0.0, (datetime.now() - datetime.fromisoformat(ts)).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_float(value) -> Optional[float]:
+    """状态文件里的可选数字：缺失或写坏了都当「没有」，不影响界面刷新。"""
+    if value is None:
+        return None
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return None
 
@@ -199,6 +212,10 @@ def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> Mon
         pending_outbox=int(data.get("pending_outbox") or 0),
         last_push_success_at=data.get("last_push_success_at"),
         notify_channels=notify_channels,
+        storage_status=(str(data["storage_status"])
+                        if data.get("storage_status") else None),
+        storage_days_left=_opt_float(data.get("storage_days_left")),
+        storage_used_gb=_opt_float(data.get("storage_used_gb")),
     )
 
 
@@ -547,9 +564,23 @@ class RoomWatchApp:
             bits.append(f"帧 {state.frames}")
         if state.pending_outbox:
             bits.append(f"待发送 {state.pending_outbox}")
+        if state.storage_used_gb is not None:
+            bits.append(f"存储 {state.storage_used_gb:.1f} GB")
+
+        storage_note = ""
+        if state.storage_status == "over":
+            storage_note = "存储已超过上限，正在清理最旧文件"
+        elif state.storage_status == "warning" and state.storage_days_left is not None:
+            storage_note = f"存储预计 {state.storage_days_left:.0f} 天后达到上限"
+
         if state.notify_channels == 0:
+            text = "告警不会送达：没有启用任何通知渠道"
+            if storage_note:
+                text += " · " + storage_note
+            self.detail_label.configure(text=text, fg="#993C1D")
+        elif storage_note:
             self.detail_label.configure(
-                text="告警不会送达：没有启用任何通知渠道", fg="#993C1D")
+                text="⚠ " + storage_note + " · " + " · ".join(bits), fg="#993C1D")
         else:
             self.detail_label.configure(text=" · ".join(bits), fg="#666")
 

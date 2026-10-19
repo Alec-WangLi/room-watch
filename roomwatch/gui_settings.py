@@ -1,4 +1,4 @@
-"""设置窗口：摄像头 / 推送 / 相册 / 身份 / 自启 / 声音 六个页签。
+"""设置窗口：摄像头 / 推送 / 相册 / 身份 / 录像 / 心跳 / 自启 / 声音 八个页签。
 
 设计约束（都很实在）
 --------------------
@@ -20,7 +20,7 @@ from typing import Optional
 
 
 # 页签顺序。必须与 settings.sections() 一致（tests/test_settings.py 钉住）。
-SECTIONS = ("摄像头", "推送", "相册", "身份", "心跳", "自启", "声音")
+SECTIONS = ("摄像头", "推送", "相册", "身份", "录像", "心跳", "自启", "声音")
 
 
 class SettingsDialog:
@@ -86,6 +86,7 @@ class SettingsDialog:
 
         self._build_camera_block(self.rows_holder["摄像头"])
         self._build_gallery_block(self.rows_holder["相册"])
+        self._build_storage_block(self.rows_holder["录像"])
         self._build_heartbeat_block(self.rows_holder["心跳"])
         self._build_identity_block(self.rows_holder["身份"])
         self._build_autostart_block(self.rows_holder["自启"])
@@ -311,6 +312,65 @@ class SettingsDialog:
                  + "\n".join(lines),
             fg="#0F6E56")
 
+    # ---------------- 存储 ----------------
+
+    def _build_storage_block(self, parent) -> None:
+        box = self.ttk.LabelFrame(parent, text="存储与容量预测", padding=8)
+        box.pack(fill="x", pady=(0, 8))
+        self.storage_label = self.tk.Label(
+            box, text="读取中…", anchor="w", justify="left", wraplength=700,
+            font=self.app.font_small, fg="#666",
+        )
+        self.storage_label.pack(fill="x")
+
+    def _show_storage_info(self, info: dict) -> None:
+        """容量摘要。数字口径与 `rw storage` 完全一致（同一个 forecast）。"""
+        if not info:
+            self.storage_label.configure(text="存储统计将在监控运行后出现。", fg="#666")
+            return
+
+        gb = 1024 ** 3
+        used = float(info.get("used_bytes") or 0) / gb
+        max_bytes = float(info.get("max_bytes") or 0)
+        free = info.get("free_bytes")
+        forecast = info.get("forecast") or {}
+        status = str(forecast.get("status") or "")
+        lines = []
+        if max_bytes > 0:
+            lines.append(f"已用 {used:.1f} GB / 上限 {max_bytes / gb:.0f} GB")
+        else:
+            lines.append(f"已用 {used:.1f} GB（未设容量上限）")
+        if free is not None:
+            lines[-1] += f" · 磁盘剩余 {float(free) / gb:.1f} GB"
+
+        daily = float(forecast.get("daily_bytes") or 0) / (1024 ** 2)
+        if daily > 0:
+            lines.append(f"最近增速约 {daily:.0f} MB/天")
+
+        if status == "over":
+            lines.append("⚠ 已超过容量上限，正在按最旧优先清理；"
+                         "可调小保留天数或调大容量上限。")
+            color = "#993C1D"
+        elif status == "warning":
+            days = forecast.get("days_to_cap")
+            if days is not None:
+                lines.append(f"⚠ 按当前增速，约 {days:.1f} 天后达到容量上限；"
+                             "可调小保留天数或调大容量上限。")
+            color = "#993C1D"
+        elif status == "unlimited":
+            lines.append("未设置容量上限与保留天数：磁盘由你自行管理。")
+            color = "#8A5A00"
+        else:
+            projected = forecast.get("projected_days")
+            keep = info.get("keep_days")
+            if projected is not None:
+                lines.append(f"按当前设置，文件预计保留约 {projected:.0f} 天。")
+            elif keep:
+                lines.append(f"文件按天保留 {keep} 天。")
+            color = "#0F6E56"
+
+        self.storage_label.configure(text="\n".join(lines), fg=color)
+
     # ---------------- 读取 ----------------
 
     def reload(self) -> None:
@@ -330,6 +390,7 @@ class SettingsDialog:
         self._fill_rows(data.get("values") or {}, data.get("secrets") or {})
         self._show_gallery_info(data.get("gallery") or {})
         self._show_heartbeat(data.get("heartbeat") or {})
+        self._show_storage_info(data.get("storage") or {})
         self._show_channel_warning(
             data.get("channels") or [], data.get("outbox") or {},
             data.get("channel_issues") or {})

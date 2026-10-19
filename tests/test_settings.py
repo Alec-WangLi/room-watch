@@ -61,7 +61,8 @@ class SpecTest(unittest.TestCase):
     def test_spec_covers_all_tabs(self) -> None:
         sections = {f.section for f in settings.SPEC.values()}
         self.assertEqual(sections, set(settings.sections()))
-        self.assertEqual(len(sections), 7)
+        self.assertEqual(len(sections), 8)
+        self.assertIn("录像", sections)
 
     def test_credentials_are_flagged_secret(self) -> None:
         for key in ("notify.wecom_bot.webhook", "notify.wxpusher.app_token",
@@ -338,6 +339,105 @@ class HeartbeatSettingTest(unittest.TestCase):
                 mock.patch("psutil.net_if_stats", return_value=stats):
             found = settings._lan_addresses()
         self.assertEqual(found, [("WLAN", "192.168.1.3")])
+
+
+class RecordSettingsTest(unittest.TestCase):
+    """录像策略与存储预算：默认值安全、跨字段校验、写 local 并复读。"""
+
+    def test_record_fields_are_in_spec(self) -> None:
+        for key in (
+            "record.enabled",
+            "record.min_seconds",
+            "record.idle_stop_seconds",
+            "record.max_seconds",
+            "record.max_total_seconds",
+            "record.owner_at_computer",
+            "storage.max_total_gb",
+            "storage.warn_days",
+            "snapshot.keep_days",
+        ):
+            self.assertIn(key, settings.SPEC, key)
+        self.assertEqual(settings.SPEC["record.owner_at_computer"].choices,
+                         ("keep", "mute", "skip"))
+
+    def test_invalid_owner_policy_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"record.owner_at_computer": "pause"})
+            self.assertFalse(result["ok"])
+            self.assertIn("record.owner_at_computer", result["errors"])
+            self.assertFalse((root / "config.local.yaml").exists())
+
+    def test_max_seconds_must_not_exceed_total(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {
+                "record.max_seconds": 3600,
+                "record.max_total_seconds": 1800,
+            })
+            self.assertFalse(result["ok"])
+            self.assertIn("record.max_seconds", result["errors"])
+            self.assertFalse((root / "config.local.yaml").exists())
+
+    def test_min_seconds_must_not_exceed_max(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {
+                "record.min_seconds": 300,
+                "record.max_seconds": 120,
+            })
+            self.assertFalse(result["ok"])
+            self.assertIn("record.min_seconds", result["errors"])
+
+    def test_record_values_are_written_to_local_and_reread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {
+                "record.min_seconds": 10,
+                "record.idle_stop_seconds": 15,
+                "record.max_seconds": 120,
+                "record.max_total_seconds": 600,
+                "record.owner_at_computer": "skip",
+                "storage.max_total_gb": 5,
+                "storage.warn_days": 14,
+            })
+            self.assertTrue(result["ok"], result)
+            data = yaml.safe_load((root / "config.local.yaml").read_text(encoding="utf-8"))
+            from roomwatch.config import load_config
+
+            cfg = load_config(str(root / "config.yaml"))
+        self.assertEqual(data["record"]["owner_at_computer"], "skip")
+        self.assertEqual(cfg["record"]["max_seconds"], 120)
+        self.assertEqual(cfg["storage"]["warn_days"], 14)
+        self.assertEqual(cfg["storage"]["max_total_gb"], 5)
+
+    def test_snapshot_reports_storage_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            captures = Path(tmp) / "data" / "captures"
+            day = captures / "2026-10-18"
+            day.mkdir(parents=True)
+            (day / "120000.mp4").write_bytes(b"v" * 4096)
+            # 用绝对路径：load_config 会按 PROJECT_ROOT 归一相对路径，
+            # 临时项目里写相对路径会指到仓库自己的 data/ 去。
+            root = make_project(Path(tmp), main_extra=(
+                "record:\n"
+                "  max_seconds: 120\n"
+                "  max_total_seconds: 600\n"
+                "  owner_at_computer: mute\n"
+                "snapshot:\n"
+                f"  dir: {captures.as_posix()}\n"
+                "  keep_days: 30\n"
+                "storage:\n"
+                "  max_total_gb: 10\n"
+                "  warn_days: 7\n"
+            ))
+            snap = settings.snapshot(root)
+        storage = snap["storage"]
+        self.assertIn("forecast", storage)
+        self.assertEqual(storage["used_bytes"], 4096)
+        self.assertEqual(storage["max_bytes"], 10 * 1024 ** 3)
+        self.assertEqual(storage["keep_days"], 30)
+        self.assertEqual(storage["forecast"]["used_bytes"], 4096)
 
 
 if __name__ == "__main__":

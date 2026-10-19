@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 from dataclasses import dataclass, field as dc_field
 from ipaddress import ip_address
@@ -35,11 +36,12 @@ from . import health
 from .config import load_config
 from .delivery import KNOWN_CHANNELS, enabled_channels
 from .heartbeat import load_heartbeat
+from .rules import storage_summary
 
 __all__ = [
     "Field", "SPEC", "LOCAL_NAME", "snapshot", "apply", "coerce",
     "read_local", "write_local", "sections", "unset", "gallery_info",
-    "heartbeat_info", "outbox_info", "channel_issues",
+    "heartbeat_info", "outbox_info", "channel_issues", "storage_info",
 ]
 
 MAIN_NAME = "config.yaml"
@@ -48,7 +50,7 @@ LOCAL_NAME = "config.local.yaml"
 LOCAL_HEADER = """# 本机配置覆盖（不入库、不要提交）
 # 由界面「设置」/ `rw setup` / `rw push` 生成：只写与本机相关的差异。
 # 为什么不写进 config.yaml：升级安装包会整体覆盖主配置，写那里的设置会丢。
-# 想改检测灵敏度、录像时长这类参数，请改 config.yaml，不要在这里重复写。
+# 录像时长、存储上限这类参数优先在界面「设置 → 录像」里改；也可以直接改这里。
 """
 
 # 判定「占位串」的规则与 setup_push 保持一致：只看 replace_me，不看前缀。
@@ -121,6 +123,26 @@ _add(Field("identity.unknown_policy", "认不出的人怎么处理", "身份", "
 _add(Field("identity.on_owner", "认出本人时怎么做", "身份", "choice", ("skip", "log"),
            hint="skip=不抓拍不录像不推送；log=照录但只写日志"))
 
+# ---- 录像 ----
+_add(Field("record.enabled", "录制事件视频", "录像", "bool"))
+_add(Field("record.min_seconds", "最短录像（秒）", "录像", "int", lo=5, hi=600,
+           hint="地板：刚开录就没人了也至少录这么久，避免把一次进门切成碎片"))
+_add(Field("record.idle_stop_seconds", "人离开后多久收尾（秒）", "录像", "int",
+           lo=5, hi=600, hint="画面空这么久就停止，不对着空房间录"))
+_add(Field("record.max_seconds", "单段最长（秒）", "录像", "int", lo=30, hi=3600,
+           hint="到点自动接下一段，人在就不会断档"))
+_add(Field("record.max_total_seconds", "一次在场总上限（秒）", "录像", "int",
+           lo=60, hi=86400, hint="防止有人在屋里待一整天写满磁盘"))
+_add(Field("record.owner_at_computer", "本人在电脑前时", "录像", "choice",
+           ("keep", "mute", "skip"),
+           hint="keep=照录照推；mute=照录不推；skip=不录不推（更省磁盘，但可能漏掉真正的闯入者）"))
+_add(Field("storage.max_total_gb", "录像总容量上限（GB）", "录像", "int", lo=0, hi=1000,
+           hint="抓拍+录像+音频的总上限，超了按最旧优先删；0 = 不限"))
+_add(Field("storage.warn_days", "容量预警阈值（天）", "录像", "int", lo=1, hi=90,
+           hint="按最近几天的写入速度，预计不足这么多天就预警"))
+_add(Field("snapshot.keep_days", "文件保留天数", "录像", "int", lo=0, hi=3650,
+           hint="按天清理；0 = 永不按天清理（仍受容量上限约束）"))
+
 # ---- 心跳 ----
 _add(Field("monitor.heartbeat_url", "心跳成功 URL", "心跳", "secret", secret=True,
            hint="healthchecks.io 等服务的完整 URL；留空＝不启用外部心跳"))
@@ -148,7 +170,7 @@ _add(Field("voice.volume_mode", "如何让提示音听得见", "声音", "choice
 
 def sections() -> list[str]:
     """界面上页签的顺序。"""
-    return ["摄像头", "推送", "相册", "身份", "心跳", "自启", "声音"]
+    return ["摄像头", "推送", "相册", "身份", "录像", "心跳", "自启", "声音"]
 
 
 # ---------------------------------------------------------------- 值处理
@@ -424,6 +446,39 @@ def outbox_info(root: Path | str, cfg: dict) -> dict:
     return result
 
 
+def storage_info(root: Path | str, cfg: dict | None = None) -> dict:
+    """存储占用 + 容量预测。目录不存在时返回零值，不主动创建。
+
+    与 `rw storage` 共用 `rules.storage_forecast`，避免「命令行说还够 3 天、
+    界面说还够 10 天」这种口径不一的故障。
+    """
+    root = Path(root)
+    cfg = cfg or load_config(str(root / MAIN_NAME))
+    snap = cfg.get("snapshot") or {}
+    st = cfg.get("storage") or {}
+    directory = Path(str(snap.get("dir") or "data/captures"))
+    if not directory.is_absolute():
+        directory = root / directory
+
+    max_gb = float(st.get("max_total_gb", 20))
+    keep_days = int(snap.get("keep_days", 30))
+    warn_days = float(st.get("warn_days", 7))
+    max_bytes = int(max_gb * (1024 ** 3))
+
+    try:
+        free = shutil.disk_usage(directory).free if directory.is_dir() else None
+    except OSError:
+        free = None
+
+    return storage_summary(
+        directory,
+        max_bytes=max_bytes,
+        keep_days=keep_days,
+        warn_days=warn_days,
+        free_bytes=free,
+    )
+
+
 def snapshot(root: Path | str) -> dict:
     """界面要显示的全部内容：普通值 + 凭据状态。"""
     root = Path(root)
@@ -452,6 +507,7 @@ def snapshot(root: Path | str) -> dict:
         "gallery": gallery_info(root, cfg),
         "heartbeat": heartbeat_info(root, cfg),
         "outbox": outbox_info(root, cfg),
+        "storage": storage_info(root, cfg),
         "channels": enabled_channels(cfg.get("notify") or {}),
         "channel_issues": channel_issues(cfg),
         "labels": {key: {"label": f.label, "section": f.section, "kind": f.kind,
@@ -523,6 +579,27 @@ def apply(root: Path | str, changes: dict) -> dict:
             errors["gallery.token"] = (
                 "允许局域网访问时必须设置至少 12 位相册密码（房间画面不能裸奔）"
             )
+            return {"ok": False, "applied": [], "errors": errors}
+
+    # 录像时长的三个约束互相牵制：地板不能高过单段上限，
+    # 单段上限不能高过一次在场的总上限，否则配置会自相矛盾。
+    if any(key.startswith("record.") for key in coerced):
+        current = load_config(str(root / MAIN_NAME))
+
+        def effective(key: str, default: float) -> float:
+            value = coerced.get(key)
+            if value is None:
+                value = get_path(current, key)
+            return default if value is None else float(value)
+
+        min_seconds = effective("record.min_seconds", 20.0)
+        max_seconds = effective("record.max_seconds", 300.0)
+        total_seconds = effective("record.max_total_seconds", 1800.0)
+        if min_seconds > max_seconds:
+            errors["record.min_seconds"] = "最短录像时间不能大于单段最长"
+        if max_seconds > total_seconds:
+            errors["record.max_seconds"] = "单段最长不能大于一次在场的总上限"
+        if errors:
             return {"ok": False, "applied": [], "errors": errors}
 
     local_path = root / LOCAL_NAME

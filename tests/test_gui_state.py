@@ -425,5 +425,28 @@ class GalleryUrlTest(unittest.TestCase):
             self.assertEqual(gui.gallery_url(root), "http://127.0.0.1:18765/")
 
 
+class StorageStateTest(unittest.TestCase):
+    """存储预警要从 status.json 一路带到界面状态，不能只写日志。"""
+
+    def test_storage_warning_fields_are_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_status(root, seconds_ago=1, storage_status="warning",
+                         storage_days_left=2.4, storage_used_gb=8.0,
+                         storage_max_gb=10.0)
+            state = gui.read_state(root, alive=ALIVE)
+        self.assertEqual(state.storage_status, "warning")
+        self.assertAlmostEqual(state.storage_days_left, 2.4, places=1)
+        self.assertAlmostEqual(state.storage_used_gb, 8.0, places=2)
+
+    def test_missing_storage_fields_are_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_status(root, seconds_ago=1)
+            state = gui.read_state(root, alive=ALIVE)
+        self.assertIsNone(state.storage_status)
+        self.assertIsNone(state.storage_days_left)
+
+
 if __name__ == "__main__":
     unittest.main()
