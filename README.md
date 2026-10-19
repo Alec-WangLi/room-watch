@@ -165,6 +165,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 | `rw push-video PATH` | 把一段录像发到企业微信（验证视频推送） |
 | `rw test [--fast]` | 跑全部测试（`--fast` 跳过集成测试） |
 | `rw doctor` | 环境自检 |
+| `rw diag` | 生成脱敏诊断包（日志/健康快照/退出记录/脱敏配置） |
 | `rw update [--check\|--yes\|--force\|--json]` | 检查并安装更新（见「自动更新」） |
 | `rw version` | 版本号 + 当前 git 提交 |
 | `rw gui` | 打开桌面界面 |
@@ -304,6 +305,8 @@ rw test --fast   # 跳过最慢的集成测试（约 55 秒）
 |---|---|
 | `ModuleNotFoundError: No module named 'cv2'` | 解释器选错了，跑 `rw doctor`；详见 AGENTS.md B 节 |
 | 状态显示在线但其实没画面 | 不要信 `status.json` 里的 `stale`，用 `rw status` 重算 |
+| 进程不知道怎么退出的 | 看 `var/state/last_exit.json` 与 `var/logs/watcher-fault.log`；`rw guard --status` 看重启历史 |
+| 要反馈问题 | 先跑 `rw diag`，把生成的脱敏诊断包附上（不含房间图片与原始凭据） |
 | 浏览器里视频拖不动进度条 | 相册的 Range 支持只在 206 响应下生效，看 `var/logs/gallery.log` |
 | 录像 0 字节 / 放不出来 | 进程被硬杀，mp4 缺 moov atom，这段救不回来 |
 | 日志里刷 `Failed to load OpenH264 library` | 噪音，实际由 Media Foundation 编码成功，可忽略 |
@@ -316,6 +319,11 @@ rw test --fast   # 跳过最慢的集成测试（约 55 秒）
 - **gallery 没有自愈**：`guardian` 只管监控进程，相册挂了需要手动 `rw gallery`
   或用计划任务托管。
 - 桌面程序的「停止监控」是强制终止（`taskkill`），不保证 mp4 收尾。
+
+原生崩溃转储（WER LocalDumps）默认不开启：它需要注册表写权限，普通安装不应
+擅自修改系统设置。要抓 cv2 或驱动层崩溃时，按
+[微软文档](https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps)
+临时开启，把生成的 `.dmp` 与 `rw diag` 的 zip 一起提供。
 
 ---
 

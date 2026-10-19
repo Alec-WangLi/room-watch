@@ -30,6 +30,10 @@ room-watch/
 │  ├─ notifier.py           # 推送渠道（wxpusher / serverchan / wecom_bot / none）
 │  ├─ gallery.py            # 本地相册 HTTP（标准库，自实现 Range）
 │  ├─ guardian.py           # 守护进程（判活、退避、单实例锁）
+│  ├─ health.py             # 健康快照、退出码、退出记录、停滞判定
+│  ├─ diagnostics.py        # 崩溃钩子（faulthandler / excepthook）
+│  ├─ logutil.py            # 日志轮转与固定字段事件
+│  ├─ diag.py               # 脱敏诊断包（rw diag）
 │  ├─ setup_push.py         # 推送配置引导
 │  ├─ wizard.py             # 首次配置向导（摄像头/webhook/自启）
 │  ├─ updater.py            # 自动更新（Releases → 校验 → 静默安装）

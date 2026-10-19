@@ -160,6 +160,7 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 | 目的 | 命令 |
 |---|---|
 | 环境自检 | `rw doctor` |
+| 诊断包（脱敏） | `rw diag` |
 | 拍预览图 | `rw probe` |
 | 试跑（不推送） | `rw dry-run` |
 | 正式运行 | `rw start` |
@@ -212,11 +213,12 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 |---|---|---|
 | `data/captures/<日期>/` | 抓拍 jpg、录像 mp4、音频 wav | 否（隐私） |
 | `data/identity/owner.npz` | 本人人脸特征 | 否（生物特征） |
-| `var/logs/` | watcher / gallery / probe / gui-selftest | 否 |
-| `var/state/` | status.json / guardian_state.json / guardian.lock / **stop.request** / **volume_backup.json** | 否 |
+| `var/logs/` | watcher / gallery / probe / gui-selftest / watcher-fault | 否 |
+| `var/state/` | status.json / health.json / last_exit.json / guardian_state.json / guardian_history.jsonl / guardian.lock / **stop.request** / **volume_backup.json** | 否 |
 | `var/db/events.db` | 事件库 | 否 |
 | `var/media/` | preview.jpg 等临时产物 | 否 |
 | `var/cache/voice/` | 语音缓存（可重建） | 否 |
+| `var/diag/` | `rw diag` 生成的诊断包（可删） | 否 |
 | `models/` + `yolov8n.pt` | 权重 | **是**（下载极慢，属稀缺资产） |
 
 ### D.4 分发布局（0.1.3 起）
@@ -512,6 +514,16 @@ room-watch-<版本>\
 - **教训**：任何「会写 runtime\」的流程（安装、替换运行时）都要先把占用者数清楚，
   不能只盯着 watcher。`select_targets()` 是纯函数，测试里直接喂进程列表。
 
+### F.23 健康快照与退出记录是两套文件
+
+- `var/state/health.json` 是「现在」：每秒更新，回答进程在不在、循环序号、
+  连续错误数、摄像头重开次数、RSS/CPU、自检结果。
+- `var/state/last_exit.json` 是「上一次」：只在进程退出时写，回答为什么退出。
+- **退出码**：`0` 正常 / `2` 配置 / `3` 摄像头 / `4` 模型 / `5` 未处理异常 /
+  `6` 停滞。guardian 重启时把退出码与原因写进 `guardian_history.jsonl`。
+- 原生崩溃（cv2/驱动层）由 `faulthandler` 写 `var/logs/watcher-fault.log`；
+  WER LocalDumps 默认不开，需要注册表写权限，只在排障时手动启用。
+- 反馈问题先跑 `rw diag`：诊断包会脱敏配置、只收 `var/` 与配置，**不收 `data/`**。
 
 ---
 

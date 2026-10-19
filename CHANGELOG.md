@@ -14,6 +14,38 @@
 
 ---
 
+## [0.1.11] - 2026-10-19
+
+> M0：先把「为什么退出」变成可回答的问题。不改变监控行为，只增加观测能力。
+
+### 新增
+
+- **健康快照** `var/state/health.json`：每秒写一次 pid、循环序号、最后画面/推理时间、
+  连续错误数、摄像头重开次数、RSS/CPU、自检结果。guardian、界面与诊断包共用。
+- **退出记录** `var/state/last_exit.json`：正常停止、摄像头打不开、模型加载失败、
+  未处理异常、主循环停滞都会留下退出码与原因；guardian 重启时读取并写入历史。
+- **崩溃钩子**：`faulthandler` 写入 `var/logs/watcher-fault.log`（原生崩溃，
+  含全部线程栈）；`sys.excepthook` / `threading.excepthook` 记录 Python 未捕获异常。
+- **停滞看门狗**：主循环序号超过 `health.stall_seconds`（默认 120 秒）没变化时，
+  先转储线程栈，再以 `EXIT_STALLED` 退出，交给 guardian 重启。
+- **守护重启历史** `var/state/guardian_history.jsonl`：每次重启记录动作、退出码与原因；
+  `rw guard --status` 显示上次退出原因与最近 5 条历史。
+- **日志轮转**：watcher 与 guardian 的日志改为 5MB × 5 份轮转。
+- **`rw diag`**：生成脱敏诊断包（日志尾部、健康快照、退出记录、守护历史、
+  脱敏后的 `config.local.yaml`、doctor 输出、系统信息），不收录 `data/` 下的图像。
+
+### 退出码
+
+`0` 正常 / `2` 配置错误 / `3` 摄像头不可用 / `4` 模型加载失败 /
+`5` 未处理异常 / `6` 主循环停滞。
+
+### 测试
+
+新增 `test_health.py`、`test_diagnostics.py`、`test_diag.py`；
+集成测试增加健康快照与退出记录的断言。
+
+---
+
 ## [0.1.10] - 2026-10-19
 
 > 真机升级 0.1.9 失败后补的修复：安装器按 `rc=5` 回滚，版本号原地不动，
