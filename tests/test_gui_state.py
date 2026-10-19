@@ -16,7 +16,9 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -311,6 +313,32 @@ class GuardCommandTest(unittest.TestCase):
         cmd = gui.guard_command("C:/py/python.exe", Path("C:/proj"), "C:/proj/config.yaml",
                                 once=True)
         self.assertIn("--once", cmd)
+
+
+class HeadlessSubprocessTest(unittest.TestCase):
+    def test_headless_flags_on_non_windows(self):
+        self.assertEqual(gui._headless_flags("linux"), 0)
+
+    def test_headless_flags_on_windows(self):
+        if os.name != "nt":
+            self.skipTest("Windows only")
+        self.assertTrue(gui._headless_flags("nt") & subprocess.CREATE_NO_WINDOW)
+
+    def test_run_headless_passes_creationflags(self):
+        with mock.patch.object(gui.subprocess, "run", return_value=mock.Mock()) as run:
+            gui._run_headless(["python.exe", "-c", "pass"])
+        self.assertEqual(
+            run.call_args.kwargs.get("creationflags"), gui._headless_flags()
+        )
+
+    def test_update_check_uses_headless_run(self):
+        with mock.patch.object(gui.subprocess, "run", return_value=mock.Mock()) as run:
+            gui._update_check("py", Path("C:/proj"))
+        args = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        self.assertEqual(args, ["py", "-m", "roomwatch", "update", "--json"])
+        self.assertTrue(kwargs.get("capture_output"))
+        self.assertEqual(kwargs.get("creationflags"), gui._headless_flags())
 
 
 if __name__ == "__main__":

@@ -255,6 +255,27 @@ def preview_image(root: Path) -> tuple[Optional[Path], str]:
     return path, kind
 
 
+def _headless_flags(platform: Optional[str] = None) -> int:
+    """Windows 下隐藏子进程的控制台窗口；非 Windows 返回 0。"""
+    plat = platform or os.name
+    if plat != "nt":
+        return 0
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _run_headless(args: list[str], **kwargs):
+    """所有不需要用户看见控制台的子进程都走这里。"""
+    kwargs.setdefault("creationflags", _headless_flags())
+    return subprocess.run(args, **kwargs)
+
+
+def _update_check(python: str, project: Path, timeout: float = 180.0):
+    return _run_headless(
+        [python, "-m", "roomwatch", "update", "--json"],
+        cwd=str(project), capture_output=True, text=True, timeout=timeout,
+    )
+
+
 def start_command(python: str, root: Path, config_path: str) -> list[str]:
     log = Path(root) / "var" / "logs" / "watcher.log"
     return [python, "-m", "roomwatch", "start", "--config", str(config_path), "--log", str(log)]
@@ -303,7 +324,7 @@ def _tk_candidates() -> list[str]:
 def _find_tk_python() -> Optional[str]:
     for exe in _tk_candidates():
         try:
-            proc = subprocess.run([exe, "-c", "import tkinter"], capture_output=True, timeout=20)
+            proc = _run_headless([exe, "-c", "import tkinter"], capture_output=True, timeout=20)
         except (OSError, subprocess.SubprocessError):
             continue
         if proc.returncode == 0:
@@ -325,7 +346,7 @@ def _relaunch_with_tk(argv: Sequence[str]) -> int:
     env["PYTHONPATH"] = str(root) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     print(f"当前解释器没有 tkinter，改用：{exe}")
     try:
-        proc = subprocess.run([exe, "-m", "roomwatch", "gui", *argv], cwd=str(root), env=env)
+        proc = _run_headless([exe, "-m", "roomwatch", "gui", *argv], cwd=str(root), env=env)
         return proc.returncode
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"启动失败：{exc}", file=sys.stderr)
@@ -584,7 +605,7 @@ class RoomWatchApp:
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
         try:
-            proc = subprocess.run(
+            proc = _run_headless(
                 [exe, "-m", "roomwatch", *args],
                 cwd=str(self.project), env=env, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=timeout,
@@ -628,7 +649,7 @@ class RoomWatchApp:
                 seen.append(item)
         for exe in seen:
             try:
-                proc = subprocess.run([exe, "-c", "import cv2"], capture_output=True, timeout=25)
+                proc = _run_headless([exe, "-c", "import cv2"], capture_output=True, timeout=25)
             except (OSError, subprocess.SubprocessError):
                 continue
             if proc.returncode == 0:
@@ -732,7 +753,7 @@ class RoomWatchApp:
 
             def kill_work() -> dict:
                 try:
-                    subprocess.run(force_kill_command(pid), capture_output=True, timeout=15)
+                    _run_headless(force_kill_command(pid), capture_output=True, timeout=15)
                 except (OSError, subprocess.SubprocessError):
                     pass
                 gone = procutil.wait_pid_exit(pid, timeout=5.0)
@@ -938,10 +959,7 @@ class RoomWatchApp:
         def work() -> None:
             data: dict
             try:
-                proc = subprocess.run(
-                    [self.python, "-m", "roomwatch", "update", "--json"],
-                    cwd=str(self.project), capture_output=True, text=True, timeout=180,
-                )
+                proc = _update_check(self.python, self.project, timeout=180)
                 lines = [ln for ln in (proc.stdout or "").strip().splitlines() if ln.strip()]
                 data = json.loads(lines[-1]) if lines else {}
                 data.setdefault("error", "")
