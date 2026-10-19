@@ -90,6 +90,7 @@ STATE_DIR = VAR_DIR / "state"
 DB_DIR = VAR_DIR / "db"
 MEDIA_DIR = VAR_DIR / "media"
 CACHE_DIR = VAR_DIR / "cache"
+DIAG_DIR = VAR_DIR / "diag"
 
 
 def resolve(path: str | os.PathLike[str] | None, default: str = "") -> str:
