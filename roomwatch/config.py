@@ -48,6 +48,8 @@ _PATH_KEYS = (
     ("health", "path"),
     ("health", "exit_record"),
     ("health", "fault_log"),
+    ("outbox", "database"),
+    ("outbox", "media_dir"),
 )
 
 

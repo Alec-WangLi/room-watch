@@ -61,12 +61,17 @@ class ReadStateTest(unittest.TestCase):
     def test_fresh_heartbeat_with_live_pid_is_online(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_status(root, seconds_ago=1)
+            write_status(root, seconds_ago=1, pending_outbox=3,
+                         last_push_success_at="2026-10-19T12:00:00",
+                         notify_channels=0)
             state = gui.read_state(root, alive=ALIVE)
         self.assertTrue(state.online)
         self.assertEqual(state.phase, "running")
         self.assertEqual(state.pid, 1234)
         self.assertEqual(state.events_today, 3)
+        self.assertEqual(state.pending_outbox, 3)
+        self.assertEqual(state.last_push_success_at, "2026-10-19T12:00:00")
+        self.assertEqual(state.notify_channels, 0)
 
     def test_fresh_heartbeat_but_dead_pid_is_offline(self) -> None:
         """这就是「停止后点不了启动」的根因，必须判离线。"""

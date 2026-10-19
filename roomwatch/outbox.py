@@ -365,8 +365,8 @@ class OutboxStore:
         freed = 0
 
         rows = self.conn.execute(
-            "SELECT id, payload FROM outbox WHERE status IN (?,?,?) AND created_at < ?",
-            (STATUS_PENDING, STATUS_SENDING, STATUS_FAILED, cutoff),
+            "SELECT id, payload FROM outbox WHERE status IN (?,?) AND created_at < ?",
+            (STATUS_PENDING, STATUS_FAILED, cutoff),
         ).fetchall()
         for row in rows:
             payload = _payload(row["payload"])
@@ -410,6 +410,23 @@ class OutboxStore:
                     expired += 1
                     used = _dir_size(media)
             self.conn.commit()
+
+        # 孤儿临时文件（转码成功但进程在发送前被杀）也会随时间清理，
+        # 避免 var/outbox 慢慢变大。
+        cutoff_dt = now_dt - timedelta(days=max(0.0, float(max_age_days)))
+        try:
+            for entry in media.rglob("*"):
+                if not entry.is_file():
+                    continue
+                try:
+                    if datetime.fromtimestamp(entry.stat().st_mtime) < cutoff_dt:
+                        size = entry.stat().st_size
+                        entry.unlink()
+                        freed += size
+                except OSError:
+                    continue
+        except OSError:
+            pass
 
         return {
             "expired": expired,

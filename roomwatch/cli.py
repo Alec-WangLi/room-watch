@@ -90,6 +90,7 @@ COMMANDS: dict[str, Command] = {
     "config": Command("读取或修改界面设置（--json / --set 键=值 / --test）"),
     "autostart": Command("开机自启：查看状态或开启/关闭（--json / --enable / --disable）"),
     "identity": Command("查看或清除本人人脸模板（--json / --clear）"),
+    "heartbeat": Command("测试外部心跳 URL（--test / --json）"),
     "guard": Command("守护进程：保证监控进程一直活着", "guardian"),
     "push": Command("配置微信/Server酱推送渠道", "setup_push"),
     "setup": Command("首次配置向导：摄像头、微信推送、相册密码、开机自启", "wizard"),
@@ -740,6 +741,35 @@ def _pairs_after(argv: Sequence[str], flag: str) -> dict:
     return pairs
 
 
+def _cmd_heartbeat(argv: Sequence[str]) -> int:
+    """测试外部心跳 URL；输出里绝不带完整 URL。"""
+    from datetime import datetime
+
+    from .config import load_config
+    from .heartbeat import load_heartbeat, ping
+
+    json_mode = "--json" in argv
+    if "--test" not in argv:
+        raise UsageError("用法：rw heartbeat --test [--json]")
+
+    cfg = load_config(str(paths.PROJECT_ROOT / "config.yaml"))
+    hb = load_heartbeat(cfg)
+    if not hb.configured:
+        result = {"ok": False, "message": "还没有配置 monitor.heartbeat_url", "at": None}
+    else:
+        ok, error = ping(hb.url, hb.timeout_seconds)
+        result = {
+            "ok": ok,
+            "message": "" if ok else error,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+    if json_mode:
+        print(json.dumps(result, ensure_ascii=True))
+    else:
+        print("✓ 心跳成功" if result["ok"] else f"✗ 心跳失败：{result['message']}")
+    return 0 if result["ok"] else 1
+
+
 def _cmd_config(argv: Sequence[str]) -> int:
     """读设置 / 改设置 / 发测试消息。界面「设置」窗口的全部后端。"""
     from . import settings
@@ -810,37 +840,34 @@ def _cmd_config(argv: Sequence[str]) -> int:
 
 
 def _config_test(root: Path, json_mode: bool) -> int:
-    """用生效配置里的凭据发一条测试消息。"""
-    import io
-    from contextlib import redirect_stdout
-
+    """用当前生效的所有渠道各发一条测试消息。"""
     from .config import load_config
-    from .setup_push import send_test
+    from .delivery import enabled_channels
+    from .notifier import Notifier
 
     cfg = load_config(str(root / "config.yaml"))
     notify = cfg.get("notify") or {}
-    channel = str(notify.get("channel") or "none")
-    creds: dict = {}
-    if channel == "wecom_bot":
-        creds = {"webhook": str((notify.get("wecom_bot") or {}).get("webhook") or "")}
-    elif channel == "wxpusher":
-        block = notify.get("wxpusher") or {}
-        creds = {"token": str(block.get("app_token") or ""), "uid": str(block.get("uid") or "")}
-    elif channel == "serverchan":
-        creds = {"sendkey": str((notify.get("serverchan") or {}).get("sendkey") or "")}
-
-    missing = [key for key, value in creds.items() if not value or "replace_me" in value.lower()]
-    if channel == "none" or missing:
-        payload = {"ok": False, "channel": channel,
-                   "message": "推送渠道是 none" if channel == "none"
-                   else f"凭据不完整：缺少 {', '.join(missing)}"}
+    channels = enabled_channels(notify)
+    if not channels:
+        payload = {"ok": False, "channel": "none", "channels": {},
+                   "message": "没有启用任何推送渠道"}
     else:
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            ok = send_test(channel, creds)
-        detail = buffer.getvalue().strip()
-        payload = {"ok": bool(ok), "channel": channel,
-                   "message": "" if ok else (detail[-600:] or "发送失败，服务端没有返回原因")}
+        body = ("room-watch 推送测试\n"
+                "收到这条消息，说明推送配置成功。有人进入房间时你会收到类似提醒。")
+        notifier = Notifier(notify)
+        results: dict = {}
+        errors: list[str] = []
+        for channel in channels:
+            result = notifier.deliver(channel, "text", {"text": body})
+            results[channel] = {"ok": bool(result.ok), "error": result.error}
+            if not result.ok:
+                errors.append(f"{channel}: {result.error}")
+        payload = {
+            "ok": not errors,
+            "channel": ",".join(channels),
+            "channels": results,
+            "message": "" if not errors else "；".join(errors)[-600:],
+        }
 
     if json_mode:
         print(json.dumps(payload, ensure_ascii=True))
@@ -974,6 +1001,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_autostart(rest)
         if name == "identity":
             return _cmd_identity(rest)
+        if name == "heartbeat":
+            return _cmd_heartbeat(rest)
 
         spec = COMMANDS[name]
         translated = translate(name, rest)

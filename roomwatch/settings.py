@@ -31,11 +31,15 @@ from typing import Any, Dict
 
 import yaml
 
+from . import health
 from .config import load_config
+from .delivery import KNOWN_CHANNELS, enabled_channels
+from .heartbeat import load_heartbeat
 
 __all__ = [
     "Field", "SPEC", "LOCAL_NAME", "snapshot", "apply", "coerce",
     "read_local", "write_local", "sections", "unset", "gallery_info",
+    "heartbeat_info", "outbox_info", "channel_issues",
 ]
 
 MAIN_NAME = "config.yaml"
@@ -86,9 +90,8 @@ _add(Field("camera.source", "网络摄像头地址", "摄像头", "secret", secr
            hint="rtsp://用户名:密码@IP:554/...；留空＝用本机编号"))
 
 # ---- 推送 ----
-_add(Field("notify.channel", "推送渠道", "推送", "choice",
-           ("wecom_bot", "wxpusher", "serverchan", "none"),
-           hint="wecom_bot 是唯一能把照片直接发到微信的渠道"))
+_add(Field("notify.channels", "启用的渠道", "推送", "multi", KNOWN_CHANNELS,
+           hint="勾选几个就同时发给几个；只选一个时没有冗余，建议至少两个"))
 _add(Field("notify.wecom_bot.webhook", "企业微信机器人 Webhook", "推送", "secret", secret=True,
            hint="整条地址直接粘贴；只填 key 也认"))
 _add(Field("notify.wecom_bot.send_video", "录像也推送", "推送", "bool",
@@ -97,6 +100,11 @@ _add(Field("notify.wxpusher.app_token", "WxPusher appToken", "推送", "secret",
 _add(Field("notify.wxpusher.uid", "WxPusher UID", "推送", "secret", secret=True))
 _add(Field("notify.serverchan.sendkey", "ServerChan SendKey", "推送", "secret", secret=True,
            hint="第三方推送服务 Server酱；只保存在本机"))
+_add(Field("notify.webhook.url", "通用 webhook 地址", "推送", "secret", secret=True,
+           hint="ntfy / Gotify / Bark / 自建服务；收到 JSON POST"))
+_add(Field("notify.webhook.timeout_seconds", "webhook 超时（秒）", "推送", "int", lo=3, hi=120))
+_add(Field("notify.webhook.max_image_mb", "webhook 内联图片上限（MB）", "推送", "int",
+           lo=0, hi=20, hint="超过就只发文字；0 = 不内联"))
 
 # ---- 相册 ----
 _add(Field("gallery.host", "允许局域网访问", "相册", "choice",
@@ -112,6 +120,17 @@ _add(Field("identity.unknown_policy", "认不出的人怎么处理", "身份", "
            ("alert", "ignore"), hint="alert=照常告警（安全优先）；ignore=当成本人静默"))
 _add(Field("identity.on_owner", "认出本人时怎么做", "身份", "choice", ("skip", "log"),
            hint="skip=不抓拍不录像不推送；log=照录但只写日志"))
+
+# ---- 心跳 ----
+_add(Field("monitor.heartbeat_url", "心跳成功 URL", "心跳", "secret", secret=True,
+           hint="healthchecks.io 等服务的完整 URL；留空＝不启用外部心跳"))
+_add(Field("monitor.heartbeat_fail_url", "心跳失败 URL", "心跳", "secret", secret=True,
+           hint="持续不健康时 ping 它；留空＝停止 ping，由外部服务宽限期告警"))
+_add(Field("monitor.heartbeat_start_url", "心跳启动 URL", "心跳", "secret", secret=True))
+_add(Field("monitor.heartbeat_interval_seconds", "心跳间隔（秒）", "心跳", "int",
+           lo=60, hi=86400))
+_add(Field("monitor.heartbeat_timeout_seconds", "心跳超时（秒）", "心跳", "int",
+           lo=3, hi=60))
 
 # ---- 自启 ----
 # 开机自启拉起的是守护进程，所以「它多久确认一次」天然属于这一页。
@@ -129,7 +148,7 @@ _add(Field("voice.volume_mode", "如何让提示音听得见", "声音", "choice
 
 def sections() -> list[str]:
     """界面上页签的顺序。"""
-    return ["摄像头", "推送", "相册", "身份", "自启", "声音"]
+    return ["摄像头", "推送", "相册", "身份", "心跳", "自启", "声音"]
 
 
 # ---------------------------------------------------------------- 值处理
@@ -297,6 +316,22 @@ def coerce(field: Field, raw: Any) -> Any:
             raise ValueError(f"{field.label}只能是 {'/'.join(field.choices)}，收到：{raw}")
         return text
 
+    if field.kind == "multi":
+        if isinstance(raw, (list, tuple)):
+            items = list(raw)
+        else:
+            items = str(raw).replace(";", ",").split(",")
+        result: list[str] = []
+        for item in items:
+            name = str(item).strip().lower()
+            if not name:
+                continue
+            if name not in field.choices:
+                raise ValueError(f"{field.label}里有不认识的渠道：{name}")
+            if name not in result:
+                result.append(name)
+        return result
+
     text = str(raw).strip()
     if field.min_len and text and len(text) < field.min_len:
         raise ValueError(f"{field.label}至少 {field.min_len} 位，收到 {len(text)} 位")
@@ -312,6 +347,83 @@ def secret_info(value: Any) -> dict:
     return {"set": True, "tail": f"…{tail}" if tail else ""}
 
 
+def channel_issues(cfg: dict) -> dict:
+    """启用但凭据不完整的渠道；界面要显式提示，不能让告警安静地发不出去。"""
+    notify = cfg.get("notify") or {}
+    issues: dict = {}
+    for channel in enabled_channels(notify):
+        if channel == "wecom_bot":
+            value = str((notify.get("wecom_bot") or {}).get("webhook") or "").strip()
+            if not value or "REPLACE" in value.upper():
+                issues[channel] = "webhook 未配置"
+        elif channel == "wxpusher":
+            block = notify.get("wxpusher") or {}
+            if not str(block.get("app_token") or "").strip() or not str(block.get("uid") or "").strip():
+                issues[channel] = "appToken/UID 未配置"
+        elif channel == "serverchan":
+            value = str((notify.get("serverchan") or {}).get("sendkey") or "").strip()
+            if not value or "replace_me" in value.lower():
+                issues[channel] = "SendKey 未配置"
+        elif channel == "webhook":
+            value = str((notify.get("webhook") or {}).get("url") or "").strip()
+            if not value or "replace_me" in value.lower():
+                issues[channel] = "URL 未配置"
+    return issues
+
+
+def heartbeat_info(root: Path | str, cfg: dict) -> dict:
+    hb = load_heartbeat(cfg)
+    state = health.read_json(Path(root) / "var" / "state" / "guardian_state.json") or {}
+    return {
+        "configured": hb.configured,
+        "fail_url_set": bool(hb.fail_url),
+        "interval_seconds": hb.interval_seconds,
+        "last_at": state.get("last_heartbeat_at"),
+        "last_ok": state.get("last_heartbeat_ok"),
+        "last_error": str(state.get("last_heartbeat_error") or ""),
+    }
+
+
+def outbox_info(root: Path | str, cfg: dict) -> dict:
+    """给设置界面看的队列与渠道健康；数据库不存在时返回零值，不主动建库。"""
+    root = Path(root)
+    outbox_cfg = cfg.get("outbox") or {}
+    db = outbox_cfg.get("database")
+    if not db:
+        storage = cfg.get("storage") or {}
+        event_db = storage.get("database")
+        db = (str(Path(event_db).with_name("outbox.db")) if event_db
+              else str(root / "var" / "db" / "outbox.db"))
+    path = Path(str(db))
+    if not path.is_absolute():
+        path = root / path
+    result = {
+        "pending": 0,
+        "failed": 0,
+        "last_success_at": None,
+        "channels": {},
+    }
+    if not path.is_file():
+        return result
+    try:
+        from .outbox import OutboxStore
+
+        store = OutboxStore(path)
+        try:
+            stats = store.stats()
+            result.update({
+                "pending": int(stats.get("pending", 0)),
+                "failed": int(stats.get("failed_permanent", 0)),
+                "last_success_at": stats.get("last_success_at"),
+                "channels": store.channel_health(),
+            })
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001 - 读取失败不该让设置窗口打不开
+        pass
+    return result
+
+
 def snapshot(root: Path | str) -> dict:
     """界面要显示的全部内容：普通值 + 凭据状态。"""
     root = Path(root)
@@ -319,6 +431,11 @@ def snapshot(root: Path | str) -> dict:
     values: dict = {}
     secrets: dict = {}
     for field in SPEC.values():
+        if field.key == "notify.channels":
+            values[field.key] = ",".join(
+                enabled_channels(cfg.get("notify") or {})
+            )
+            continue
         raw = get_path(cfg, field.key)
         if field.kind == "choice" and isinstance(raw, bool):
             # YAML 1.1 把裸 off/on 当布尔：界面要看到 "off" 而不是 False
@@ -333,6 +450,10 @@ def snapshot(root: Path | str) -> dict:
         "files": {"main": str(root / MAIN_NAME), "local": str(root / LOCAL_NAME)},
         "sections": sections(),
         "gallery": gallery_info(root, cfg),
+        "heartbeat": heartbeat_info(root, cfg),
+        "outbox": outbox_info(root, cfg),
+        "channels": enabled_channels(cfg.get("notify") or {}),
+        "channel_issues": channel_issues(cfg),
         "labels": {key: {"label": f.label, "section": f.section, "kind": f.kind,
                          "choices": list(f.choices), "hint": f.hint,
                          "secret": f.secret}

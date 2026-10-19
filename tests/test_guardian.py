@@ -306,6 +306,7 @@ class GuardPausedTest(unittest.TestCase):
                    "__config_path__": str(root / "config.yaml")}
             control.set_desired_state(root, "paused")
             g = G.Guard(cfg, dry_run=True)
+            g._notify = lambda *args, **kwargs: None
             with mock.patch.object(g, "_start_watcher") as sw, \
                  mock.patch.object(g, "_start_gallery") as sg:
                 self.assertEqual(g.check_once(), G.ACT_PAUSED)
@@ -676,6 +677,7 @@ class GalleryBackoffTest(unittest.TestCase):
                 datetime.now() - timedelta(minutes=1)
             ).isoformat(timespec="seconds")
             g._start_gallery = lambda: 111
+            g._notify = lambda *args, **kwargs: None
             g._check_gallery(datetime.now())
         self.assertEqual(g.state["gallery_failures"], 3)
 

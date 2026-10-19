@@ -61,11 +61,13 @@ class SpecTest(unittest.TestCase):
     def test_spec_covers_all_tabs(self) -> None:
         sections = {f.section for f in settings.SPEC.values()}
         self.assertEqual(sections, set(settings.sections()))
-        self.assertEqual(len(sections), 6)
+        self.assertEqual(len(sections), 7)
 
     def test_credentials_are_flagged_secret(self) -> None:
         for key in ("notify.wecom_bot.webhook", "notify.wxpusher.app_token",
                     "notify.wxpusher.uid", "notify.serverchan.sendkey",
+                    "notify.webhook.url", "monitor.heartbeat_url",
+                    "monitor.heartbeat_fail_url", "monitor.heartbeat_start_url",
                     "camera.source"):
             self.assertTrue(settings.SPEC[key].secret, key)
 
@@ -112,7 +114,7 @@ class SnapshotTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_project(Path(tmp))
             snap = settings.snapshot(root)
-        self.assertEqual(snap["values"]["notify.channel"], "none")
+        self.assertEqual(snap["values"]["notify.channels"], "")
         self.assertEqual(snap["values"]["identity.threshold"], 0.45)
 
     def test_placeholder_credential_counts_as_unset(self) -> None:
@@ -151,10 +153,10 @@ class ApplyTest(unittest.TestCase):
             root = make_project(Path(tmp))
             (root / "config.local.yaml").write_text(
                 "camera:\n  source: rtsp://user:pw@10.0.0.2:554/live\n", encoding="utf-8")
-            settings.apply(root, {"notify.channel": "wecom_bot"})
+            settings.apply(root, {"notify.channels": "wecom_bot"})
             data = yaml.safe_load((root / "config.local.yaml").read_text(encoding="utf-8"))
         self.assertEqual(data["camera"]["source"], "rtsp://user:pw@10.0.0.2:554/live")
-        self.assertEqual(data["notify"]["channel"], "wecom_bot")
+        self.assertEqual(data["notify"]["channels"], ["wecom_bot"])
 
     def test_unknown_key_is_rejected_and_nothing_written(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,7 +170,7 @@ class ApplyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_project(Path(tmp))
             result = settings.apply(root, {"identity.threshold": "9",
-                                           "notify.channel": "wecom_bot"})
+                                           "notify.channels": "wecom_bot"})
             self.assertFalse(result["ok"])
             self.assertFalse((root / "config.local.yaml").exists())
 
@@ -193,14 +195,72 @@ class ApplyTest(unittest.TestCase):
 
             settings.write_local = sabotage  # type: ignore[assignment]
             try:
-                result = settings.apply(root, {"notify.channel": "wecom_bot"})
+                result = settings.apply(root, {"notify.channels": "wecom_bot"})
             finally:
                 settings.write_local = real  # type: ignore[assignment]
         self.assertFalse(result["ok"])
         self.assertTrue(any("复读" in msg for msg in result["errors"].values()))
 
 
-class GallerySettingsTest(unittest.TestCase):
+class MultiChannelSettingTest(unittest.TestCase):
+    def test_multi_coerce_dedupes_and_validates(self) -> None:
+        field = settings.SPEC["notify.channels"]
+        self.assertEqual(settings.coerce(field, "wecom_bot, wxpusher,wecom_bot"),
+                         ["wecom_bot", "wxpusher"])
+        with self.assertRaises(ValueError):
+            settings.coerce(field, "wecom_bot,telegram")
+
+    def test_channels_are_written_as_yaml_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"notify.channels": "wecom_bot,wxpusher"})
+            self.assertTrue(result["ok"], result)
+            data = yaml.safe_load((root / "config.local.yaml").read_text(encoding="utf-8"))
+            snap = settings.snapshot(root)
+        self.assertEqual(data["notify"]["channels"], ["wecom_bot", "wxpusher"])
+        self.assertEqual(snap["values"]["notify.channels"], "wecom_bot,wxpusher")
+        self.assertEqual(snap["channels"], ["wecom_bot", "wxpusher"])
+
+    def test_legacy_channel_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            snap = settings.snapshot(root)
+        self.assertEqual(snap["values"]["notify.channels"], "")
+        self.assertEqual(snap["channels"], [])
+
+    def test_unconfigured_channel_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            settings.apply(root, {"notify.channels": "wecom_bot"})
+            snap = settings.snapshot(root)
+        self.assertIn("wecom_bot", snap["channel_issues"])
+        self.assertIn("webhook", snap["channel_issues"]["wecom_bot"])
+
+
+class HeartbeatSettingTest(unittest.TestCase):
+    def test_heartbeat_info_reads_merged_config_and_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            (root / "config.local.yaml").write_text(
+                "monitor:\n  heartbeat_url: https://hc.test/abc\n", encoding="utf-8")
+            state = root / "var" / "state"
+            state.mkdir(parents=True)
+            (state / "guardian_state.json").write_text(json.dumps({
+                "last_heartbeat_at": "2026-10-19T12:00:00",
+                "last_heartbeat_ok": True,
+                "last_heartbeat_error": "",
+            }), encoding="utf-8")
+            snap = settings.snapshot(root)
+        self.assertTrue(snap["heartbeat"]["configured"])
+        self.assertEqual(snap["heartbeat"]["interval_seconds"], 300)
+        self.assertEqual(snap["heartbeat"]["last_at"], "2026-10-19T12:00:00")
+
+    def test_outbox_info_is_zero_without_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            snap = settings.snapshot(root)
+        self.assertEqual(snap["outbox"]["pending"], 0)
+        self.assertEqual(snap["outbox"]["channels"], {})
     def test_lan_requires_password(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_project(Path(tmp))

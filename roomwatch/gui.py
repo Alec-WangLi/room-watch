@@ -90,6 +90,9 @@ class MonitorState:
     recording: bool = False
     caption: str = ""
     last_frame: str = ""
+    pending_outbox: int = 0
+    last_push_success_at: Optional[str] = None
+    notify_channels: Optional[int] = None
 
 
 def _age_seconds(ts: Optional[str]) -> Optional[float]:
@@ -160,6 +163,11 @@ def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> Mon
     online = pid_ok and gap is not None and gap <= STALE_SECONDS
     recording = bool(data.get("recording"))
     stopping = online and control.stop_requested(Path(root), pid or 0)
+    notify_raw = data.get("notify_channels")
+    try:
+        notify_channels = int(notify_raw) if notify_raw is not None else None
+    except (TypeError, ValueError):
+        notify_channels = None
 
     if stopping:
         phase = "stopping"
@@ -188,6 +196,9 @@ def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> Mon
         recording=recording,
         caption=caption,
         last_frame=str(data.get("last_frame_at") or ""),
+        pending_outbox=int(data.get("pending_outbox") or 0),
+        last_push_success_at=data.get("last_push_success_at"),
+        notify_channels=notify_channels,
     )
 
 
@@ -534,7 +545,13 @@ class RoomWatchApp:
             bits.append(f"今日 {state.events_today} 次")
         if state.frames is not None:
             bits.append(f"帧 {state.frames}")
-        self.detail_label.configure(text=" · ".join(bits))
+        if state.pending_outbox:
+            bits.append(f"待发送 {state.pending_outbox}")
+        if state.notify_channels == 0:
+            self.detail_label.configure(
+                text="告警不会送达：没有启用任何通知渠道", fg="#993C1D")
+        else:
+            self.detail_label.configure(text=" · ".join(bits), fg="#666")
 
         start_state, stop_state = button_states(state, self._busy)
         self.btn_start.configure(state=start_state)
@@ -1244,8 +1261,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dialog = gui_settings.SettingsDialog(app, autoload=False)
         app.win.update()
         tabs = dialog.notebook.tabs()
-        if len(tabs) != 6:
-            problems.append(f"设置页签数量是 {len(tabs)}，应为 6")
+        if len(tabs) != 7:
+            problems.append(f"设置页签数量是 {len(tabs)}，应为 7")
         dialog.close()
 
         width = app.win.winfo_width()

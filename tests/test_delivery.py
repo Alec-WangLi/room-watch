@@ -15,12 +15,14 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from roomwatch import delivery as D
 from roomwatch import notifier as N
+from roomwatch import outbox as O
 from roomwatch import videopush as VP
 
 
@@ -213,5 +215,92 @@ class VideoDeliverTest(unittest.TestCase):
         self.assertFalse(result.retryable)
 
 
+class DeliveryWorkerTest(unittest.TestCase):
+    class FakeDispatcher:
+        def __init__(self, results=None):
+            self.results = list(results or [])
+            self.calls = []
+
+        def deliver(self, item):
+            self.calls.append(item)
+            result = self.results.pop(0) if self.results else O.DeliveryResult(True)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db = self.root / "outbox.db"
+        self.media = self.root / "media"
+        self.media.mkdir()
+        self.store = O.OutboxStore(self.db)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _worker(self, results=None, **kwargs):
+        return D.DeliveryWorker(self.db, self.FakeDispatcher(results),
+                                media_dir=self.media, **kwargs)
+
+    def _enqueue(self, kind="text", dedupe="e1:text"):
+        return self.store.enqueue(channel="wecom_bot", kind=kind, payload={"text": "x"},
+                                  event_id="e1", dedupe_key=dedupe)
+
+    def test_delivers_and_marks_done(self):
+        self._enqueue()
+        worker = self._worker()
+        self.assertTrue(worker.run_once(self.store))
+        self.assertEqual(self.store.stats()["delivered"], 1)
+        self.assertFalse(worker.run_once(self.store))
+
+    def test_permanent_failure_is_recorded(self):
+        self._enqueue()
+        worker = self._worker([O.DeliveryResult(False, retryable=False, error="401")])
+        worker.run_once(self.store)
+        self.assertEqual(self.store.stats()["failed_permanent"], 1)
+
+    def test_exception_is_rescheduled_not_raised(self):
+        self._enqueue()
+        worker = self._worker([RuntimeError("boom")])
+        self.assertTrue(worker.run_once(self.store))
+        row = self.store.conn.execute(
+            "SELECT status, attempts, last_error FROM outbox").fetchone()
+        self.assertEqual(row["status"], O.STATUS_PENDING)
+        self.assertEqual(row["attempts"], 1)
+        self.assertIn("boom", row["last_error"])
+
+    def test_flush_drains_until_empty(self):
+        for i in range(3):
+            self._enqueue(dedupe=f"e{i}:text")
+        worker = self._worker()
+        self.assertEqual(worker.flush(10), 3)
+        self.assertEqual(self.store.stats()["delivered"], 3)
+
+    def test_kinds_filter(self):
+        self._enqueue(kind="video", dedupe="e1:video")
+        worker = self._worker()
+        self.assertEqual(worker.flush(10), 0)
+
+    def test_thread_start_delivers_and_stops(self):
+        self._enqueue()
+        worker = self._worker(poll_seconds=0.1)
+        worker.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                reader = O.OutboxStore(self.db)
+                delivered = reader.stats()["delivered"]
+                reader.close()
+                if delivered:
+                    break
+                time.sleep(0.05)
+        finally:
+            worker.stop()
+        self.assertEqual(delivered, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

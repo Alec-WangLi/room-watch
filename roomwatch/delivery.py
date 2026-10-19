@@ -11,12 +11,17 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 from .notifier import Notifier
-from .outbox import DeliveryResult, OutboxItem
+from .outbox import DeliveryResult, OutboxItem, OutboxStore
+
+log = logging.getLogger("room-watch")
 
 KNOWN_CHANNELS = ("wecom_bot", "wxpusher", "serverchan", "webhook")
 
@@ -130,7 +135,130 @@ class ChannelDispatcher:
         )
 
 
+class DeliveryWorker:
+    """从 outbox 领取并投递；文字/图片快道与视频慢道各一个实例。
+
+    SQLite 连接不能跨线程共享，所以 worker 在自己的线程里创建 OutboxStore；
+    `flush()` 是给 `guard --once` 用的同步路径，也在调用线程里临时开连接。
+    """
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        dispatcher: ChannelDispatcher,
+        *,
+        kinds: tuple = ("text", "image"),
+        poll_seconds: float = 2.0,
+        maintenance_seconds: float = 600.0,
+        lease_seconds: float = 120.0,
+        media_dir: str | Path = "var/outbox",
+        max_age_days: float = 7.0,
+        max_total_bytes: int = 2 * 1024 ** 3,
+        stop_event: Optional[threading.Event] = None,
+    ):
+        self.db_path = str(db_path)
+        self.dispatcher = dispatcher
+        self.kinds = tuple(kinds)
+        self.poll_seconds = max(0.2, float(poll_seconds))
+        self.maintenance_seconds = max(30.0, float(maintenance_seconds))
+        self.lease_seconds = max(5.0, float(lease_seconds))
+        self.media_dir = str(media_dir)
+        self.max_age_days = float(max_age_days)
+        self.max_total_bytes = int(max_total_bytes)
+        self._stop = stop_event or threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------ 生命周期
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        name = "delivery-" + "-".join(self.kinds or ("all",))
+        self._thread = threading.Thread(target=self.run, daemon=True, name=name)
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.1, timeout))
+
+    # ------------------------------------------------------------ 执行
+
+    def _open(self) -> OutboxStore:
+        return OutboxStore(self.db_path)
+
+    def run_once(self, store: Optional[OutboxStore] = None) -> bool:
+        """领取一条并投递。返回是否真的处理了一条。"""
+        own = store is None
+        store = store or self._open()
+        try:
+            item = store.claim_next(
+                lease_seconds=self.lease_seconds, kinds=self.kinds
+            )
+            if item is None:
+                return False
+            try:
+                result = self.dispatcher.deliver(item)
+            except Exception as exc:  # noqa: BLE001 - 单条失败不能杀死 worker
+                log.warning("投递异常（%s/%s）：%s", item.channel, item.kind, exc)
+                result = DeliveryResult(False, retryable=True, error=f"投递异常：{exc}")
+            store.record_channel_result(item.channel, result.ok, result.error)
+            if result.ok:
+                store.mark_delivered(item.id)
+            else:
+                status = store.mark_retry(
+                    item.id, error=result.error,
+                    retryable=result.retryable, jitter=0.1,
+                )
+                if status == "failed_permanent":
+                    log.error("投递永久失败（%s/%s）：%s",
+                              item.channel, item.kind, result.error)
+            return True
+        finally:
+            if own:
+                store.close()
+
+    def flush(self, max_items: int = 10) -> int:
+        """同步排空（最多 max_items 条），给 guard --once 用。"""
+        store = self._open()
+        done = 0
+        try:
+            while done < max(0, int(max_items)) and self.run_once(store):
+                done += 1
+        finally:
+            store.close()
+        return done
+
+    def run(self) -> None:
+        store = self._open()
+        last_maintenance = 0.0
+        try:
+            while not self._stop.is_set():
+                try:
+                    worked = self.run_once(store)
+                except Exception as exc:  # noqa: BLE001 - 数据库/线程异常不能让 worker 退出
+                    log.warning("outbox worker 本轮异常: %s", exc)
+                    worked = False
+                now = time.monotonic()
+                if now - last_maintenance >= self.maintenance_seconds:
+                    last_maintenance = now
+                    try:
+                        store.expire_and_prune(
+                            media_dir=self.media_dir,
+                            max_age_days=self.max_age_days,
+                            max_total_bytes=self.max_total_bytes,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("outbox 清理失败: %s", exc)
+                if not worked:
+                    self._stop.wait(self.poll_seconds)
+        finally:
+            store.close()
+
+
 __all__ = [
     "KNOWN_CHANNELS", "channel_list", "enabled_channels", "supports_image",
-    "supports_video", "build_items", "ChannelDispatcher",
+    "supports_video", "build_items", "ChannelDispatcher", "DeliveryWorker",
 ]

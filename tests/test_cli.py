@@ -16,6 +16,7 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,7 @@ class CommandTableTest(unittest.TestCase):
             "say", "say-raw", "ab", "volume-check", "volume-set", "storage",
             "gallery", "guard", "push", "push-video", "setup", "test", "doctor",
             "diag", "update", "version", "gui", "stop", "config", "autostart", "identity",
+            "heartbeat",
         }
         self.assertEqual(set(cli.COMMANDS), expected)
 
@@ -195,6 +197,42 @@ class StartStopSemanticsTest(unittest.TestCase):
 
     def test_command_table_includes_diag(self):
         self.assertIn("diag", cli.COMMANDS)
+
+
+class ConfigTestCommandTest(unittest.TestCase):
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"errcode": 0, "code": 1000}
+
+    def test_config_test_uses_all_enabled_channels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.yaml").write_text(
+                "notify:\n"
+                "  channels: [wecom_bot, wxpusher]\n"
+                "  wecom_bot:\n"
+                "    webhook: https://x.test/send?key=K\n"
+                "  wxpusher:\n"
+                "    app_token: AT_real\n"
+                "    uid: UID_real\n",
+                encoding="utf-8",
+            )
+            buffer = io.StringIO()
+            with mock.patch("roomwatch.notifier.requests.post",
+                            return_value=self.FakeResponse()) as post, \
+                    redirect_stdout(buffer):
+                rc = cli._config_test(root, json_mode=True)
+        payload = json.loads(buffer.getvalue().strip().splitlines()[-1])
+        self.assertEqual(rc, 0)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(
+            {name: item["ok"] for name, item in payload["channels"].items()},
+            {"wecom_bot": True, "wxpusher": True},
+        )
+        self.assertEqual(post.call_count, 2)
 
 
 if __name__ == "__main__":

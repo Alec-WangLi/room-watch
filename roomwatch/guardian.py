@@ -61,9 +61,12 @@ from typing import Optional
 
 from . import control
 from . import health
+from . import heartbeat as heartbeat_mod
 from . import logutil
 from . import procutil
 from .config import load_config as _merge_config
+from .delivery import ChannelDispatcher, DeliveryWorker, build_items
+from .outbox import OutboxStore
 from .paths import PROJECT_ROOT, resolve
 
 log = logging.getLogger("guardian")
@@ -365,6 +368,33 @@ class Guard:
 
         self.state = self._load_state()
 
+        # 关键通知与外部心跳。outbox 延迟到真正要发通知时再建，
+        # 这样 `guard --status` 和纯判定单测不会碰数据库。
+        self.notify_cfg = cfg.get("notify") or {}
+        self.heartbeat = heartbeat_mod.HeartbeatSender(
+            heartbeat_mod.load_heartbeat(cfg), self.state, self._save_state
+        )
+        outbox_cfg = cfg.get("outbox") or {}
+        event_db = Path(storage.get("database") or (self.root / "var" / "db" / "events.db"))
+        if not event_db.is_absolute():
+            event_db = self.root / event_db
+        outbox_db = Path(outbox_cfg.get("database") or (event_db.parent / "outbox.db"))
+        if not outbox_db.is_absolute():
+            outbox_db = self.root / outbox_db
+        media_dir = Path(outbox_cfg.get("media_dir") or (event_db.parent.parent / "outbox"))
+        if not media_dir.is_absolute():
+            media_dir = self.root / media_dir
+        self.outbox_db_path = str(outbox_db)
+        self.outbox_media = str(media_dir)
+        self.outbox_max_age_days = float(outbox_cfg.get("max_age_days", 7))
+        self.outbox_max_total_bytes = int(
+            float(outbox_cfg.get("max_total_mb", 2048)) * 1024 * 1024
+        )
+        self.outbox = None
+        self.dispatcher = None
+        self.delivery_fast = None
+        self.delivery_video = None
+
     # ---------- 状态 ----------
 
     def _load_state(self) -> dict:
@@ -388,6 +418,13 @@ class Guard:
             "last_gallery_alert_at": None,
             "last_gallery_spawn_at": None,
             "last_gallery_spawn_pid": None,
+            "last_heartbeat_at": None,
+            "last_heartbeat_ok": None,
+            "last_heartbeat_error": "",
+            "last_heartbeat_fail_at": None,
+            "last_heartbeat_start_at": None,
+            "heartbeat_fail_streak": 0,
+            "last_heartbeat_alert_at": None,
         }
         try:
             with open(self.state_path, "r", encoding="utf-8") as f:
@@ -681,18 +718,92 @@ class Guard:
         self._save_state()
         return action
 
-    def _notify(self, text: str) -> None:
+    def _ensure_outbox(self) -> OutboxStore:
+        if self.outbox is None:
+            self.outbox = OutboxStore(self.outbox_db_path)
+            self.dispatcher = ChannelDispatcher(self.notify_cfg, self.outbox_media)
+            self.delivery_fast = DeliveryWorker(
+                self.outbox_db_path,
+                self.dispatcher,
+                kinds=("text", "image"),
+                media_dir=self.outbox_media,
+                max_age_days=self.outbox_max_age_days,
+                max_total_bytes=self.outbox_max_total_bytes,
+            )
+            self.delivery_video = DeliveryWorker(
+                self.outbox_db_path,
+                self.dispatcher,
+                kinds=("video",),
+                poll_seconds=5.0,
+                media_dir=self.outbox_media,
+                max_age_days=self.outbox_max_age_days,
+                max_total_bytes=self.outbox_max_total_bytes,
+            )
+        return self.outbox
+
+    def _notify(self, text: str, severity: str = "critical") -> None:
+        try:
+            store = self._ensure_outbox()
+            items = build_items(
+                self.notify_cfg,
+                event_id=f"{severity}:{datetime.now().isoformat()}",
+                text=text,
+                severity=severity,
+            )
+            if not items:
+                log.info("没有启用的通知渠道，跳过：%s", text[:80])
+                return
+            if store.enqueue_many(items):
+                return
+            return
+        except Exception as exc:  # noqa: BLE001 - outbox 故障回退直发
+            log.warning("写入通知队列失败，回退直发：%s", exc)
+
         def send() -> None:
             try:
                 from .notifier import Notifier
 
-                ok = Notifier(self.cfg.get("notify") or {}).send(text)
+                ok = Notifier(self.notify_cfg).send(text)
                 if not ok:
                     log.warning("守护通知未送达：%s", text[:80])
             except Exception as exc:  # noqa: BLE001 - 通知失败不能拖累守护
                 log.warning("发送守护通知失败: %s", exc)
 
         threading.Thread(target=send, daemon=True, name="guardian-notify").start()
+
+    def _heartbeat(self, now: datetime, action: str) -> str:
+        """按本轮检查结果发外部心跳；反复失败时发一条 critical 告警。"""
+        if self.dry_run:
+            return "dry-run"
+        if action in (ACT_STARTED, ACT_WAIT):
+            # 刚拉起/还在观察，不能算「健康」，也不该立刻发失败心跳。
+            return "starting"
+        healthy = action == ACT_OK
+        if healthy and self.supervise_gallery:
+            gpid = self._gallery_pid()
+            healthy = decide_gallery(
+                gpid, pid_alive, cmdline=_psutil_cmdline
+            ) == ACT_OK
+        paused = action == ACT_PAUSED
+        outcome = self.heartbeat.maybe_send(
+            healthy=healthy, paused=paused, now=now
+        )
+
+        if (not healthy and not paused
+                and self.heartbeat.failure_streak >= 3):
+            last = self.state.get("last_heartbeat_alert_at")
+            should_alert = True
+            if last:
+                try:
+                    elapsed = (now - datetime.fromisoformat(str(last))).total_seconds()
+                    should_alert = elapsed >= self.crash_window_minutes * 60
+                except (TypeError, ValueError):
+                    pass
+            if should_alert:
+                self._notify("room-watch：外部心跳连续失败，整机可能已失联")
+                self.state["last_heartbeat_alert_at"] = now.isoformat(timespec="seconds")
+                self._save_state()
+        return outcome
 
     def _check_selfcheck(self, now: datetime) -> None:
         data = health.read_json(self.health_path)
@@ -896,11 +1007,21 @@ class Guard:
             log.info("已有 guardian 实例在运行，本实例退出")
             return
         try:
+            self._ensure_outbox()
+            self.delivery_fast.start()
+            self.delivery_video.start()
+        except Exception as exc:  # noqa: BLE001 - 通知层故障不能阻止守护
+            log.error("outbox 初始化失败，守护继续运行（通知将回退直发）：%s", exc)
+        self.heartbeat.note_start()
+        try:
             while True:
+                action = ""
+                checked = False
                 try:
                     with FileLock(self.lock_path) as got:
                         if got:
-                            self.check_once()
+                            checked = True
+                            action = self.check_once()
                         else:
                             log.debug("另一个守护实例正在检查，跳过本轮")
                 except KeyboardInterrupt:
@@ -908,8 +1029,17 @@ class Guard:
                     return
                 except Exception as exc:  # noqa: BLE001 - 守护者自己绝不能崩
                     log.error("检查轮次异常（已吞掉，继续看守）: %s", exc)
+                if checked:
+                    try:
+                        self._heartbeat(datetime.now(), action)
+                    except Exception as exc:  # noqa: BLE001 - 心跳不能拖垮守护
+                        log.warning("外部心跳异常: %s", exc)
                 time.sleep(self.check_seconds)
         finally:
+            if self.delivery_fast is not None:
+                self.delivery_fast.stop()
+            if self.delivery_video is not None:
+                self.delivery_video.stop()
             owner.release()
 
 
@@ -992,6 +1122,12 @@ def main(argv: list[str] | None = None) -> None:
                 return
             action = guard.check_once()
         log.info("单次检查完成：%s", action)
+        try:
+            guard._heartbeat(datetime.now(), action)
+            guard._ensure_outbox()
+            guard.delivery_fast.flush(5)
+        except Exception as exc:  # noqa: BLE001 - 单次模式也要尽量退出干净
+            log.warning("单次模式投递/心跳失败: %s", exc)
         return
 
     guard.run_forever()

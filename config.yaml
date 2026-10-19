@@ -183,6 +183,20 @@ heartbeat:
   interval_minutes: 30      # 每 30 分钟推一条「监控在线」。0 表示关闭
   stale_after_seconds: 120  # 超过 120 秒没读到画面，状态页就显示「已停止」
 
+monitor:
+  # 外部心跳（死手开关）：整机断电/断网/guardian 也死掉时，进程内通知发不出去，
+  # 只能由外部服务发现「心跳停了」。
+  # healthchecks.io 示例：
+  #   成功 https://hc-ping.com/<uuid>
+  #   失败 https://hc-ping.com/<uuid>/fail        （可选）
+  #   启动 https://hc-ping.com/<uuid>/start       （可选）
+  # 留空 = 不启用；URL 里可能含 token，按凭据处理。
+  heartbeat_url: ""
+  heartbeat_fail_url: ""
+  heartbeat_start_url: ""
+  heartbeat_interval_seconds: 300
+  heartbeat_timeout_seconds: 10
+
 storage:
   database: var/db/events.db   # SQLite 事件日志
   status: var/state/status.json   # 运行状态快照，给 rw status 和相册页读取
@@ -195,6 +209,13 @@ storage:
   min_free_gb: 3          # 磁盘剩余低于这个值，就额外逼近清理到上限的一半
   check_minutes: 10       # 多久检查一次容量
   protect_seconds: 300    # 最近 5 分钟内写过的文件不删（可能正在录）
+
+outbox:
+  # 持久化发件箱：通知先落盘，断网/重启后继续投递。
+  database: var/db/outbox.db
+  media_dir: var/outbox          # 压缩后的视频临时文件；投递成功即删
+  max_age_days: 7                # 超过 7 天的待投递项作废
+  max_total_mb: 2048             # 媒体临时文件总上限；超了先淘汰旧视频，不淘汰文字
 
 guardian:
   # 外部守护进程（guardian.py）：负责 watcher 进程死掉/卡死后把它拉起来。
@@ -231,6 +252,11 @@ notify:
   channel: wecom_bot
   title: 房间有人进入
 
+  # 多渠道扇出：列表里的渠道都会收到同一条告警。
+  # null（默认）= 回退上面的 channel；空列表 [] = 明确禁用全部（界面会警告）。
+  # 可选：wecom_bot / wxpusher / serverchan / webhook
+  channels: null
+
   # —— 渠道一：WxPusher（微信）——
   # 1. 微信搜「WxPusher」公众号，或去 wxpusher.zjiecode.com 扫码登录
   # 2. 创建一个应用，拿到 appToken（AT_ 开头）
@@ -256,6 +282,14 @@ notify:
       width: 854            # 压缩后的宽度，高度按比例（480p）
       fps: 12
       audio: true
+
+  # —— 渠道四：通用 webhook（ntfy / Gotify / Bark / 自建服务）——
+  # JSON POST：event/kind/severity/time/text/owner/has_image/image_base64。
+  # 图片只在小于 max_image_mb 时内联 base64，避免把大图塞进请求体。
+  webhook:
+    url: ""
+    timeout_seconds: 10
+    max_image_mb: 1
 
 gallery:
   # 本地相册。默认只绑本机，手机看不到——要手机访问就把 host 改成 0.0.0.0，

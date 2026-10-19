@@ -20,7 +20,7 @@ from typing import Optional
 
 
 # 页签顺序。必须与 settings.sections() 一致（tests/test_settings.py 钉住）。
-SECTIONS = ("摄像头", "推送", "相册", "身份", "自启", "声音")
+SECTIONS = ("摄像头", "推送", "相册", "身份", "心跳", "自启", "声音")
 
 
 class SettingsDialog:
@@ -32,6 +32,7 @@ class SettingsDialog:
         self.ttk = app.ttk
         self.labels: dict = {}
         self.vars: dict = {}
+        self.multi_vars: dict = {}
         self.secret_labels: dict = {}
         self._built = False       # 控件是否已按快照建出来（只建一次）
         self._populated = False   # 是否至少成功读过一次配置
@@ -39,8 +40,8 @@ class SettingsDialog:
 
         self.win = self.tk.Toplevel(app.win)
         self.win.title("设置 · 房间监控")
-        self.win.geometry("800x660")
-        self.win.minsize(720, 580)
+        self.win.geometry("800x700")
+        self.win.minsize(720, 620)
         self.win.transient(app.win)
 
         self.notebook = self.ttk.Notebook(self.win)
@@ -48,6 +49,7 @@ class SettingsDialog:
 
         self.tab_frames: dict = {}
         self.rows_holder: dict = {}
+        self.actions_holder: dict = {}
         for name in SECTIONS:
             frame = self.ttk.Frame(self.notebook, padding=10)
             self.notebook.add(frame, text=name)
@@ -55,15 +57,39 @@ class SettingsDialog:
             # 先把底部按钮占好位，再让内容区吃掉剩余空间；顺序反了按钮会被挤到看不见
             actions = self.ttk.Frame(frame)
             actions.pack(side="bottom", fill="x", pady=(10, 0))
-            holder = self.ttk.Frame(frame)
-            holder.pack(fill="both", expand=True)
+            self.actions_holder[name] = actions
+            if name == "推送":
+                # 推送页字段多，内容区可滚动，避免把底部按钮挤出窗口。
+                canvas = self.tk.Canvas(frame, highlightthickness=0, borderwidth=0,
+                                        width=720, height=380)
+                scroll = self.ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+                holder = self.ttk.Frame(canvas)
+                window_id = canvas.create_window((0, 0), window=holder, anchor="nw",
+                                                 width=700)
+                holder.bind(
+                    "<Configure>",
+                    lambda _e, c=canvas: c.configure(scrollregion=c.bbox("all")),
+                )
+                canvas.bind(
+                    "<Configure>",
+                    lambda e, c=canvas, w=window_id: c.itemconfigure(w, width=e.width),
+                )
+                canvas.configure(yscrollcommand=scroll.set)
+                canvas.pack(side="left", fill="both", expand=True)
+                scroll.pack(side="right", fill="y")
+                self._push_canvas = canvas
+                canvas.bind_all("<MouseWheel>", self._on_push_wheel)
+            else:
+                holder = self.ttk.Frame(frame)
+                holder.pack(fill="both", expand=True)
             self.rows_holder[name] = holder
 
         self._build_camera_block(self.rows_holder["摄像头"])
         self._build_gallery_block(self.rows_holder["相册"])
+        self._build_heartbeat_block(self.rows_holder["心跳"])
         self._build_identity_block(self.rows_holder["身份"])
         self._build_autostart_block(self.rows_holder["自启"])
-        self._build_push_actions(self.tab_frames["推送"])
+        self._build_push_actions(self.actions_holder["推送"], self.rows_holder["推送"])
 
         footer = self.ttk.Frame(self.win)
         footer.pack(fill="x", padx=12, pady=(0, 12))
@@ -83,6 +109,13 @@ class SettingsDialog:
             self.status_label.configure(text="（自检模式：未读取配置）")
 
     # ---------------- 特殊区块 ----------------
+
+    def _on_push_wheel(self, event) -> None:
+        try:
+            if self.notebook.index("current") == SECTIONS.index("推送"):
+                self._push_canvas.yview_scroll(int(-event.delta / 120), "units")
+        except Exception:  # noqa: BLE001 - 窗口已关闭/事件来自别的控件
+            pass
 
     def _build_identity_block(self, parent) -> None:
         box = self.ttk.LabelFrame(parent, text="本人身份", padding=8)
@@ -122,12 +155,104 @@ class SettingsDialog:
         self.ttk.Label(box, text="开机自启拉起的是守护进程：监控意外退出时它会重新拉起。",
                        font=self.app.font_small, foreground="#888").pack(fill="x", pady=(6, 0))
 
-    def _build_push_actions(self, parent) -> None:
+    def _build_push_actions(self, parent, holder) -> None:
         bar = self.ttk.Frame(parent)
         bar.pack(side="bottom", fill="x", pady=(6, 0))
         self.ttk.Button(bar, text="发送测试消息", command=self.on_test_push).pack(side="left")
         self.ttk.Label(bar, text="会先保存当前页面，再发一条测试消息",
                        font=self.app.font_small, foreground="#888").pack(side="left", padx=8)
+        # 渠道状态放在内容顶部：页面字段多，放底部会被挤到看不见。
+        self.channel_warning = self.tk.Label(
+            holder, text="", anchor="w", justify="left", wraplength=700,
+            font=self.app.font_small, fg="#993C1D",
+        )
+        self.channel_warning.pack(side="top", fill="x", pady=(0, 6))
+
+    def _build_heartbeat_block(self, parent) -> None:
+        box = self.ttk.LabelFrame(parent, text="死手开关状态", padding=8)
+        box.pack(fill="x", pady=(0, 8))
+        self.heartbeat_label = self.tk.Label(
+            box, text="读取中…", anchor="w", justify="left", wraplength=700,
+            font=self.app.font_small, fg="#666",
+        )
+        self.heartbeat_label.pack(fill="x")
+        bar = self.ttk.Frame(box)
+        bar.pack(fill="x", pady=(6, 0))
+        self.ttk.Button(bar, text="测试心跳", command=self.on_test_heartbeat).pack(side="left")
+        self.ttk.Label(box, text="心跳只发送存活信息，不包含画面、人脸或配置；测试使用已保存的 URL。",
+                       font=self.app.font_small, foreground="#888").pack(fill="x", pady=(6, 0))
+
+    def _show_heartbeat(self, info: dict) -> None:
+        if not info.get("configured"):
+            self.heartbeat_label.configure(
+                text="未配置外部心跳：整机断电/断网时无法通知。\n"
+                     "填好「心跳成功 URL」并保存后，外部服务发现心跳消失会提醒你。",
+                fg="#993C1D")
+            return
+        if info.get("last_at"):
+            ok = bool(info.get("last_ok"))
+            text = (f"已配置 · 最近一次 {info.get('last_at')} · "
+                    + ("成功" if ok else "失败"))
+            if info.get("last_error"):
+                text += "\n" + str(info["last_error"])
+            self.heartbeat_label.configure(text=text, fg="#0F6E56" if ok else "#993C1D")
+            return
+        self.heartbeat_label.configure(
+            text="已配置，尚未发送过心跳（守护进程启动后会按间隔发送）。",
+            fg="#8A5A00")
+
+    def _show_channel_warning(self, channels: list, outbox: dict,
+                              issues: Optional[dict] = None) -> None:
+        issues = issues or {}
+        if not channels:
+            text = "告警不会送达：没有启用任何通知渠道。"
+            color = "#993C1D"
+        elif issues:
+            text = ("有渠道未配置完整，告警可能发不出去："
+                    + "；".join(f"{name}（{msg}）" for name, msg in issues.items()))
+            color = "#993C1D"
+        elif len(channels) == 1:
+            text = (f"当前只启用一个渠道（{channels[0]}）；建议至少两个，"
+                    "渠道失效时才不会安静地失联。")
+            color = "#8A5A00"
+        else:
+            text = f"已启用 {len(channels)} 个渠道：" + "、".join(channels)
+            color = "#0F6E56"
+
+        pending = int(outbox.get("pending") or 0)
+        if pending:
+            text += f" · 待发送 {pending} 条"
+        health = outbox.get("channels") or {}
+        details = []
+        for name in channels:
+            info = health.get(name) or {}
+            if info.get("last_ok_at"):
+                details.append(f"{name} 最近成功 {info['last_ok_at']}")
+            elif info.get("last_error"):
+                details.append(f"{name} 最近失败 {info.get('last_error_at') or ''}")
+        if details:
+            text += "\n" + "；".join(details[:4])
+        self.channel_warning.configure(text=text, fg=color)
+
+    def on_test_heartbeat(self) -> None:
+        if self._saving:
+            return
+        self.status_label.configure(text="测试心跳…", fg="#666")
+
+        def work() -> dict:
+            return self.app._run_cli(["heartbeat", "--test", "--json"], timeout=30)
+
+        self.app._run_task(work, self._on_test_heartbeat)
+
+    def _on_test_heartbeat(self, result: dict) -> None:
+        if result.get("ok"):
+            self.status_label.configure(text="心跳成功", fg="#0F6E56")
+            self.app.messagebox.showinfo("心跳成功", "外部心跳 URL 已返回 2xx。")
+        else:
+            message = str(result.get("message") or result.get("error") or "未知原因")
+            self.status_label.configure(text="心跳失败", fg="#993C1D")
+            self.app.messagebox.showerror("心跳失败", message)
+        self.reload()
 
     def _build_camera_block(self, parent) -> None:
         box = self.ttk.LabelFrame(parent, text="验证", padding=8)
@@ -204,6 +329,10 @@ class SettingsDialog:
         self.labels = data["labels"]
         self._fill_rows(data.get("values") or {}, data.get("secrets") or {})
         self._show_gallery_info(data.get("gallery") or {})
+        self._show_heartbeat(data.get("heartbeat") or {})
+        self._show_channel_warning(
+            data.get("channels") or [], data.get("outbox") or {},
+            data.get("channel_issues") or {})
         self.status_label.configure(text="已读取。改完点「保存」，重启监控后生效。", fg="#666")
 
     def _fill_rows(self, values: dict, secrets: dict) -> None:
@@ -232,6 +361,18 @@ class SettingsDialog:
 
         for key, label in self.secret_labels.items():
             label.configure(text=self._secret_text(secrets.get(key) or {}))
+        for key, boxes in self.multi_vars.items():
+            raw = values.get(key)
+            if isinstance(raw, (list, tuple)):
+                selected = {str(item).strip().lower() for item in raw}
+            else:
+                selected = {
+                    item.strip().lower()
+                    for item in str(raw or "").replace(";", ",").split(",")
+                    if item.strip()
+                }
+            for name, var in boxes.items():
+                var.set(name in selected)
         self._populated = True
 
     def _secret_text(self, info: dict) -> str:
@@ -250,6 +391,16 @@ class SettingsDialog:
             var = tk.BooleanVar(value=bool(value))
             ttk.Checkbutton(row, variable=var).pack(side="left")
             self.vars[key] = var
+        elif kind == "multi":
+            frame = ttk.Frame(row)
+            frame.pack(side="left", fill="x", expand=True)
+            boxes = {}
+            for choice in meta.get("choices") or ():
+                var = tk.BooleanVar(value=False)
+                ttk.Checkbutton(frame, text=str(choice), variable=var).pack(
+                    side="left", padx=(0, 10))
+                boxes[str(choice)] = var
+            self.multi_vars[key] = boxes
         elif kind == "choice":
             var = tk.StringVar(value=str(value or ""))
             ttk.Combobox(row, textvariable=var, values=list(meta.get("choices") or ()),
@@ -292,6 +443,9 @@ class SettingsDialog:
             if not text and meta.get("kind") in ("int", "float", "choice"):
                 continue      # 空值不提交：老配置缺这个键时不该因此存不进去
             changes[key] = text
+        for key, boxes in self.multi_vars.items():
+            chosen = [name for name, var in boxes.items() if bool(var.get())]
+            changes[key] = ",".join(chosen)
         return changes
 
     def _save_args(self) -> list[str]:
@@ -574,6 +728,10 @@ class SettingsDialog:
     # ---------------- 关闭 ----------------
 
     def close(self) -> None:
+        try:
+            self.win.unbind_all("<MouseWheel>")
+        except Exception:  # noqa: BLE001 - 已销毁
+            pass
         try:
             self.win.destroy()
         except Exception:  # noqa: BLE001 - 已销毁

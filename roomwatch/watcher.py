@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import yaml
@@ -61,12 +62,12 @@ from .audio_recorder import AudioRecorder, pre_roll_delay_ms
 from .detector import FaceFinder
 from .gate import MotionGate
 from .onnx_detector import build_detector
+from .delivery import ChannelDispatcher, DeliveryWorker, build_items, enabled_channels
 from .identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker, save_owner_photo
 from .labels import identity_text
-from .notifier import Notifier
+from .outbox import OutboxStore
 from .recorder import Recorder, video_path_for
 from .speaker import Speaker
-from .videopush import VideoPusher
 
 log = logging.getLogger("room-watch")
 
@@ -267,10 +268,33 @@ class Watcher:
         # 只在「好→坏」和「坏→好」时各记一条，避免每秒刷屏。
         self._status_write_failed = False
         self._health_write_failed = False
-        self.store = EventStore(storage.get("database") or resolve("var/db/events.db"))
-        self.notifier = Notifier(cfg.get("notify") or {})
-        # 录像推送：转码+上传要几十秒，走后台队列，不在主循环里等
-        self.video_pusher = VideoPusher(cfg.get("notify") or {}, resolve("var/cache/push"))
+        event_db = Path(storage.get("database") or resolve("var/db/events.db"))
+        self.store = EventStore(str(event_db))
+        self.notify_cfg = cfg.get("notify") or {}
+        outbox_cfg = cfg.get("outbox") or {}
+        outbox_db = Path(outbox_cfg.get("database") or (event_db.parent / "outbox.db"))
+        if not outbox_db.is_absolute():
+            outbox_db = Path(resolve(str(outbox_db)))
+        self.outbox_path = str(outbox_db)
+        media_dir = Path(outbox_cfg.get("media_dir") or (event_db.parent.parent / "outbox"))
+        if not media_dir.is_absolute():
+            media_dir = Path(resolve(str(media_dir)))
+        self.outbox_media = str(media_dir)
+        self.outbox = OutboxStore(self.outbox_path)
+        self.dispatcher = ChannelDispatcher(self.notify_cfg, self.outbox_media)
+        max_age_days = float(outbox_cfg.get("max_age_days", 7))
+        max_total_bytes = int(float(outbox_cfg.get("max_total_mb", 2048)) * 1024 * 1024)
+        common = dict(
+            media_dir=self.outbox_media,
+            max_age_days=max_age_days,
+            max_total_bytes=max_total_bytes,
+        )
+        self.delivery_fast = DeliveryWorker(
+            self.outbox_path, self.dispatcher, kinds=("text", "image"), **common)
+        # 视频转码/上传可能几十秒，单独一条慢道，不能挡住文字告警。
+        self.delivery_video = DeliveryWorker(
+            self.outbox_path, self.dispatcher, kinds=("video",),
+            poll_seconds=5.0, **common)
 
         # 容量上限：keep_days 管不住「一天之内写满盘」，所以再加一道体积闸门
         self.max_total_bytes = int(float(storage.get("max_total_gb", 20)) * (1024 ** 3))
@@ -380,6 +404,16 @@ class Watcher:
             return False
         return idle_seconds_windows() < self.idle_threshold
 
+    def enqueue_notification(self, items: list[dict]) -> int:
+        """把一批通知写进 outbox。数据库故障只降级为「本次没入队」，不拖垮监控。"""
+        if not items:
+            return 0
+        try:
+            return self.outbox.enqueue_many(items)
+        except Exception as exc:  # noqa: BLE001 - 通知层故障不能影响采集
+            log.warning("写入通知队列失败: %s", exc)
+            return 0
+
     def notify_allowed(self) -> bool:
         """图片和视频共用同一道闸门：dry-run 不发，本人坐在电脑前不发。"""
         if self.dry_run:
@@ -464,12 +498,19 @@ class Watcher:
             raise IOError(f"写图失败: {path}")
         return path
 
+    def _outbox_stats(self) -> dict:
+        try:
+            return self.outbox.stats()
+        except Exception:  # noqa: BLE001 - 状态展示不能影响主循环
+            return {}
+
     def write_status(self, camera_ok: bool = True) -> None:
         """把「我还在跑」写成一个文件，供 gallery 的 /status 读取。
 
         这是回答「监控还在线吗」最直接的依据：看 last_frame_at 距现在多久。
         """
         now = datetime.now()
+        outbox_stats = self._outbox_stats()
         payload = {
             "pid": os.getpid(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
@@ -491,6 +532,9 @@ class Watcher:
             "events_today": self.events_today,
             "recording": self.recorder.recording,
             "dry_run": self.dry_run,
+            "pending_outbox": outbox_stats.get("pending", 0),
+            "last_push_success_at": outbox_stats.get("last_success_at"),
+            "notify_channels": len(enabled_channels(getattr(self, "notify_cfg", {}))),
         }
         try:
             health.write_json_atomic(self.status_path, payload)
@@ -505,9 +549,13 @@ class Watcher:
     def write_health(self) -> None:
         """每秒写一次的健康快照，供 guardian / 界面 / 诊断包读取。"""
         recorder = getattr(self, "recorder", None)
+        outbox_stats = self._outbox_stats()
         extra = {
             "recording": bool(getattr(recorder, "recording", False)),
             "camera_ok": bool(getattr(self, "camera_ok", True)),
+            "pending_outbox": outbox_stats.get("pending", 0),
+            "last_push_success_at": outbox_stats.get("last_success_at"),
+            "notify_channels": len(enabled_channels(getattr(self, "notify_cfg", {}))),
         }
         try:
             extra["desired_state"] = control.read_desired_state(self.root)
@@ -687,7 +735,7 @@ class Watcher:
             self.push_video(video)
 
     def push_video(self, video_path: str) -> None:
-        """把一段收尾好的录像交给后台队列推送。"""
+        """把一段收尾好的录像写进 outbox 的视频慢道。"""
         if not video_path or not os.path.exists(video_path):
             return
         if not self.notify_allowed():
@@ -695,7 +743,17 @@ class Watcher:
         when = self.last_event_at
         stamp = when.strftime("%H:%M:%S") if when else os.path.basename(video_path)[:6]
         mb = os.path.getsize(video_path) / 1048576
-        self.video_pusher.submit(video_path, f"{stamp} 房间录像（{mb:.1f} MB，已压缩）")
+        event_id = when.isoformat() if when else datetime.now().isoformat()
+        items = build_items(
+            self.notify_cfg,
+            event_id=event_id,
+            text=f"{stamp} 房间录像（{mb:.1f} MB，已压缩）",
+            video_path=video_path,
+            severity="event",
+            owner=self.last_identity_label,
+        )
+        # text/image 已经由 fire_event 入队；这里只补视频，避免重复文字。
+        self.enqueue_notification([item for item in items if item["kind"] == "video"])
 
     def pump_recording(self, frame, dets: list, now: datetime) -> None:
         """每帧一次：喂帧 + 判断该不该收尾。"""
@@ -777,12 +835,12 @@ class Watcher:
         """定时报平安。收不到心跳，就说明它挂了。"""
         if not should_heartbeat(now, self.last_heartbeat_at, self.heartbeat_minutes):
             return
-        self.last_heartbeat_at = now
 
         if self.dry_run:
             log.info("[心跳-仅日志] 监控在线 %s，今日抓拍 %d 次",
                      humanize_duration((now - self.started_at).total_seconds()),
                      self.events_today)
+            self.last_heartbeat_at = now
             return
 
         text = (
@@ -790,11 +848,16 @@ class Watcher:
             f"今日抓拍 {self.events_today} 次 · 最后画面 "
             f"{self.last_frame_at.strftime('%H:%M:%S') if self.last_frame_at else '未知'}"
         )
-        # 注意 send() 的第二个参数是图片字节，不是副标题。
-        # 曾误写成 send("监控在线", text)，正文被当图片做 base64，抛
-        # "a bytes-like object is required" 而整条推送失败（wxpusher 时更隐蔽：
-        # 只取第一个参数，于是永远只发出去「监控在线」四个字）。
-        self.notifier.send(text)
+        # 走 outbox：断网时这条报平安也应该补发，而不是直接消失。
+        items = build_items(
+            self.notify_cfg,
+            event_id=f"digest:{now.date().isoformat()}",
+            text=text,
+            severity="digest",
+        )
+        if not items or self.enqueue_notification(items):
+            # 没有渠道也算处理过，避免每个循环重复尝试；入队失败则保持到期，下轮重试。
+            self.last_heartbeat_at = now
 
     def fire_event(self, frame, dets: list, when: datetime) -> None:
         conf = max((d.conf for d in dets), default=0.0)
@@ -811,8 +874,14 @@ class Watcher:
                     f"（{identity_text(self.last_identity_label)}）\n存档: {path}")
             if self.current_video:
                 text += f"\n录像: {self.current_video}"
-            with open(path, "rb") as f:
-                notified = self.notifier.send(text, image_bytes=f.read())
+            notified = self.enqueue_notification(build_items(
+                self.notify_cfg,
+                event_id=when.isoformat(),
+                text=text,
+                image_path=path,
+                severity="event",
+                owner=self.last_identity_label,
+            )) > 0
 
         self.store.add(when, path, conf, notified, video=self.current_video,
                        identity=self.last_identity_label)
@@ -842,6 +911,8 @@ class Watcher:
         threading.Thread(
             target=self._watchdog, daemon=True, name="health-watchdog"
         ).start()
+        self.delivery_fast.start()
+        self.delivery_video.start()
         self.write_health()
         interval = 1.0 / max(1, self.fps)
         last_status_write = 0.0
@@ -1037,6 +1108,8 @@ class Watcher:
             raise
         finally:
             self._watchdog_stop.set()
+            self.delivery_fast.stop()
+            self.delivery_video.stop()
             self._record_exit(self._exit_code(), self.exit_reason)
             logutil.event(log, "watcher_exit",
                           code=self._exit_code(), reason=self.exit_reason)
@@ -1057,6 +1130,10 @@ class Watcher:
             restored = self.volume_guard.restore()
             if restored:
                 log.info("系统音量：%s", restored)
+            try:
+                self.outbox.close()
+            except Exception:  # noqa: BLE001 - 退出路径上不抛
+                pass
 
     def probe(self) -> None:
         """打开摄像头拍一张 preview.jpg，用来确认画面角度对不对。
