@@ -55,12 +55,27 @@ def _iso(value) -> Optional[str]:
     return str(value)
 
 
+_PROCESS = None
+_PROCESS_PID: Optional[int] = None
+
+
+def _process():
+    """复用同一个 psutil.Process；否则 cpu_percent 每次都从基线开始，永远是 0。"""
+    global _PROCESS, _PROCESS_PID
+    import psutil
+
+    pid = os.getpid()
+    if _PROCESS is None or _PROCESS_PID != pid:
+        _PROCESS = psutil.Process(pid)
+        _PROCESS_PID = pid
+        _PROCESS.cpu_percent(interval=None)  # 建立基线
+    return _PROCESS
+
+
 def proc_stats() -> tuple[Optional[float], Optional[float]]:
     """当前进程的 RSS(MB) 与 CPU 百分比；拿不到就返回 (None, None)。"""
     try:
-        import psutil
-
-        proc = psutil.Process(os.getpid())
+        proc = _process()
         rss_mb = proc.memory_info().rss / (1024 * 1024)
         cpu_pct = proc.cpu_percent(interval=None)
         return round(float(rss_mb), 1), round(float(cpu_pct), 1)

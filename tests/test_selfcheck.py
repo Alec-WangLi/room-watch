@@ -64,6 +64,18 @@ class SelfcheckTest(unittest.TestCase):
             model = next(r for r in results if r.name == "模型")
             self.assertTrue(model.ok, model.detail)
 
+    def test_missing_pt_is_ok_when_onnx_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            onnx = root / "models" / "y.onnx"
+            onnx.parent.mkdir(parents=True)
+            onnx.write_bytes(b"x")
+            cfg = {"detector": {"model": "missing.pt",
+                                "onnx_model": str(onnx)}}
+            results = selfcheck.run(cfg, root)
+            model = next(r for r in results if r.name == "模型")
+            self.assertTrue(model.ok, model.detail)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

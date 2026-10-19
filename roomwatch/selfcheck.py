@@ -35,12 +35,21 @@ def _check_models(cfg: dict, root: str | Path) -> CheckResult:
 
     checked: list[Path] = []
     missing: list[str] = []
-    for key in ("model", "onnx_model"):
-        path = _resolve(root, detector.get(key))
-        if path:
-            checked.append(path)
-            if not path.is_file():
-                missing.append(str(path))
+
+    onnx = _resolve(root, detector.get("onnx_model"))
+    model = _resolve(root, detector.get("model"))
+    onnx_ok = bool(onnx and onnx.is_file())
+    model_ok = bool(model and model.is_file())
+    if onnx:
+        checked.append(onnx)
+    if model:
+        checked.append(model)
+    # ONNX 是首选；它缺失时 .pt 仍可作为 torch 兜底。只有两者都不可用才算失败。
+    if onnx and not onnx_ok and not model_ok:
+        missing.append(str(onnx))
+    if not onnx and model and not model_ok:
+        missing.append(str(model))
+
     face_path = _resolve(root, face.get("model"))
     if face_path:
         checked.append(face_path)
@@ -53,6 +62,8 @@ def _check_models(cfg: dict, root: str | Path) -> CheckResult:
     if missing:
         return CheckResult("模型", False, "缺少：" + "、".join(missing))
     detail = f"{len(checked)} 个模型文件齐全" if checked else "未配置模型路径"
+    if onnx and not onnx_ok and model_ok:
+        detail += "；ONNX 缺失，将用 torch 兜底"
     if owner_note:
         detail += "；" + owner_note
     return CheckResult("模型", True, detail)

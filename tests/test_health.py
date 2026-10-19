@@ -180,6 +180,16 @@ class WatcherHealthTest(unittest.TestCase):
             self.assertIn("rss_mb", data)
 
 
+class ProcessStatsTest(unittest.TestCase):
+    def test_process_handle_is_reused(self):
+        self.assertIs(health._process(), health._process())
+
+    def test_proc_stats_returns_numbers(self):
+        rss, cpu = health.proc_stats()
+        self.assertIsNotNone(rss)
+        self.assertIsNotNone(cpu)
+
+
 class WatcherExitRecordTest(unittest.TestCase):
     def test_record_exit_prefers_diagnostics(self):
         from roomwatch.watcher import Watcher

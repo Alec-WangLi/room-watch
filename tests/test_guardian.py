@@ -311,6 +311,28 @@ class GuardPausedTest(unittest.TestCase):
                 sw.assert_not_called()
                 sg.assert_not_called()
 
+    def test_pause_notifies_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = {"guardian": {
+                       "desired_state": str(root / "var/state/desired_state.json"),
+                       "state": str(root / "var/state/guardian_state.json"),
+                       "lock": str(root / "var/state/guardian.lock"),
+                       "history": str(root / "var/state/h.jsonl"),
+                       "supervise_gallery": False},
+                   "health": {"exit_record": str(root / "var/state/last_exit.json")},
+                   "storage": {"status": str(root / "var/state/status.json")},
+                   "__config_path__": str(root / "config.yaml")}
+            control.set_desired_state(root, "paused")
+            g = G.Guard(cfg, dry_run=True)
+            sent = []
+            g._notify = lambda text: sent.append(text)
+            self.assertEqual(g.check_once(), G.ACT_PAUSED)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("暂停", sent[0])
+            g.check_once()
+            self.assertEqual(len(sent), 1)
+
 
 class GuardRecoveryTest(unittest.TestCase):
     def _cfg(self, root):
@@ -407,12 +429,202 @@ class GuardSupervisionTest(unittest.TestCase):
                         dry_run=True)
             g._start_watcher = lambda: 123
             g.state["restart_times"] = [
-                (datetime.now() - timedelta(minutes=1)).isoformat(timespec="seconds")
+                (datetime.now() - timedelta(minutes=2)).isoformat(timespec="seconds")
             ]
             sent = []
             g._notify = lambda text: sent.append(text)
             self.assertEqual(g.check_once(), G.ACT_RESTART_GONE)
             self.assertTrue(any("重启" in text for text in sent))
+
+
+class WatcherStartTest(unittest.TestCase):
+    def _cfg(self, root):
+        return {"guardian": {
+                    "desired_state": str(root / "var/state/desired_state.json"),
+                    "state": str(root / "var/state/guardian_state.json"),
+                    "lock": str(root / "var/state/guardian.lock"),
+                    "history": str(root / "var/state/h.jsonl"),
+                    "supervise_gallery": False},
+                "health": {"path": str(root / "var/state/health.json"),
+                           "exit_record": str(root / "var/state/last_exit.json")},
+                "storage": {"status": str(root / "var/state/status.json")},
+                "__config_path__": str(root / "config.yaml")}
+
+    def test_watcher_command_is_foreground(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g = G.Guard(self._cfg(Path(tmp)), dry_run=True)
+            cmd = g._watcher_cmd()
+        self.assertIn("start", cmd)
+        self.assertIn("--foreground", cmd)
+        self.assertIn("roomwatch", cmd)
+
+    def test_first_run_starts_watcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g._start_watcher = lambda: 123
+            self.assertEqual(g.check_once(), G.ACT_STARTED)
+            self.assertEqual(g.state["last_spawn_pid"], 123)
+
+    def test_recent_spawn_is_not_duplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g.state["last_spawn_pid"] = os.getpid()
+            g.state["last_spawn_at"] = datetime.now().isoformat(timespec="seconds")
+            calls = []
+            g._start_watcher = lambda: calls.append(True) or 123
+            self.assertEqual(g.check_once(), G.ACT_WAIT)
+            self.assertEqual(calls, [])
+
+
+class ConfigMergeTest(unittest.TestCase):
+    def test_load_config_merges_local(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main = root / "config.yaml"
+            main.write_text("notify:\n  channel: none\n", encoding="utf-8")
+            (root / "config.local.yaml").write_text(
+                "notify:\n  channel: wxpusher\n  wxpusher:\n"
+                "    app_token: AT_REAL\n    uid: UID_REAL\n",
+                encoding="utf-8",
+            )
+            cfg = G.load_config(str(main))
+        self.assertEqual(cfg["notify"]["channel"], "wxpusher")
+        self.assertEqual(cfg["notify"]["wxpusher"]["app_token"], "AT_REAL")
+
+
+class ExitAttributionTest(unittest.TestCase):
+    def _cfg(self, root):
+        return {"guardian": {
+                    "desired_state": str(root / "var/state/desired_state.json"),
+                    "state": str(root / "var/state/guardian_state.json"),
+                    "lock": str(root / "var/state/guardian.lock"),
+                    "history": str(root / "var/state/h.jsonl"),
+                    "supervise_gallery": False},
+                "health": {"path": str(root / "var/state/health.json"),
+                           "exit_record": str(root / "var/state/last_exit.json")},
+                "storage": {"status": str(root / "var/state/status.json")},
+                "__config_path__": str(root / "config.yaml")}
+
+    def test_stale_exit_record_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": 999_999_998,
+                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+            (root / "var/state/last_exit.json").write_text(json.dumps({
+                "pid": 999_999_999, "code": 0, "reason": "normal"}),
+                encoding="utf-8")
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g._start_watcher = lambda: 123
+            g.check_once()
+            rows = G.read_history(root / "var/state/h.jsonl")
+        self.assertEqual(rows[-1]["exit_reason"], "unknown")
+
+    def test_matching_exit_record_is_trusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": 999_999_998,
+                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+            (root / "var/state/last_exit.json").write_text(json.dumps({
+                "pid": 999_999_998, "code": 5, "reason": "unhandled"}),
+                encoding="utf-8")
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g._start_watcher = lambda: 123
+            g.check_once()
+            rows = G.read_history(root / "var/state/h.jsonl")
+        self.assertEqual(rows[-1]["exit_reason"], "unhandled")
+
+
+class RestartBackoffTest(unittest.TestCase):
+    def test_recent_restart_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": 999_999_998,
+                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+            cfg = ExitAttributionTest()._cfg(root)
+            g = G.Guard(cfg, dry_run=True)
+            g.state["restart_times"] = [
+                (datetime.now() - timedelta(seconds=30)).isoformat(timespec="seconds")
+            ]
+            g.state["last_restart_at"] = g.state["restart_times"][0]
+            start = mock.Mock(return_value=123)
+            g._start_watcher = start
+            self.assertEqual(g.check_once(), G.ACT_BACKOFF)
+            start.assert_not_called()
+
+
+class HistoryDetailTest(unittest.TestCase):
+    def test_history_has_uptime_and_health_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            started = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": 999_999_998, "started_at": started,
+                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+            (root / "var/state/health.json").write_text(json.dumps({
+                "loop_seq": 42, "consecutive_errors": 3,
+                "camera_reopens": 1, "rss_mb": 120.5}), encoding="utf-8")
+            cfg = ExitAttributionTest()._cfg(root)
+            g = G.Guard(cfg, dry_run=True)
+            g._start_watcher = lambda: 123
+            g.check_once()
+            rows = G.read_history(root / "var/state/h.jsonl")
+        self.assertGreaterEqual(rows[-1]["uptime_seconds"], 3500)
+        self.assertEqual(rows[-1]["health"]["loop_seq"], 42)
+
+
+class GalleryBackoffTest(unittest.TestCase):
+    def test_gallery_failure_backs_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": os.getpid(),
+                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+            cfg = ExitAttributionTest()._cfg(root)
+            cfg["guardian"]["supervise_gallery"] = True
+            cfg["guardian"]["gallery_pid"] = str(root / "var/state/gallery.pid")
+            cfg["guardian"]["gallery_log"] = str(root / "var/logs/gallery.log")
+            g = G.Guard(cfg, dry_run=True)
+            calls = []
+            g._start_gallery = lambda: calls.append(True) or None
+            g.check_once()
+            g.check_once()
+        self.assertEqual(len(calls), 1)
+
+
+class OwnerLockValidationTest(unittest.TestCase):
+    def test_unrelated_live_pid_is_taken_over(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "owner.lock")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            lock = G.FileLock(path, validate=lambda pid: False)
+            self.assertTrue(lock.acquire())
+            lock.release()
+
+    def test_matching_live_pid_still_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "owner.lock")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            lock = G.FileLock(path, validate=lambda pid: True)
+            self.assertFalse(lock.acquire())
 
 
 if __name__ == "__main__":
