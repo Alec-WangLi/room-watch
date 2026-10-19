@@ -75,7 +75,9 @@
 | `roomwatch/logutil.py` | 日志轮转与固定字段事件 | |
 | `roomwatch/diag.py` | 脱敏诊断包 | **不收 `data/`** |
 | `roomwatch/benchcodec.py` | 编码基准（cv2 + ffmpeg 硬件编码器） | 只测量，不在主链路 |
+| `roomwatch/benchdetect.py` | 推理基准（墙钟 + CPU 核数） | 只测量，不切换引擎 |
 | `roomwatch/selfcheck.py` | 启动自检（模型/目录/推送/磁盘） | |
+| `roomwatch/verify.py` | 「真的在工作」验证：自检+摄像头+推送+心跳 | 所有外部动作可注入 |
 | `roomwatch/procutil.py` | 进程判活 / 等退出 / 结束 | 判活的唯一实现，updater 也用它 |
 | `roomwatch/control.py` | 停止协议 + 期望状态 + gallery PID | 不许再用 taskkill 当主路径 |
 | `roomwatch/settings.py` | 界面设置的后端：读生效值、写 `config.local.yaml`、复读校验 | 凭据只回掩码 |
@@ -177,6 +179,8 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 | 音量 | `rw volume-check` / `rw volume-set 70` |
 | 磁盘占用 | `rw storage`（`--json` 供界面/脚本） |
 | 编码基准 | `rw bench-encode`（只测量，不改默认编码器） |
+| 推理基准 | `rw bench-detect`（只测量，不切换引擎） |
+| 验证「真的在工作」 | `rw verify [--json] [--no-camera]` |
 | 相册 | `rw gallery [--port 9000]` |
 | 守护（监控 + 相册） | `rw guard [--once\|--status\|--dry-run]` |
 | 推送配置 | `rw push` |
@@ -694,20 +698,20 @@ room-watch-<版本>\
    **待所有者本人操作**，代码侧已无需改动。
 7. **Watcher 每 30~63 分钟静默退出未根治** —— 0.1.11 已加健康快照、退出记录、
    崩溃栈、看门狗与 guardian 历史，先用真机数据定位；guardian 仍常驻兜底。
-8. **未在干净机器上验证过安装包** —— 0.1.12 已本地构建
-   `dist\room-watch-0.1.12-setup.exe`，但同机存在开发环境，仍需干净机器验证。
+8. **未在干净机器上验证过安装包** —— 0.1.18 已本地构建
+   `dist\room-watch-0.1.18-setup.exe`，但同机存在开发环境，仍需干净机器验证。
 
 ---
 
-## J. 当前状态（2026-10-19 交接）
+## J. 当前状态（2026-10-19 晚）
 
-- **分支**：`main` = `546b846`（稳定版 0.1.12）；`beta` = `f6a0670`
-  （0.1.12 + GUI 子进程隐藏控制台修复），两个远程分支均已推送。
-- **已完成**：M0 可观测性（0.1.11）+ M1 守护自愈（0.1.12）；
-  评审的 2 个 Critical 与 11 个 Important 已修；全量测试通过。
-- **未发布**：v0.1.11 / v0.1.12 没有 GitHub tag/Release；内置更新看不到新版本。
-- **下一步**：M2 持久化 outbox + 重试 + 多渠道 + 外部心跳；M3 录制/存储；
-  M4 推理性能；M5 产品化；M6 平台抽象。
-- **详细交接**：`docs/handoff/2026-10-19-session.md`；新会话入口 `CLAUDE.md`。
-- **待用户操作**：用 `dist\room-watch-0.1.12-setup.exe` 覆盖安装 0.1.10；
-  发版前先把 `beta` 升到 0.1.13，避免与 `main` 的 0.1.12 同号不同内容。
+- **分支**：`main` = `b63f8a2`（稳定版 0.1.12）；`beta` = `97b2e5d`（0.1.17，
+  已推送并发布预发布 `v0.1.17-beta`）；开发分支 `feat/0.1.18-productization`
+  （M5 产品化 + M2 收尾 + 稳定性补课，`VERSION` = 0.1.18，尚未推送/发版）。
+- **已完成**：M0 可观测性、M1 守护自愈、M2 投递层（0.1.16）与事件过滤（0.1.18）、
+  M3 录制/存储（0.1.17）、M4 基准工具、M5 验证/诊断/文档。
+- **未做**：托盘（需 pystray + 真机）、M6 平台抽象、干净机器安装验证。
+- **下一步**：真机验收 0.1.18 → 合回 `beta` → 稳定后升修订号再合 `main`、
+  从 `main` 发 stable Release。
+- **详细交接**：`docs/handoff/2026-10-19-session.md`（第 14 节为 0.1.18）；
+  新会话入口 `CLAUDE.md`。

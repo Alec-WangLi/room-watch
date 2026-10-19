@@ -19,5 +19,8 @@
   `C:\Users\Alec\.workbuddy\binaries\python\envs\default\Scripts\python.exe`；
   默认 `python` 可能没有 cv2，以 `rw doctor` 为准。
 
-当前状态速览：`main` = 0.1.12（M0–M1），`beta` = 0.1.12 + GUI 闪窗修复
-（`f6a0670`）。0.1.11/0.1.12 尚未发 GitHub Release；发版需所有者明确同意。
+当前状态速览：`main` = 0.1.12（M0–M1），`beta` = 0.1.17（M2 + M3，
+已发预发布 `v0.1.17-beta`）；当前开发分支 `feat/0.1.18-productization`
+（M5 产品化 + M2 事件过滤 + 稳定性补课，0.1.18，待真机验收）。
+发版通道：稳定版从 `main` 走 plain Release，测试版从 `beta` 走 prerelease
+（`scripts/release.py --channel stable|beta`）；发版需所有者明确同意。
