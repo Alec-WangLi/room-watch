@@ -24,19 +24,92 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import health
 from . import procutil
 
 __all__ = [
-    "STOP_NAME", "stop_request_path", "read_stop_request", "request_stop",
+    "STOP_NAME", "DESIRED_NAME", "GALLERY_PID_NAME",
+    "stop_request_path", "read_stop_request", "request_stop",
     "clear_stop_request", "stop_requested", "stop_watcher", "DEFAULT_GRACE",
+    "desired_state_path", "read_desired_state", "set_desired_state",
+    "gallery_pid_path", "pid_matches", "stop_gallery",
 ]
 
 STOP_NAME = "stop.request"
+DESIRED_NAME = "desired_state.json"
+GALLERY_PID_NAME = "gallery.pid"
 DEFAULT_GRACE = 20.0     # 录像收尾 + 音轨合并，实测 2~8 秒；留足余量
 
 
 def stop_request_path(root: Path | str) -> Path:
     return Path(root) / "var" / "state" / STOP_NAME
+
+
+def desired_state_path(root: Path | str) -> Path:
+    return Path(root) / "var" / "state" / DESIRED_NAME
+
+
+def gallery_pid_path(root: Path | str) -> Path:
+    return Path(root) / "var" / "state" / GALLERY_PID_NAME
+
+
+def read_desired_state(root: Path | str) -> str:
+    """用户期望监控处于 running 还是 paused。
+
+    文件缺失/损坏一律按 running：宁可多拉起一次，也不要让监控在用户
+    不知情的情况下永久待机。
+    """
+    try:
+        data = json.loads(desired_state_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "running"
+    if isinstance(data, dict) and data.get("state") in ("running", "paused"):
+        return str(data["state"])
+    return "running"
+
+
+def set_desired_state(root: Path | str, state: str, *, by: str = "unknown") -> Path:
+    if state not in ("running", "paused"):
+        raise ValueError(f"未知的期望状态：{state!r}（只支持 running / paused）")
+    path = desired_state_path(root)
+    health.write_json_atomic(path, {
+        "state": state,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "by": by,
+    })
+    return path
+
+
+def pid_matches(
+    pid: int,
+    markers: tuple[str, ...],
+    *,
+    cmdline: Optional[Callable[[int], list[str]]] = None,
+) -> bool:
+    """PID 还活着不够，命令行里必须出现全部标记，防止 PID 复用误判。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        args = cmdline(pid) if cmdline else _psutil_cmdline(pid)
+    except Exception:  # noqa: BLE001 - 进程刚死 / 权限不足都按不匹配处理
+        return False
+    if not args:
+        return False
+    text = " ".join(str(part) for part in args).lower()
+    return all(marker.lower() in text for marker in markers)
+
+
+def _psutil_cmdline(pid: int) -> list[str]:
+    try:
+        import psutil
+
+        return list(psutil.Process(int(pid)).cmdline())
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def request_stop(root: Path | str, pid: int) -> Path:
@@ -139,3 +212,33 @@ def stop_watcher(
         return {"method": "stuck", "waited": waited}
     clear_stop_request(root)
     return {"method": "forced", "waited": waited}
+
+
+def stop_gallery(
+    root: Path | str,
+    *,
+    alive: Optional[Callable[[int], bool]] = None,
+    kill: Optional[Callable[..., bool]] = None,
+    cmdline: Optional[Callable[[int], list[str]]] = None,
+) -> dict:
+    """按 PID 文件停止相册；命令行不匹配视为已停止，绝不误杀复用 PID。"""
+    alive = alive or procutil.pid_alive
+    kill = kill or procutil.kill_pid
+
+    try:
+        pid = int(gallery_pid_path(root).read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        pid = 0
+
+    if (
+        not pid
+        or not alive(pid)
+        or not pid_matches(pid, ("roomwatch", "gallery"), cmdline=cmdline)
+    ):
+        return {"method": "already-stopped", "waited": 0.0}
+
+    if kill(pid, force=False):
+        return {"method": "graceful", "waited": 0.0}
+    if kill(pid, force=True):
+        return {"method": "forced", "waited": 0.0}
+    return {"method": "stuck", "waited": 0.0}

@@ -134,5 +134,87 @@ class StopWatcherTest(unittest.TestCase):
         self.assertTrue(seen.get("exists"))
 
 
+class DesiredStateTest(unittest.TestCase):
+    def test_missing_file_defaults_to_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(control.read_desired_state(Path(tmp)), "running")
+
+    def test_round_trip_and_corrupt_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            control.set_desired_state(root, "paused", by="test")
+            self.assertEqual(control.read_desired_state(root), "paused")
+            control.desired_state_path(root).write_text("{oops", encoding="utf-8")
+            self.assertEqual(control.read_desired_state(root), "running")
+
+    def test_invalid_state_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                control.set_desired_state(Path(tmp), "banana")
+
+
+class PidMatchTest(unittest.TestCase):
+    def test_matching_command_line(self):
+        cmd = ["python.exe", "-m", "roomwatch", "gallery", "--config", "x"]
+        self.assertTrue(control.pid_matches(1, ("roomwatch", "gallery"), cmdline=lambda pid: cmd))
+
+    def test_reused_pid_with_other_command_is_not_a_match(self):
+        cmd = ["notepad.exe", "foo.txt"]
+        self.assertFalse(control.pid_matches(1, ("roomwatch", "gallery"), cmdline=lambda pid: cmd))
+
+    def test_markers_are_case_insensitive(self):
+        cmd = ["python.exe", "-m", "RoomWatch", "Gallery"]
+        self.assertTrue(control.pid_matches(1, ("roomwatch", "gallery"), cmdline=lambda pid: cmd))
+
+    def test_missing_pid_or_exception_is_false(self):
+        self.assertFalse(control.pid_matches(0, ("roomwatch",), cmdline=lambda pid: []))
+        self.assertFalse(control.pid_matches(1, ("roomwatch",),
+                                             cmdline=lambda pid: (_ for _ in ()).throw(OSError())))
+
+
+class StopGalleryTest(unittest.TestCase):
+    def test_dead_pid_is_already_stopped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = control.stop_gallery(Path(tmp), alive=lambda pid: False)
+            self.assertEqual(result["method"], "already-stopped")
+
+    def test_matching_pid_is_killed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var" / "state").mkdir(parents=True)
+            control.gallery_pid_path(root).write_text("4321", encoding="utf-8")
+            calls = []
+            state = {"alive": True}
+
+            def kill(pid, timeout=5.0, force=True):
+                calls.append(force)
+                state["alive"] = False
+                return True
+
+            result = control.stop_gallery(
+                root,
+                alive=lambda pid: state["alive"],
+                kill=kill,
+                cmdline=lambda pid: ["python", "-m", "roomwatch", "gallery"],
+            )
+        self.assertEqual(result["method"], "graceful")
+        self.assertEqual(calls, [False])
+
+    def test_reused_pid_is_not_killed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var" / "state").mkdir(parents=True)
+            control.gallery_pid_path(root).write_text("4321", encoding="utf-8")
+            kill = mock.Mock(return_value=True)
+            result = control.stop_gallery(
+                root,
+                alive=lambda pid: True,
+                kill=kill,
+                cmdline=lambda pid: ["notepad.exe"],
+            )
+        self.assertEqual(result["method"], "already-stopped")
+        kill.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
