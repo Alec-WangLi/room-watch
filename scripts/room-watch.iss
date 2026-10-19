@@ -65,11 +65,14 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\room-watch.exe"; Tasks: deskt
 [Run]
 ; 装完直接进配置向导。四问里的第 4 问就是「开机自启」，由向导决定，
 ; 安装器这里不传 --autostart，避免「取消勾选仍然自启」的矛盾。
+; 升级时 config.local.yaml 会被卸载器保留：已经有配置就不要再弹首次向导，
+; 否则用户会以为配置丢了，甚至一路回车把原配置覆盖掉。
 Filename: "{app}\runtime\python\python.exe"; \
   Parameters: "-m roomwatch setup"; \
   WorkingDir: "{app}"; \
   Description: "立即配置摄像头与微信推送"; \
-  Flags: postinstall nowait skipifsilent
+  Flags: postinstall nowait skipifsilent; \
+  Check: IsFirstRun
 
 [UninstallRun]
 ; 取消开机自启（reg delete 找不到键会返回非 0，不当作失败）。
@@ -136,6 +139,13 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   StopOldProcesses();
   Result := '';
+end;
+
+// [Run] 的 Check：只有真正没配置过才弹首次向导。
+// config.local.yaml 是用户配置，升级卸载时会被保留。
+function IsFirstRun(): Boolean;
+begin
+  Result := not FileExists(ExpandConstant('{app}\config.local.yaml'));
 end;
 
 // 装完在完成页说清下一步，客户不用猜「然后呢」。

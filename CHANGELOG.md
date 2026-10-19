@@ -41,6 +41,7 @@
   `room-watch.exe --selftest` 在打包产物里检查 psutil 是否存在。
 - 安装器在复制文件前先用旧版 `rw stop` 优雅停止监控，再按安装目录路径
   清理 guardian / gallery / 界面进程；升级不再卡在「无法自动关闭所有应用程序」。
+- 配置向导只在首次安装（没有 `config.local.yaml`）时启动，升级不再重复弹出。
 
 ---
 
