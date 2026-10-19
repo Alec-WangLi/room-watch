@@ -593,20 +593,29 @@ room-watch-<版本>\
 - 仓库：<https://github.com/Alec-WangLi/room-watch>（public，主分支 `main`）。
 - 许可证 **AGPL-3.0**，原因写在 `README.md`：`models/yolov8n.onnx` 来自 Ultralytics，
   本身即 AGPL-3.0，主许可证与之一致才不会自相矛盾。`NOTICE` 逐项列第三方来源。
-- **发版一条命令**（幂等，重复跑只补缺失资产）：
+- **发版两个通道，不要发错**（脚本幂等，重复跑只补缺失资产）：
 
   ```
   set GH_TOKEN=ghp_xxx        :: PowerShell: $env:GH_TOKEN="ghp_xxx"
-  python scripts/release.py
+
+  python scripts/release.py --channel stable
+  python scripts/release.py --channel beta
   ```
 
-  它做：读 `VERSION` → 算 SHA256 并写 `.sha256` → 在 `main` 当前提交上建 tag
-  → 建 Release → 上传两个资产。仓库名可用 `RW_REPO` 覆盖（fork 后自己发版）。
+  - `stable`：取 `main` 的提交，tag `v<版本>`，普通 Release。
+    内置自动更新只认这个通道。
+  - `beta`：取 `beta` 的提交，tag `v<版本>-beta`，**必须勾 prerelease**。
+    GitHub 的 `/releases/latest` 不返回预发布，所以稳定用户不会被推测试版；
+    测试者手动下载安装。
+  - 脚本会校验已存在的 tag/release 是否与通道一致，发现指向别的提交或
+    prerelease 标志不符会拒绝复用。先 `--dry-run` 可以只看将要做的事。
+  - 资产命名两个通道一致：`room-watch-<版本>-setup.exe` + `.sha256`。
+    仓库名可用 `RW_REPO` 覆盖（fork 后自己发版）。
 
-- **资产命名是硬约束**，自动更新靠正则 `room-watch-(\d+\.\d+\.\d+)-setup\.exe$` 匹配：
-  `room-watch-<版本>-setup.exe` + `room-watch-<版本>-setup.exe.sha256`。tag 必须 `v<版本>`。
-- **不要勾 prerelease**：`/releases/latest` 与 302 回退都不返回预发布，等于自动更新看不见它。
-- 打 tag = 对外发布，按第 12 条版本纪律需所有者批准。
+- **所有者口径（2026-10-19）**：只要本人说「推送到远程」，就默认同时打 tag
+  并发 GitHub Release；但仍必须先判断版本性质——`main`/稳定版走 `stable`，
+  `beta`/测试版走 `beta`，不确定就先问，不许猜着发。
+- 打 tag = 对外发布；除上述默认口径外，仍按第 12 条版本纪律需所有者批准。
 
 ### G.5 推送权限与历史重写（2026-10-19 真机踩过）
 
