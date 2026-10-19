@@ -98,6 +98,7 @@ COMMANDS: dict[str, Command] = {
                           requires_value=True),
     "test": Command("跑全部测试（--fast 跳过最慢的集成测试）"),
     "doctor": Command("环境自检：解释器、依赖、模型、目录、端口、钩子"),
+    "diag": Command("生成诊断包（日志/脱敏配置/健康快照）"),
     "update": Command("检查并安装更新（--check 只查，--yes 允许跨次版本）"),
     "version": Command("打印版本号"),
     "gui": Command("打开桌面界面"),
@@ -841,6 +842,17 @@ def _cmd_identity(argv: Sequence[str]) -> int:
 # ---------------------------------------------------------------- 入口
 
 
+def _cmd_diag(argv: Sequence[str]) -> int:
+    """生成诊断包并打印路径。"""
+    from . import diag
+
+    if argv:
+        raise UsageError(f"rw diag 不接受参数，收到：{' '.join(argv)}")
+    path = diag.build_bundle(paths.PROJECT_ROOT)
+    print(f"诊断包已生成：{path}")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -860,6 +872,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_test(rest)
         if name == "doctor":
             return _cmd_doctor(rest)
+        if name == "diag":
+            return _cmd_diag(rest)
         if name == "update":
             return _cmd_update(rest)
         if name == "version":
