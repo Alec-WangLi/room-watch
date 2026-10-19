@@ -6,12 +6,10 @@ title 房间监控 - 守护模式
 setlocal
 cd /d "%~dp0.."
 
-set PY=C://Users/user//.workbuddy//binaries//python//envs//default//Scripts//python.exe
+set RW=%~dp0..\rw.cmd
 
-if not exist "%PY%" (
-  echo [错误] 找不到 Python 解释器：
-  echo   %PY%
-  echo 请确认路径正确，或改成你环境里的 python.exe
+if not exist "%RW%" (
+  echo [错误] 找不到 rw.cmd，仓库可能不完整
   pause
   exit /b 1
 )
@@ -29,7 +27,7 @@ echo   （已在运行的监控不会被关掉，只是没人看着它了）
 echo ==========================================================
 echo.
 
-"%PY%" -m roomwatch guard --config config.yaml
+"%RW%" guard
 
 echo.
 echo 守护已退出。

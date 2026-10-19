@@ -73,6 +73,9 @@ Filename: "{app}\runtime\python\python.exe"; \
 ; RunOnceId 必填：升级时新旧两份卸载器都会跑，没有它同一条会被执行两次。
 Filename: "{cmd}"; Parameters: "/c reg delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v RoomWatch /f >nul 2>&1"; \
   RunOnceId: "RoomWatchRemoveAutostart"; Flags: runhidden
+; 新版优先用计划任务；旧 Run 值也要删，避免升级后两套自启同时拉起 guardian。
+Filename: "{cmd}"; Parameters: "/c schtasks /Delete /TN RoomWatchGuardian /F >nul 2>&1"; \
+  RunOnceId: "RoomWatchRemoveTask"; Flags: runhidden
 
 [UninstallDelete]
 ; runtime\ 整体强删：comtypes 运行时会往 site-packages\comtypes\gen\ 生成

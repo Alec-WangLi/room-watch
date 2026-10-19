@@ -33,36 +33,18 @@ if (-not (Test-Path (Join-Path $wd "roomwatch\cli.py"))) {
     exit 1
 }
 
-Write-Host "即将创建计划任务 RoomWatchGuardian：" -ForegroundColor Cyan
-Write-Host "  程序    : $py"
-Write-Host "  参数    : -m roomwatch guard --once"
-Write-Host "  目录    : $wd"
-Write-Host "  触发    : 登录时 + 每 3 分钟"
+Write-Host "正在注册开机自启（优先计划任务，失败回退 Run 键）..." -ForegroundColor Cyan
 Write-Host ""
 
-$action = New-ScheduledTaskAction -Execute $py -Argument "-m roomwatch guard --once" -WorkingDirectory $wd
-$t1 = New-ScheduledTaskTrigger -AtLogOn
-$t2 = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-        -RepetitionInterval (New-TimeSpan -Minutes 3) `
-        -RepetitionDuration (New-TimeSpan -Days 3650)
-$settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable `
-        -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+& (Join-Path $wd "rw.cmd") autostart --enable
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[错误] 自启注册失败，请看上方输出。" -ForegroundColor Red
+    pause
+    exit 1
+}
 
-Register-ScheduledTask -TaskName "RoomWatchGuardian" `
-    -Action $action -Trigger @($t1, $t2) -Settings $settings `
-    -Description "room-watch 守护：登录时启动，此后每3分钟检查监控是否存活，挂了自动重启" `
-    -Force | Out-Null
-
-$task = Get-ScheduledTask -TaskName "RoomWatchGuardian"
 Write-Host ""
-Write-Host "已创建：$($task.TaskName)  状态：$($task.State)" -ForegroundColor Green
+& (Join-Path $wd "rw.cmd") autostart
 Write-Host ""
-Write-Host "验证一下（应输出守护状态）：" -ForegroundColor Cyan
-& $py -m roomwatch guard --config (Join-Path $wd "config.yaml") --status
-Write-Host ""
-Write-Host "卸载命令：Unregister-ScheduledTask -TaskName RoomWatchGuardian -Confirm:`$false" -ForegroundColor DarkGray
+Write-Host "取消：& (Join-Path $wd 'rw.cmd') autostart --disable" -ForegroundColor DarkGray
 pause

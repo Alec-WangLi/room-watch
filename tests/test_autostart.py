@@ -40,27 +40,30 @@ class ScriptTest(unittest.TestCase):
 
 class StatusTest(unittest.TestCase):
     def test_missing_value_is_disabled(self) -> None:
-        info = autostart.status(ROOT, read=lambda: None, platform="win32")
+        info = autostart.status(ROOT, read=lambda: None,
+                                runner=lambda cmd: (1, "", "blocked"), platform="win32")
         self.assertFalse(info["enabled"])
         self.assertFalse(info["points_to_this_install"])
 
     def test_value_pointing_here_is_enabled(self) -> None:
         target = autostart.command_line(ROOT)
-        info = autostart.status(ROOT, read=lambda: target, platform="win32")
+        info = autostart.status(ROOT, read=lambda: target,
+                                runner=lambda cmd: (1, "", "blocked"), platform="win32")
         self.assertTrue(info["enabled"])
         self.assertTrue(info["points_to_this_install"])
         self.assertEqual(info["command"], target)
 
     def test_value_pointing_elsewhere_is_enabled_but_flagged(self) -> None:
         info = autostart.status(ROOT, read=lambda: 'wscript.exe "D:\\old\\start-monitor.vbs"',
-                                platform="win32")
+                                runner=lambda cmd: (1, "", "blocked"), platform="win32")
         self.assertTrue(info["enabled"])
         self.assertFalse(info["points_to_this_install"])
 
     def test_script_existence_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            info = autostart.status(root, read=lambda: None, platform="win32")
+            info = autostart.status(root, read=lambda: None,
+                                    runner=lambda cmd: (1, "", "blocked"), platform="win32")
             self.assertFalse(info["script_exists"])
 
 
@@ -76,6 +79,7 @@ class EnableDisableTest(unittest.TestCase):
             ok, msg = autostart.enable(
                 root, str(pythonw), root / "config.yaml",
                 write=lambda value: written.setdefault("value", value) or True,
+                runner=lambda cmd: (1, "", "blocked"),
                 platform="win32",
             )
             self.assertTrue(ok, msg)
@@ -109,18 +113,94 @@ class EnableDisableTest(unittest.TestCase):
                 raise OSError("拒绝访问")
 
             ok, msg = autostart.enable(root, str(pythonw), root / "config.yaml",
-                                       write=boom, platform="win32")
+                                       write=boom,
+                                       runner=lambda cmd: (1, "", "blocked"),
+                                       platform="win32")
         self.assertFalse(ok)
         self.assertIn("拒绝访问", msg)
 
     def test_disable_reports_when_not_registered(self) -> None:
-        ok, msg = autostart.disable(delete=lambda: False, platform="win32")
+        ok, msg = autostart.disable(delete=lambda: False,
+                                    runner=lambda cmd: (1, "", "blocked"), platform="win32")
         self.assertFalse(ok)
         self.assertIn("没有", msg)
 
     def test_disable_success(self) -> None:
-        ok, msg = autostart.disable(delete=lambda: True, platform="win32")
+        ok, msg = autostart.disable(delete=lambda: True,
+                                    runner=lambda cmd: (1, "", "blocked"), platform="win32")
         self.assertTrue(ok, msg)
+
+
+def runner_ok(cmd):
+    return (0, "", "")
+
+
+class TaskSchedulerTest(unittest.TestCase):
+    def test_task_xml_has_logon_trigger_and_restart(self):
+        xml = autostart.task_xml(ROOT, PYTHONW, ROOT / "config.yaml",
+                                 ROOT / "var/logs/guardian.log")
+        self.assertIn("<LogonTrigger>", xml)
+        self.assertIn("<RestartOnFailure>", xml)
+        self.assertIn("-m roomwatch guard", xml)
+        self.assertIn(str(ROOT), xml)
+        self.assertIn("IgnoreNew", xml)
+
+    def test_enable_prefers_task_then_removes_legacy_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runtime" / "python").mkdir(parents=True)
+            (root / "runtime" / "python" / "pythonw.exe").write_bytes(b"x")
+            deleted = []
+            ok, msg = autostart.enable(root, str(root / "runtime/python/pythonw.exe"),
+                                       root / "config.yaml", write=lambda v: True,
+                                       delete=lambda: deleted.append(True) or True,
+                                       runner=runner_ok, platform="win32")
+            self.assertTrue(ok, msg)
+            self.assertIn("计划任务", msg)
+            self.assertTrue(deleted)
+
+    def test_enable_falls_back_to_run_when_task_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runtime" / "python").mkdir(parents=True)
+            (root / "runtime" / "python" / "pythonw.exe").write_bytes(b"x")
+            written = {}
+            ok, msg = autostart.enable(root, str(root / "runtime/python/pythonw.exe"),
+                                       root / "config.yaml",
+                                       write=lambda v: written.setdefault("v", v) or True,
+                                       delete=lambda: True,
+                                       runner=lambda cmd: (1, "", "blocked"),
+                                       platform="win32")
+            self.assertTrue(ok, msg)
+            self.assertIn("Run", msg)
+            self.assertIn("v", written)
+
+    def test_enable_reports_failure_when_both_paths_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "runtime" / "python").mkdir(parents=True)
+            (root / "runtime" / "python" / "pythonw.exe").write_bytes(b"x")
+            ok, msg = autostart.enable(root, str(root / "runtime/python/pythonw.exe"),
+                                       root / "config.yaml", write=lambda v: False,
+                                       delete=lambda: True,
+                                       runner=lambda cmd: (1, "", "blocked"),
+                                       platform="win32")
+            self.assertFalse(ok)
+            self.assertIn("失败", msg)
+
+
+class BackendStatusTest(unittest.TestCase):
+    def test_task_backend(self):
+        info = autostart.status(ROOT, read=lambda: None,
+                                runner=lambda cmd: (0, "", ""), platform="win32")
+        self.assertEqual(info["backend"], "task")
+        self.assertFalse(info["conflict"])
+
+    def test_conflict_when_both_exist(self):
+        info = autostart.status(ROOT, read=lambda: autostart.command_line(ROOT),
+                                runner=lambda cmd: (0, "", ""), platform="win32")
+        self.assertEqual(info["backend"], "conflict")
+        self.assertTrue(info["conflict"])
 
 
 if __name__ == "__main__":
