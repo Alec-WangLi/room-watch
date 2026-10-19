@@ -34,7 +34,7 @@ class CommandTableTest(unittest.TestCase):
             "say", "say-raw", "ab", "volume-check", "volume-set", "storage",
             "gallery", "guard", "push", "push-video", "setup", "test", "doctor",
             "diag", "update", "version", "gui", "stop", "config", "autostart", "identity",
-            "heartbeat",
+            "heartbeat", "bench-encode",
         }
         self.assertEqual(set(cli.COMMANDS), expected)
 

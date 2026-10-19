@@ -85,6 +85,7 @@ COMMANDS: dict[str, Command] = {
     "volume-set": Command("直接设置系统主音量（0~100）", "watcher",
                           takes="--volume-set", requires_value=True),
     "storage": Command("查看磁盘占用、容量上限与最旧文件", "watcher", ("--storage",)),
+    "bench-encode": Command("测量录像编码速度（只测量，不改默认编码器）"),
     "stop": Command("优雅停止监控：先让录像收尾，再退出"),
     "gallery": Command("启动本地相册（默认 127.0.0.1:8765）", "gallery"),
     "config": Command("读取或修改界面设置（--json / --set 键=值 / --test）"),
@@ -1003,6 +1004,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_identity(rest)
         if name == "heartbeat":
             return _cmd_heartbeat(rest)
+        if name == "bench-encode":
+            from . import benchcodec
+
+            return benchcodec.main(rest)
 
         spec = COMMANDS[name]
         translated = translate(name, rest)
