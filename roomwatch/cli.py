@@ -71,7 +71,7 @@ class Command:
 
 # 命令表就是规范本身：新增功能先在这里登记，否则 `rw --help` 里看不到。
 COMMANDS: dict[str, Command] = {
-    "start": Command("启动监控（前台常驻，Ctrl+C 退出）", "watcher"),
+    "start": Command("启动监控（后台常驻，由 guardian 托管；--foreground 前台运行）"),
     "dry-run": Command("试跑：抓拍存档但不推送，用来验证误报率", "watcher", ("--dry-run",)),
     "probe": Command("拍一张预览图后退出，用来确认摄像头角度", "watcher", ("--probe",)),
     "status": Command("看监控是否在线（重算心跳，不信文件里的 stale 字段）", "watcher", ("--status",)),
@@ -622,23 +622,78 @@ def _status_pid() -> int:
         return 0
 
 
+def _cmd_start(argv: Sequence[str]) -> int:
+    """后台启动：写 running 并交给 guardian；--foreground 保留旧行为。"""
+    from . import control
+
+    if "--foreground" in argv:
+        return _run_module("watcher", [a for a in argv if a != "--foreground"])
+
+    root = paths.PROJECT_ROOT
+    python = paths.find_python()
+    config = str(root / "config.yaml")
+    argv_list = list(argv)
+    if "--config" in argv_list:
+        idx = argv_list.index("--config")
+        if idx + 1 < len(argv_list):
+            config = argv_list[idx + 1]
+
+    log_path = str(root / "var" / "logs" / "guardian.log")
+    (root / "var" / "logs").mkdir(parents=True, exist_ok=True)
+    control.set_desired_state(root, "running", by="cli")
+
+    cmd = [python, "-m", "roomwatch", "guard", "--config", config, "--log", log_path]
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    try:
+        subprocess.Popen(
+            cmd, cwd=str(root), creationflags=flags,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, close_fds=True,
+        )
+    except OSError as exc:
+        print(f"启动 guardian 失败：{exc}", file=sys.stderr)
+        return 1
+
+    # 立即触发一次检查，避免用户等一个 check_seconds 周期才看到画面
+    try:
+        subprocess.run(
+            [python, "-m", "roomwatch", "guard", "--once",
+             "--config", config, "--log", log_path],
+            cwd=str(root), timeout=30, capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    print("监控已启动（后台运行，由 guardian 托管）。")
+    return 0
+
+
 def _cmd_stop(argv: Sequence[str]) -> int:
-    """优雅停止：写 stop.request，等它自己收尾，超时再强杀。"""
+    """优雅停止：先写 paused，再停相册与监控。"""
     from . import control, procutil
 
     if argv:
         raise UsageError(f"rw stop 不接受参数，收到：{' '.join(argv)}")
 
+    root = paths.PROJECT_ROOT
+    control.set_desired_state(root, "paused", by="cli")
+    gallery = control.stop_gallery(root)
+
     pid = _status_pid()
     if not pid or not procutil.pid_alive(pid):
         # 进程已经不在，顺手清掉可能残留的请求文件
-        control.clear_stop_request(paths.PROJECT_ROOT)
+        control.clear_stop_request(root)
         print("监控没有在运行。")
+        if gallery.get("method") != "already-stopped":
+            print(f"相册：{gallery.get('method')}")
         return 0
 
     print(f"正在停止 PID {pid}（最多等 {control.DEFAULT_GRACE:.0f} 秒让录像收尾）…")
-    result = control.stop_watcher(
-        paths.PROJECT_ROOT, pid, grace=control.DEFAULT_GRACE, force=True)
+    result = control.stop_watcher(root, pid, grace=control.DEFAULT_GRACE, force=True)
     labels = {
         "graceful": "已收尾退出（录像完整）",
         "already-stopped": "本来就没在跑",
@@ -647,6 +702,8 @@ def _cmd_stop(argv: Sequence[str]) -> int:
         "stuck": "强杀后仍未消失，请用任务管理器结束",
     }
     print(f"{labels.get(result['method'], result['method'])}，用时 {result['waited']:.0f} 秒")
+    if gallery.get("method") != "already-stopped":
+        print(f"相册：{gallery.get('method')}")
     return 0 if result["method"] in ("graceful", "already-stopped", "forced") else 1
 
 
@@ -880,6 +937,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_version(rest)
         if name == "gui":
             return _cmd_gui(rest)
+        if name == "start":
+            return _cmd_start(rest)
         if name == "stop":
             return _cmd_stop(rest)
         if name == "config":

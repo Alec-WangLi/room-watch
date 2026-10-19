@@ -1362,6 +1362,14 @@ def print_status(config_path: str) -> None:
     cfg = load_config(config_path)
     path = (cfg.get("storage") or {}).get("status") or resolve("var/state/status.json")
 
+    desired = control.read_desired_state(paths.PROJECT_ROOT)
+    print(f"期望状态    : {'运行' if desired == 'running' else '已暂停'}")
+    exit_rec = health.read_exit_record(
+        resolve((cfg.get("health") or {}).get("exit_record"), "var/state/last_exit.json")
+    )
+    if exit_rec:
+        print(f"上次退出    : {exit_rec.get('reason')}（退出码 {exit_rec.get('code')}）")
+
     if not os.path.exists(path):
         print("监控未运行（找不到 status.json）")
         return

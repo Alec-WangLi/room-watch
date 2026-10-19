@@ -41,7 +41,7 @@ class CommandTableTest(unittest.TestCase):
             self.assertTrue(spec.summary, msg=f"{name} 缺说明")
 
     def test_watcher_commands_point_at_watcher_module(self) -> None:
-        for name in ("start", "probe", "status", "storage", "enroll"):
+        for name in ("probe", "status", "storage", "enroll"):
             self.assertEqual(cli.COMMANDS[name].module, "watcher", msg=name)
 
 
@@ -151,6 +151,50 @@ class TestFilesTest(unittest.TestCase):
         }
         self.assertTrue(legacy.issubset(set(files)), msg=str(legacy - set(files)))
         self.assertGreaterEqual(len(files), 8)
+
+
+class StartStopSemanticsTest(unittest.TestCase):
+    def test_start_foreground_passes_through(self):
+        with mock.patch.object(cli, "_run_module", return_value=0) as run:
+            self.assertEqual(cli._cmd_start(["--foreground", "--config", "x"]), 0)
+        run.assert_called_once_with("watcher", ["--config", "x"])
+
+    def test_stop_sets_paused_before_stopping(self):
+        from roomwatch import control
+
+        order = []
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(cli.paths, "PROJECT_ROOT", Path(tmp)), \
+             mock.patch.object(control, "set_desired_state",
+                               side_effect=lambda *a, **k: order.append("state")) as setstate, \
+             mock.patch.object(control, "stop_gallery",
+                               side_effect=lambda *a, **k: order.append("gallery") or
+                               {"method": "already-stopped"}) as sg, \
+             mock.patch.object(cli, "_status_pid", return_value=0):
+            cli._cmd_stop([])
+        setstate.assert_called_once()
+        sg.assert_called_once()
+        self.assertEqual(order, ["state", "gallery"])
+
+    def test_start_background_sets_running_and_spawns(self):
+        from roomwatch import control
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(cli.paths, "PROJECT_ROOT", Path(tmp)), \
+             mock.patch.object(cli.paths, "find_python", return_value="py"), \
+             mock.patch.object(control, "set_desired_state") as setstate, \
+             mock.patch.object(cli.subprocess, "Popen") as popen, \
+             mock.patch.object(cli.subprocess, "run") as run:
+            self.assertEqual(cli._cmd_start([]), 0)
+        setstate.assert_called_once()
+        popen.assert_called_once()
+        run.assert_called_once()
+
+    def test_start_is_registered_without_module(self):
+        self.assertEqual(cli.COMMANDS["start"].module, "")
+
+    def test_command_table_includes_diag(self):
+        self.assertIn("diag", cli.COMMANDS)
 
 
 if __name__ == "__main__":
