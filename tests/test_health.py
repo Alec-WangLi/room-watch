@@ -16,6 +16,7 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from roomwatch import health
@@ -153,6 +154,30 @@ class WatchdogLoopTest(unittest.TestCase):
             threshold_seconds=10.0,
         )
         self.assertEqual(calls, [])
+
+
+class WatcherHealthTest(unittest.TestCase):
+    def test_write_health_contains_runtime_fields(self):
+        from roomwatch.watcher import Watcher
+
+        with tempfile.TemporaryDirectory() as tmp:
+            w = object.__new__(Watcher)
+            w.health_path = str(Path(tmp) / "health.json")
+            w.loop_seq = 7
+            w.started_at = datetime.now()
+            w.last_frame_at = datetime.now()
+            w.last_inference_at = datetime.now()
+            w.consecutive_errors = 2
+            w.camera_reopens = 3
+            w.selfcheck = [{"name": "模型", "ok": True, "detail": "ok"}]
+            w.exit_reason = "normal"
+            w.write_health()
+            data = json.loads(Path(w.health_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["loop_seq"], 7)
+            self.assertEqual(data["consecutive_errors"], 2)
+            self.assertEqual(data["camera_reopens"], 3)
+            self.assertEqual(data["selfcheck"][0]["name"], "模型")
+            self.assertIn("rss_mb", data)
 
 
 if __name__ == "__main__":

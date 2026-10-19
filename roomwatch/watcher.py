@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import faulthandler
 import logging
 import os
 import platform
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -45,9 +47,12 @@ from .rules import (
 )
 from . import audio_device
 from . import control
+from . import health
+from . import logutil
 from . import loudness
 from . import paths
 from . import speaker
+from .diagnostics import Diagnostics
 from .paths import resolve
 from .config import load_config as _load_config
 from . import camera
@@ -142,12 +147,31 @@ class EventStore:
 
 
 class Watcher:
-    def __init__(self, cfg: dict, dry_run: bool = False):
+    def __init__(self, cfg: dict, dry_run: bool = False,
+                 diagnostics: Diagnostics | None = None):
         self.cfg = cfg
         self.dry_run = dry_run
+        self.diagnostics = diagnostics
         # 停止请求文件放在这个根下的 var/state/，与界面/`rw stop` 共用同一处
         self.root = paths.runtime_root()
         self.probe_json = False
+
+        health_cfg = cfg.get("health") or {}
+        self.health_path = resolve(health_cfg.get("path"), "var/state/health.json")
+        self.exit_record_path = resolve(
+            health_cfg.get("exit_record"), "var/state/last_exit.json"
+        )
+        self.health_interval = float(health_cfg.get("snapshot_seconds", 1))
+        self.stall_seconds = float(health_cfg.get("stall_seconds", 120))
+
+        self.loop_seq = 0
+        self.last_inference_at = None
+        self.consecutive_errors = 0
+        self.camera_reopens = 0
+        self.camera_ok = True
+        self.selfcheck: list[dict] = []
+        self.exit_reason = "normal"
+        self._watchdog_stop = threading.Event()
 
         cam = cfg.get("camera") or {}
         self.cam_index = int(cam.get("index", 0))
@@ -313,7 +337,16 @@ class Watcher:
     def load_model(self) -> None:
         log.info("加载检测器（engine=%s，模型 %s）", self.detector_cfg.get("engine", "auto"),
                  self.model_name)
-        self.detector = build_detector(self.detector_cfg, base_dir=str(paths.PROJECT_ROOT))
+        try:
+            self.detector = build_detector(self.detector_cfg, base_dir=str(paths.PROJECT_ROOT))
+        except Exception:
+            self.exit_reason = "model"
+            health.write_exit_record(
+                self.exit_record_path, pid=os.getpid(),
+                code=health.EXIT_MODEL, reason=self.exit_reason,
+            )
+            log.exception("检测器加载失败")
+            sys.exit(health.EXIT_MODEL)
         cv2.setNumThreads(max(1, int(self.detector_cfg.get("threads", 2))))
         log.info(
             "检测器就绪：%s%s",
@@ -459,6 +492,66 @@ class Watcher:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, self.status_path)
+
+    def write_health(self) -> None:
+        """每秒写一次的健康快照，供 guardian / 界面 / 诊断包读取。"""
+        recorder = getattr(self, "recorder", None)
+        extra = {
+            "recording": bool(getattr(recorder, "recording", False)),
+            "camera_ok": bool(getattr(self, "camera_ok", True)),
+        }
+        try:
+            extra["desired_state"] = control.read_desired_state(self.root)
+        except Exception:  # noqa: BLE001 - 状态目录异常不该拖垮主循环
+            extra["desired_state"] = "running"
+        payload = health.build_health_payload(
+            pid=os.getpid(),
+            loop_seq=self.loop_seq,
+            started_at=self.started_at,
+            last_frame_at=self.last_frame_at,
+            last_inference_at=self.last_inference_at,
+            consecutive_errors=self.consecutive_errors,
+            camera_reopens=self.camera_reopens,
+            selfcheck=self.selfcheck,
+            extra=extra,
+        )
+        health.write_health(self.health_path, payload)
+
+    def _dump_stacks(self) -> None:
+        fault = getattr(self.diagnostics, "fault_file", None)
+        if fault is not None:
+            faulthandler.dump_traceback(file=fault, all_threads=True)
+        else:
+            faulthandler.dump_traceback(all_threads=True)
+
+    def _on_stall(self) -> None:
+        log.error("主循环停滞超过 %.0f 秒，退出等待守护进程重启", self.stall_seconds)
+        health.write_exit_record(
+            self.exit_record_path,
+            pid=os.getpid(),
+            code=health.EXIT_STALLED,
+            reason="stalled",
+        )
+        os._exit(health.EXIT_STALLED)
+
+    def _watchdog(self) -> None:
+        health.watchdog_loop(
+            get_seq=lambda: self.loop_seq,
+            dump_stacks=self._dump_stacks,
+            on_stall=self._on_stall,
+            sleep=time.sleep,
+            stop_event=self._watchdog_stop,
+            threshold_seconds=self.stall_seconds,
+        )
+
+    def _exit_code(self) -> int:
+        return {
+            "config": health.EXIT_CONFIG,
+            "camera": health.EXIT_CAMERA,
+            "model": health.EXIT_MODEL,
+            "unhandled": health.EXIT_UNHANDLED,
+            "stalled": health.EXIT_STALLED,
+        }.get(self.exit_reason, health.EXIT_OK)
 
     def maybe_speak(self, frame, dets: list, now: datetime) -> None:
         """有人进入时，对现场的人播报语音提示。
@@ -699,7 +792,12 @@ class Watcher:
 
     def run(self) -> None:
         if not self.open_camera():
-            sys.exit(2)
+            self.exit_reason = "camera"
+            health.write_exit_record(
+                self.exit_record_path, pid=os.getpid(),
+                code=health.EXIT_CAMERA, reason=self.exit_reason,
+            )
+            sys.exit(health.EXIT_CAMERA)
         self.load_model()
 
         os.makedirs(self.snap_dir, exist_ok=True)
@@ -707,8 +805,14 @@ class Watcher:
         log.info("开始监控。Ctrl+C 退出。")
 
         self.started_at = datetime.now()
+        self._watchdog_stop.clear()
+        threading.Thread(
+            target=self._watchdog, daemon=True, name="health-watchdog"
+        ).start()
+        self.write_health()
         interval = 1.0 / max(1, self.fps)
         last_status_write = 0.0
+        last_health_write = 0.0
         last_stop_check = 0.0
 
         # 上一轮如果是被强杀的，master 档抬高过的主音量还没还原，这里补上
@@ -723,12 +827,14 @@ class Watcher:
 
         try:
             while True:
+                self.loop_seq += 1
                 # 停止请求：界面/`rw stop` 写文件，这里每秒看一次。
                 # 走 break 而不是强杀，才能让 finally 把 mp4 收尾、音轨合上。
                 if time.time() - last_stop_check >= 1.0:
                     last_stop_check = time.time()
                     if control.stop_requested(self.root, os.getpid()):
                         log.info("收到停止请求，正在收尾（录像/音轨/音量）…")
+                        self.exit_reason = "stop_requested"
                         break
 
                 # 按整轮耗时控速，而不是无条件 sleep：RTSP 的 read() 本身就会阻塞到
@@ -740,15 +846,19 @@ class Watcher:
                 if not ok:
                     # 摄像头被占用、驱动抽风、USB 掉线、RTSP 断流都会走到这里
                     self.fail_streak += 1
+                    self.consecutive_errors += 1
+                    self.camera_ok = False
                     log.warning("读帧失败（连续 %d 次）", self.fail_streak)
                     self.write_status(camera_ok=False)
                     # 文件源没有「断线重连」这回事，读完就该退出，
                     # 否则会一直重开、把最后一帧当成永远失败的摄像头。
                     if self.camera_spec.kind == camera.FILE and self.fail_streak >= 2:
                         log.info("视频文件已播完，退出")
+                        self.exit_reason = "file_end"
                         break
                     if self.fail_streak >= self.reconnect_after:
                         self.reconnect_attempt += 1
+                        self.camera_reopens += 1
                         delay = camera.backoff_seconds(
                             self.reconnect_attempt, self.reconnect_base, self.reconnect_max
                         )
@@ -762,6 +872,7 @@ class Watcher:
                             log.info("采集重连成功")
                             self.fail_streak = 0
                             self.reconnect_attempt = 0
+                            self.camera_ok = True
                         else:
                             self.fail_streak = 0  # 下一轮重新计数，避免原地死循环
                     else:
@@ -770,6 +881,8 @@ class Watcher:
 
                 self.fail_streak = 0
                 self.reconnect_attempt = 0
+                self.consecutive_errors = 0
+                self.camera_ok = True
                 self.frames += 1
                 self.last_frame_at = now
 
@@ -787,6 +900,7 @@ class Watcher:
                 )
                 if self.gate.should_infer(frame, mono, busy):
                     dets = self.detect(frame)
+                    self.last_inference_at = now
                 else:
                     dets = []
                 if dets:
@@ -874,12 +988,30 @@ class Watcher:
                     self.write_status(camera_ok=True)
                     last_status_write = time.time()
 
+                # 健康快照默认每秒一次，供 guardian / 界面 / 诊断包读取
+                if time.time() - last_health_write >= self.health_interval:
+                    self.write_health()
+                    last_health_write = time.time()
+
                 spent = time.monotonic() - loop_start
                 if spent < interval:
                     time.sleep(interval - spent)
         except KeyboardInterrupt:
+            self.exit_reason = "keyboard"
             log.info("收到 Ctrl+C，退出")
+        except BaseException:
+            self.exit_reason = "unhandled"
+            raise
         finally:
+            self._watchdog_stop.set()
+            health.write_exit_record(
+                self.exit_record_path,
+                pid=os.getpid(),
+                code=self._exit_code(),
+                reason=self.exit_reason,
+            )
+            logutil.event(log, "watcher_exit",
+                          code=self._exit_code(), reason=self.exit_reason)
             # 录像必须先于状态落盘收尾：这时文件才完整可读。
             # 走 stop_recording 而不是直接 recorder.shutdown()，是为了让音轨也收尾并合并。
             if self.recorder.recording:
@@ -1144,7 +1276,7 @@ def main(argv: list[str] | None = None) -> None:
 
     handlers = [logging.StreamHandler()]
     if args.log:
-        handlers.append(logging.FileHandler(args.log, encoding="utf-8"))
+        handlers.append(logutil.rotating_file_handler(args.log))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1203,7 +1335,21 @@ def main(argv: list[str] | None = None) -> None:
             sp.shutdown()
         return
 
-    w = Watcher(cfg, dry_run=args.dry_run)
+    diagnostics = None
+    if not args.probe:
+        health_cfg = cfg.get("health") or {}
+        diagnostics = Diagnostics(
+            resolve(health_cfg.get("fault_log"), "var/logs/watcher-fault.log"),
+            resolve(health_cfg.get("exit_record"), "var/state/last_exit.json"),
+        )
+        diagnostics.install()
+
+    try:
+        w = Watcher(cfg, dry_run=args.dry_run, diagnostics=diagnostics)
+    except SystemExit as exc:
+        if diagnostics is not None:
+            diagnostics.note_exit(int(exc.code or 0), "config")
+        raise
     w.probe_json = bool(args.json)
     if args.probe:
         w.probe()

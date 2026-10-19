@@ -22,12 +22,14 @@ import sys as _sys
 
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+import json
 import os
 import shutil
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -159,6 +161,8 @@ class FullRunTest(unittest.TestCase):
             "storage": {"database": os.path.join(self.tmp, "events.db"),
                         "status": os.path.join(self.tmp, "status.json")},
             "notify": {"channel": "none"},
+            "health": {"path": os.path.join(self.tmp, "health.json"),
+                       "exit_record": os.path.join(self.tmp, "last_exit.json")},
             "record": record,
         }
 
@@ -268,6 +272,16 @@ class FullRunTest(unittest.TestCase):
 
         self.assertGreaterEqual(w.record_policy.total_recorded, 3.0)
         self.assertFalse(w.recorder.recording)
+
+    def test_health_and_exit_record_are_written(self):
+        w, cfg = self._run([False] * 5 + [True] * 5)
+        health_path = Path(cfg["health"]["path"])
+        exit_path = Path(cfg["health"]["exit_record"])
+        self.assertTrue(health_path.is_file())
+        self.assertGreater(json.loads(health_path.read_text(encoding="utf-8"))["loop_seq"], 0)
+        rec = json.loads(exit_path.read_text(encoding="utf-8"))
+        self.assertEqual(rec["code"], 0)
+        self.assertIn(rec["reason"], ("keyboard", "normal"))
 
 
 if __name__ == "__main__":
