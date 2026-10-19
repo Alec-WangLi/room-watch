@@ -180,5 +180,23 @@ class WatcherHealthTest(unittest.TestCase):
             self.assertIn("rss_mb", data)
 
 
+class WatcherExitRecordTest(unittest.TestCase):
+    def test_record_exit_prefers_diagnostics(self):
+        from roomwatch.watcher import Watcher
+
+        class FakeDiagnostics:
+            def __init__(self):
+                self.calls = []
+
+            def note_exit(self, code, reason):
+                self.calls.append((code, reason))
+
+        w = object.__new__(Watcher)
+        w.diagnostics = FakeDiagnostics()
+        w.exit_record_path = "unused.json"
+        w._record_exit(health.EXIT_STALLED, "stalled")
+        self.assertEqual(w.diagnostics.calls, [(health.EXIT_STALLED, "stalled")])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

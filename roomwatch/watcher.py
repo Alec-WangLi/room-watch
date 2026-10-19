@@ -342,10 +342,7 @@ class Watcher:
             self.detector = build_detector(self.detector_cfg, base_dir=str(paths.PROJECT_ROOT))
         except Exception:
             self.exit_reason = "model"
-            health.write_exit_record(
-                self.exit_record_path, pid=os.getpid(),
-                code=health.EXIT_MODEL, reason=self.exit_reason,
-            )
+            self._record_exit(health.EXIT_MODEL, self.exit_reason)
             log.exception("检测器加载失败")
             sys.exit(health.EXIT_MODEL)
         cv2.setNumThreads(max(1, int(self.detector_cfg.get("threads", 2))))
@@ -527,12 +524,7 @@ class Watcher:
 
     def _on_stall(self) -> None:
         log.error("主循环停滞超过 %.0f 秒，退出等待守护进程重启", self.stall_seconds)
-        health.write_exit_record(
-            self.exit_record_path,
-            pid=os.getpid(),
-            code=health.EXIT_STALLED,
-            reason="stalled",
-        )
+        self._record_exit(health.EXIT_STALLED, "stalled")
         os._exit(health.EXIT_STALLED)
 
     def _watchdog(self) -> None:
@@ -553,6 +545,15 @@ class Watcher:
             "unhandled": health.EXIT_UNHANDLED,
             "stalled": health.EXIT_STALLED,
         }.get(self.exit_reason, health.EXIT_OK)
+
+    def _record_exit(self, code: int, reason: str) -> None:
+        """优先交给 Diagnostics，避免它注册的 atexit 用 normal 覆盖真实原因。"""
+        if self.diagnostics is not None:
+            self.diagnostics.note_exit(code, reason)
+            return
+        health.write_exit_record(
+            self.exit_record_path, pid=os.getpid(), code=code, reason=reason
+        )
 
     def maybe_speak(self, frame, dets: list, now: datetime) -> None:
         """有人进入时，对现场的人播报语音提示。
@@ -803,10 +804,7 @@ class Watcher:
 
         if not self.open_camera():
             self.exit_reason = "camera"
-            health.write_exit_record(
-                self.exit_record_path, pid=os.getpid(),
-                code=health.EXIT_CAMERA, reason=self.exit_reason,
-            )
+            self._record_exit(health.EXIT_CAMERA, self.exit_reason)
             sys.exit(health.EXIT_CAMERA)
         self.load_model()
 
@@ -1014,12 +1012,7 @@ class Watcher:
             raise
         finally:
             self._watchdog_stop.set()
-            health.write_exit_record(
-                self.exit_record_path,
-                pid=os.getpid(),
-                code=self._exit_code(),
-                reason=self.exit_reason,
-            )
+            self._record_exit(self._exit_code(), self.exit_reason)
             logutil.event(log, "watcher_exit",
                           code=self._exit_code(), reason=self.exit_reason)
             # 录像必须先于状态落盘收尾：这时文件才完整可读。
