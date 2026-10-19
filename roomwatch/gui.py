@@ -48,6 +48,7 @@ from typing import Callable, Optional, Sequence
 
 from . import __version__
 from . import control
+from . import health
 from . import paths
 from . import procutil
 from . import updater
@@ -99,6 +100,24 @@ def _age_seconds(ts: Optional[str]) -> Optional[float]:
         return None
 
 
+def _state_note(root: Path) -> str:
+    """上次退出原因与自检失败摘要，拼在状态文案后面。"""
+    state_dir = Path(root) / "var" / "state"
+    notes = []
+    exit_rec = health.read_json(state_dir / "last_exit.json") or {}
+    if exit_rec.get("reason"):
+        notes.append(f"上次退出：{exit_rec['reason']}")
+    health_data = health.read_json(state_dir / "health.json") or {}
+    failures = [
+        item for item in (health_data.get("selfcheck") or [])
+        if isinstance(item, dict) and not item.get("ok", True)
+    ]
+    if failures:
+        names = "、".join(str(item.get("name") or "?") for item in failures)
+        notes.append(f"自检失败：{names}")
+    return ("（" + "；".join(notes) + "）") if notes else ""
+
+
 def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> MonitorState:
     """读状态文件并**重算**在线判定。
 
@@ -110,14 +129,20 @@ def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> Mon
     所以现在必须再确认 PID 还活着。
     """
     alive = alive or procutil.pid_alive
-    path = Path(root) / "var" / "state" / "status.json"
+    state_dir = Path(root) / "var" / "state"
+    note = _state_note(Path(root))
+    desired = control.read_desired_state(Path(root))
+    path = state_dir / "status.json"
     if not path.is_file():
-        return MonitorState(caption="未运行（找不到状态文件）")
+        if desired == "paused":
+            return MonitorState(phase="paused",
+                                caption="已暂停（守护不会自动重启）" + note)
+        return MonitorState(caption="未运行（找不到状态文件）" + note)
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return MonitorState(caption="状态文件读不了（可能正在写入）")
+        return MonitorState(caption="状态文件读不了（可能正在写入）" + note)
 
     pid_raw = data.get("pid")
     try:
@@ -140,9 +165,13 @@ def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> Mon
     elif pid_ok:
         phase = "starting"
         caption = f"进程在，但已 {gap:.0f} 秒没有画面" if gap is not None else "启动中，暂无画面"
+    elif desired == "paused":
+        phase = "paused"
+        caption = "已暂停（守护不会自动重启）"
     else:
         phase = "stopped"
         caption = "已停止"
+    caption += note
 
     return MonitorState(
         online=online,
@@ -229,6 +258,16 @@ def preview_image(root: Path) -> tuple[Optional[Path], str]:
 def start_command(python: str, root: Path, config_path: str) -> list[str]:
     log = Path(root) / "var" / "logs" / "watcher.log"
     return [python, "-m", "roomwatch", "start", "--config", str(config_path), "--log", str(log)]
+
+
+def guard_command(python: str, root: Path, config_path: str, *, once: bool = False) -> list[str]:
+    """启动守护进程；`once=True` 时立即触发一轮检查。"""
+    log = Path(root) / "var" / "logs" / "guardian.log"
+    cmd = [python, "-m", "roomwatch", "guard"]
+    if once:
+        cmd.append("--once")
+    cmd += ["--config", str(config_path), "--log", str(log)]
+    return cmd
 
 
 def force_kill_command(pid: int) -> list[str]:
@@ -625,8 +664,11 @@ class RoomWatchApp:
         (self.project / "var" / "logs").mkdir(parents=True, exist_ok=True)
         # 清掉上一轮可能残留的停止请求，否则新进程一起来就自己退了
         control.clear_stop_request(self.project)
+        control.set_desired_state(self.project, "running", by="gui")
         try:
-            self._spawn(start_command(self.python, self.project, str(self.config)))
+            # 常驻 guardian 负责后续自愈；--once 立即触发一轮，避免等一个周期
+            self._spawn(guard_command(self.python, self.project, str(self.config)))
+            self._spawn(guard_command(self.python, self.project, str(self.config), once=True))
         except OSError as exc:
             self.messagebox.showerror("启动失败", str(exc))
             return
@@ -649,13 +691,17 @@ class RoomWatchApp:
         if not self.messagebox.askyesno("停止监控", question):
             return
 
+        control.set_desired_state(self.project, "paused", by="gui")
         pid = int(state.pid)
         self._busy = "stopping"
         self._stop_pid = pid
         self.refresh_soon()
 
         def work() -> dict:
-            return control.stop_watcher(self.project, pid, grace=STOP_TIMEOUT, force=False)
+            gallery = control.stop_gallery(self.project)
+            result = control.stop_watcher(self.project, pid, grace=STOP_TIMEOUT, force=False)
+            result["gallery"] = gallery
+            return result
 
         self._run_task(work, self._on_stop_done)
 

@@ -270,5 +270,48 @@ class ParseArgsTest(unittest.TestCase):
         self.assertIsNone(root)
 
 
+class PausedStateTest(unittest.TestCase):
+    def test_paused_and_offline_is_paused_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            control.set_desired_state(root, "paused")
+            state = gui.read_state(root, alive=DEAD)
+        self.assertEqual(state.phase, "paused")
+        self.assertIn("暂停", state.caption)
+
+    def test_last_exit_reason_is_shown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/last_exit.json").write_text(
+                '{"code": 5, "reason": "unhandled"}', encoding="utf-8")
+            state = gui.read_state(root, alive=DEAD)
+        self.assertIn("unhandled", state.caption)
+
+    def test_selfcheck_failure_is_shown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/health.json").write_text(
+                '{"selfcheck": [{"name": "推送", "ok": false, "detail": "未配置"}]}',
+                encoding="utf-8")
+            state = gui.read_state(root, alive=DEAD)
+        self.assertIn("自检失败", state.caption)
+        self.assertIn("推送", state.caption)
+
+
+class GuardCommandTest(unittest.TestCase):
+    def test_guard_command_layout(self):
+        cmd = gui.guard_command("C:/py/python.exe", Path("C:/proj"), "C:/proj/config.yaml")
+        self.assertIn("guard", cmd)
+        self.assertIn("C:/proj/config.yaml", cmd)
+        self.assertIn("--log", cmd)
+
+    def test_guard_command_once(self):
+        cmd = gui.guard_command("C:/py/python.exe", Path("C:/proj"), "C:/proj/config.yaml",
+                                once=True)
+        self.assertIn("--once", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()
