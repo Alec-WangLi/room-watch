@@ -207,7 +207,23 @@ guardian:
   watcher_log: var/logs/watcher.log
   state: var/state/guardian_state.json
   lock: var/state/guardian.lock
+  history: var/state/guardian_history.jsonl
+  desired_state: var/state/desired_state.json
+  owner_lock: var/state/guardian.owner.lock
+  gallery_pid: var/state/gallery.pid
+  gallery_log: var/logs/gallery.log
+  supervise_gallery: true
+  crash_window_minutes: 10
+  crash_threshold: 3
+  notify_recovery: true
   python: null            # null = 用当前解释器
+
+health:
+  path: var/state/health.json       # watcher 每秒写的健康快照
+  exit_record: var/state/last_exit.json  # 上次退出原因（守护进程读它）
+  fault_log: var/logs/watcher-fault.log  # faulthandler 的原生崩溃转储
+  snapshot_seconds: 1
+  stall_seconds: 120                # 主循环停滞多久判定卡死
 
 notify:
   # wxpusher | serverchan | wecom_bot | none

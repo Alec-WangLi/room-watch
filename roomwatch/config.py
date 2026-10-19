@@ -40,6 +40,14 @@ _PATH_KEYS = (
     ("guardian", "watcher_log"),
     ("guardian", "state"),
     ("guardian", "lock"),
+    ("guardian", "history"),
+    ("guardian", "desired_state"),
+    ("guardian", "owner_lock"),
+    ("guardian", "gallery_pid"),
+    ("guardian", "gallery_log"),
+    ("health", "path"),
+    ("health", "exit_record"),
+    ("health", "fault_log"),
 )
 
 

@@ -14,11 +14,13 @@ import sys as _sys
 
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+import json
 import os
 import shutil
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from roomwatch import guardian as G
 
@@ -198,6 +200,48 @@ class TestReadStatus(unittest.TestCase):
         with open(p, "w", encoding="utf-8") as f:
             f.write("[1,2,3]")
         self.assertIsNone(G.read_status(p))
+
+
+class HistoryTest(unittest.TestCase):
+    def test_append_and_read_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "h.jsonl"
+            G.append_history(p, {"service": "watcher", "action": "restart_gone"})
+            G.append_history(p, {"service": "gallery", "action": "restart_gone"})
+            rows = G.read_history(p, limit=10)
+            self.assertEqual([r["service"] for r in rows], ["watcher", "gallery"])
+
+    def test_read_missing_and_corrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "h.jsonl"
+            self.assertEqual(G.read_history(p), [])
+            p.write_text("{oops\n\n[]\n", encoding="utf-8")
+            self.assertEqual(G.read_history(p), [])
+
+    def test_missing_exit_record_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g = G.Guard({"guardian": {}, "storage": {"status": str(Path(tmp) / "s.json")},
+                         "health": {"exit_record": str(Path(tmp) / "last_exit.json")},
+                         "__config_path__": str(Path(tmp) / "c.yaml")}, dry_run=True)
+            self.assertEqual(g.last_exit_reason(), "unknown")
+
+    def test_corrupt_exit_record_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "last_exit.json"
+            p.write_text("{oops", encoding="utf-8")
+            g = G.Guard({"guardian": {}, "storage": {"status": str(Path(tmp) / "s.json")},
+                         "health": {"exit_record": str(p)},
+                         "__config_path__": str(Path(tmp) / "c.yaml")}, dry_run=True)
+            self.assertEqual(g.last_exit_reason(), "unknown")
+
+    def test_exit_reason_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "last_exit.json"
+            p.write_text(json.dumps({"code": 5, "reason": "unhandled"}), encoding="utf-8")
+            g = G.Guard({"guardian": {}, "storage": {"status": str(Path(tmp) / "s.json")},
+                         "health": {"exit_record": str(p)},
+                         "__config_path__": str(Path(tmp) / "c.yaml")}, dry_run=True)
+            self.assertEqual(g.last_exit_reason(), "unhandled")
 
 
 if __name__ == "__main__":

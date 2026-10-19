@@ -55,10 +55,13 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import yaml
 
+from . import health
+from . import logutil
 from .paths import PROJECT_ROOT, resolve
 
 log = logging.getLogger("guardian")
@@ -101,6 +104,36 @@ def read_status(path: str) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def append_history(path: str | Path, record: dict) -> None:
+    """追加一条重启历史。写失败只记日志，不影响守护。"""
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        log.warning("写守护历史失败: %s", exc)
+
+
+def read_history(path: str | Path, limit: int = 20) -> list[dict]:
+    """读最近 limit 条历史；坏行跳过，文件不存在返回空列表。"""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    if limit <= 0:
+        return []
+    rows: list[dict] = []
+    for line in lines[-limit:]:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
 
 
 def frame_age_seconds(status: Optional[dict], now: Optional[datetime] = None) -> Optional[float]:
@@ -229,8 +262,13 @@ class Guard:
         self.stale_seconds = float(g.get("stale_seconds", 300))
         self.stall_confirmations = int(g.get("stall_confirmations", 2))
         self.max_backoff = float(g.get("max_backoff_seconds", 900))
-        self.lock_path = _abs(g.get("lock", "guardian.lock"))
-        self.state_path = _abs(g.get("state", "guardian_state.json"))
+        self.lock_path = _abs(g.get("lock", "var/state/guardian.lock"))
+        self.state_path = _abs(g.get("state", "var/state/guardian_state.json"))
+        self.history_path = _abs(g.get("history", "var/state/guardian_history.jsonl"))
+        health_cfg = cfg.get("health") or {}
+        self.exit_record_path = _abs(
+            health_cfg.get("exit_record") or "var/state/last_exit.json"
+        )
         self.kill_grace = float(g.get("kill_grace_seconds", 8.0))
 
         storage = cfg.get("storage") or {}
@@ -269,6 +307,13 @@ class Guard:
                 json.dump(self.state, f, ensure_ascii=False, indent=2)
         except OSError as exc:
             log.warning("写守护状态失败: %s", exc)
+
+    def last_exit_reason(self) -> str:
+        """上一次 watcher 退出原因；记录缺失或损坏都按 unknown 处理。"""
+        record = health.read_exit_record(self.exit_record_path)
+        if not record:
+            return "unknown"
+        return str(record.get("reason") or "unknown")
 
     # ---------- 动作 ----------
 
@@ -396,6 +441,7 @@ class Guard:
         else:
             reason = "进程已不存在"
 
+        exit_record = health.read_exit_record(self.exit_record_path)
         new_pid = self._start_watcher()
         self.state["restart_count"] = int(self.state.get("restart_count", 0)) + 1
         self.state["stall_streak"] = 0
@@ -406,6 +452,14 @@ class Guard:
         else:
             self.state["consecutive_failures"] = int(self.state.get("consecutive_failures", 0)) + 1
         self._save_state()
+
+        append_history(self.history_path, {
+            "at": now.isoformat(timespec="seconds"),
+            "service": "watcher",
+            "action": action,
+            "exit_code": (exit_record or {}).get("code"),
+            "exit_reason": (exit_record or {}).get("reason", "unknown"),
+        })
 
         log.warning("已重启（%s），累计第 %s 次", reason, self.state["restart_count"])
         return action
@@ -450,7 +504,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.log:
         log_path = _abs(args.log)
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+        handlers.append(logutil.rotating_file_handler(log_path))
     if sys.stderr is not None:  # pythonw 下 stderr 为 None，写 console handler 会抛异常
         handlers.append(logging.StreamHandler(sys.stderr))
 
@@ -487,6 +541,15 @@ def main(argv: list[str] | None = None) -> None:
         print(f"累计重启     : {guard.state.get('restart_count', 0)} 次")
         print(f"最近动作     : {guard.state.get('last_action')}")
         print(f"最近重启时间 : {guard.state.get('last_restart_at')}")
+        print(f"上次退出原因 : {guard.last_exit_reason()}")
+        rows = read_history(guard.history_path, limit=5)
+        if rows:
+            print("最近重启历史 :")
+            for row in rows:
+                print(f"  {row.get('at')} {row.get('service')} {row.get('action')} "
+                      f"{row.get('exit_reason')}")
+        else:
+            print("最近重启历史 : （暂无）")
         return
 
     if args.once:
