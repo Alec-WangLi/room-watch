@@ -14,7 +14,9 @@ import sys as _sys
 
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+import io
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -336,6 +338,29 @@ class GuardPausedTest(unittest.TestCase):
             self.assertEqual(len(sent), 1)
 
 
+    def test_paused_clears_pending_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = {"guardian": {
+                       "desired_state": str(root / "var/state/desired_state.json"),
+                       "state": str(root / "var/state/guardian_state.json"),
+                       "lock": str(root / "var/state/guardian.lock"),
+                       "history": str(root / "var/state/h.jsonl"),
+                       "supervise_gallery": False},
+                   "health": {"exit_record": str(root / "var/state/last_exit.json")},
+                   "storage": {"status": str(root / "var/state/status.json")},
+                   "__config_path__": str(root / "config.yaml")}
+            control.set_desired_state(root, "paused")
+            g = G.Guard(cfg, dry_run=True)
+            g._notify = lambda *args, **kwargs: None
+            g.state["pending_recovery"] = {"pid": 123, "at": "2026-10-19T12:00:00"}
+            with mock.patch.object(g, "_start_watcher"), \
+                 mock.patch.object(g, "_start_gallery"):
+                self.assertEqual(g.check_once(), G.ACT_PAUSED)
+            self.assertIsNone(g.state.get("pending_recovery"),
+                              "暂停后不该保留「待恢复」状态")
+
+
 class GuardRecoveryTest(unittest.TestCase):
     def _cfg(self, root):
         return {"guardian": {
@@ -368,6 +393,26 @@ class GuardRecoveryTest(unittest.TestCase):
             self.assertIn("unhandled", sent[0])
             g.check_once()
             self.assertEqual(len(sent), 1)
+
+    def test_stalled_restart_uses_graceful_stop_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": os.getpid(),
+                "last_frame_at": (datetime.now() - timedelta(seconds=600))
+                .isoformat(timespec="seconds")}), encoding="utf-8")
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g._notify = lambda *args, **kwargs: None
+            g.state["stall_streak"] = max(0, g.stall_confirmations - 1)
+            with mock.patch("roomwatch.guardian.control.stop_watcher",
+                            return_value={"method": "forced"}) as stop, \
+                 mock.patch.object(g, "_start_watcher", return_value=4242), \
+                 mock.patch.object(g, "_kill") as kill:
+                action = g.check_once()
+        self.assertEqual(action, G.ACT_RESTART_STALLED)
+        stop.assert_called_once()
+        kill.assert_not_called()
 
     def test_selfcheck_failure_notifies_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -699,6 +744,29 @@ class OwnerLockValidationTest(unittest.TestCase):
                 f.write(str(os.getpid()))
             lock = G.FileLock(path, validate=lambda pid: True)
             self.assertFalse(lock.acquire())
+
+
+class StructuredEventTest(unittest.TestCase):
+    def test_append_history_emits_structured_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            handler = logging.StreamHandler(buf)
+            logger = logging.getLogger("guardian")
+            old_level = logger.level
+            logger.setLevel(logging.INFO)
+            logger.addHandler(handler)
+            try:
+                G.append_history(Path(tmp) / "h.jsonl", {
+                    "service": "watcher", "action": "restart_gone",
+                    "exit_reason": "camera",
+                })
+            finally:
+                logger.removeHandler(handler)
+                logger.setLevel(old_level)
+        out = buf.getvalue()
+        self.assertIn("event=guardian_restart", out)
+        self.assertIn("service=watcher", out)
+        self.assertIn("exit_reason=camera", out)
 
 
 if __name__ == "__main__":

@@ -216,6 +216,17 @@ class DiagCommandTest(unittest.TestCase):
             cli._cmd_diag(["--bundle"])
 
 
+class AutostartHelpTest(unittest.TestCase):
+    def test_help_mentions_scheduled_task_first(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["autostart", "--help"])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("计划任务", out)
+        self.assertIn("回退", out)
+
+
 class ConfigTestCommandTest(unittest.TestCase):
     class FakeResponse:
         status_code = 200

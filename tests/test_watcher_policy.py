@@ -125,6 +125,16 @@ class WatcherPolicyTest(unittest.TestCase):
         self.assertEqual(w.recorder.stopped, [])
         self.assertEqual(w.recorder.observed, 1)
 
+    # ---------- 配置错误分类 ----------
+
+    def test_bad_numeric_config_exits_with_config_code(self):
+        """imgsz 写成字符串应报配置错误（2），不能落进「未处理异常」（5）。"""
+        from roomwatch import health
+
+        with self.assertRaises(SystemExit) as ctx:
+            Watcher({"detector": {"imgsz": "abc"}})
+        self.assertEqual(ctx.exception.code, health.EXIT_CONFIG)
+
     # ---------- 状态文件 ----------
 
     def test_status_includes_storage_forecast(self):

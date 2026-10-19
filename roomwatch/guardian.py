@@ -125,6 +125,13 @@ def append_history(path: str | Path, record: dict) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError as exc:
         log.warning("写守护历史失败: %s", exc)
+        return
+    logutil.event(
+        log, "guardian_restart",
+        service=record.get("service", ""),
+        action=record.get("action", ""),
+        exit_reason=record.get("exit_reason", ""),
+    )
 
 
 def read_history(path: str | Path, limit: int = 20) -> list[dict]:
@@ -483,6 +490,25 @@ class Guard:
             return wait - elapsed
         return None
 
+    def _stop_stalled(self, pid: Optional[int]) -> None:
+        """卡死但仍活着的 watcher：先走优雅停止，再考虑强杀。
+
+        真正冻死的进程读不到 stop.request，`stop_watcher` 会在 kill_grace
+        之后强制结束；如果它只是主循环卡住但收尾路径还能跑，这段录音、
+        音轨合并和音量还原都能保住。
+        """
+        if not pid:
+            return
+        try:
+            result = control.stop_watcher(
+                self.root, int(pid), grace=self.kill_grace, force=True)
+            log.warning("卡死进程 PID %s 已停止（%s）", pid, result.get("method"))
+            if result.get("method") in ("timeout", "stuck"):
+                self._kill(pid)
+        except Exception as exc:  # noqa: BLE001 - 兜底路径不能把守护自己搞挂
+            log.warning("优雅停止卡死进程失败，退回强制终止：%s", exc)
+            self._kill(pid)
+
     def _kill(self, pid: Optional[int]) -> None:
         if not pid:
             return
@@ -833,6 +859,7 @@ class Guard:
         if control.read_desired_state(self.root) == "paused":
             if self.state.get("last_desired_state") != "paused":
                 self._notify("room-watch：监控已暂停（不会再自动拉起）")
+                logutil.event(log, "guardian_paused")
             self.state["last_desired_state"] = "paused"
             self.state["pending_recovery"] = None
             self.state["stall_streak"] = 0
@@ -914,7 +941,7 @@ class Guard:
             return ACT_BACKOFF
 
         if action == ACT_RESTART_STALLED:
-            self._kill((status or {}).get("pid"))
+            self._stop_stalled((status or {}).get("pid"))
             reason = "进程卡死（心跳停摆）"
         else:
             reason = "进程已不存在"
@@ -1062,8 +1089,9 @@ def main(argv: list[str] | None = None) -> None:
     handlers: list[logging.Handler] = []
     if args.log:
         log_path = _abs(args.log)
-        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-        handlers.append(logutil.rotating_file_handler(log_path))
+        handler = logutil.safe_rotating_file_handler(log_path)
+        if handler is not None:
+            handlers.append(handler)
     if sys.stderr is not None:  # pythonw 下 stderr 为 None，写 console handler 会抛异常
         handlers.append(logging.StreamHandler(sys.stderr))
 
@@ -1089,7 +1117,8 @@ def main(argv: list[str] | None = None) -> None:
         print("=== 守护状态 ===")
         print(f"期望状态     : {control.read_desired_state(guard.root)}")
         gpid = guard._gallery_pid()
-        galive = bool(gpid) and pid_alive(gpid)
+        # 与巡检用同一条判活规则：PID 会被复用，必须核对命令行。
+        galive = decide_gallery(gpid, pid_alive, cmdline=_psutil_cmdline) == ACT_OK
         print(f"相册         : PID {gpid or '无'}（{'存活' if galive else '未运行'}）")
         print(f"监控状态文件 : {guard.status_path}")
         if status is None:

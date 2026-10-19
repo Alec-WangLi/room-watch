@@ -215,6 +215,28 @@ class StopGalleryTest(unittest.TestCase):
         self.assertEqual(result["method"], "already-stopped")
         kill.assert_not_called()
 
+    def test_custom_pid_file_is_honored(self):
+        """guardian.gallery_pid 改过路径时，rw stop 不能去找默认文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            custom = root / "var" / "state" / "custom-gallery.pid"
+            custom.parent.mkdir(parents=True)
+            custom.write_text("4321", encoding="utf-8")
+            state = {"alive": True}
+
+            def kill(pid, timeout=5.0, force=True):
+                state["alive"] = False
+                return True
+
+            result = control.stop_gallery(
+                root,
+                pid_file=custom,
+                alive=lambda pid: state["alive"],
+                kill=kill,
+                cmdline=lambda pid: ["python", "-m", "roomwatch", "gallery"],
+            )
+        self.assertEqual(result["method"], "graceful")
+
 
 if __name__ == "__main__":
     unittest.main()

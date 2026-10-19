@@ -274,11 +274,12 @@ class PreviewImageTest(unittest.TestCase):
 
 
 class ControlTest(unittest.TestCase):
-    def test_start_command_layout(self) -> None:
-        cmd = gui.start_command("C:/py/python.exe", Path("C:/proj"), "C:/proj/config.yaml")
+    def test_guard_command_layout(self) -> None:
+        cmd = gui.guard_command("C:/py/python.exe", Path("C:/proj"), "C:/proj/config.yaml")
         self.assertEqual(cmd[:3], ["C:/py/python.exe", "-m", "roomwatch"])
-        self.assertIn("start", cmd)
+        self.assertIn("guard", cmd)
         self.assertIn("C:/proj/config.yaml", cmd)
+        self.assertIn("guardian.log", cmd[-1])
 
     def test_force_kill_command_is_the_fallback_only(self) -> None:
         self.assertEqual(gui.force_kill_command(4321), ["taskkill", "/PID", "4321", "/F"])

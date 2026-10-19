@@ -212,16 +212,22 @@ def stop_watcher(
 def stop_gallery(
     root: Path | str,
     *,
+    pid_file: Path | str | None = None,
     alive: Optional[Callable[[int], bool]] = None,
     kill: Optional[Callable[..., bool]] = None,
     cmdline: Optional[Callable[[int], list[str]]] = None,
 ) -> dict:
-    """按 PID 文件停止相册；命令行不匹配视为已停止，绝不误杀复用 PID。"""
+    """按 PID 文件停止相册；命令行不匹配视为已停止，绝不误杀复用 PID。
+
+    `pid_file` 用于 `guardian.gallery_pid` 被改成自定义路径的情况；
+    不传时沿用默认的 var/state/gallery.pid。
+    """
     alive = alive or procutil.pid_alive
     kill = kill or procutil.kill_pid
+    path = Path(pid_file) if pid_file is not None else gallery_pid_path(root)
 
     try:
-        pid = int(gallery_pid_path(root).read_text(encoding="utf-8").strip() or 0)
+        pid = int(path.read_text(encoding="utf-8").strip() or 0)
     except (OSError, ValueError):
         pid = 0
 

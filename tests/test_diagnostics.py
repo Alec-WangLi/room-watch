@@ -39,6 +39,14 @@ class RotatingHandlerTest(unittest.TestCase):
             self.assertTrue(p.exists())
             self.assertTrue((Path(tmp) / "x.log.1").exists())
 
+    def test_safe_handler_degrades_instead_of_aborting(self):
+        """日志路径不可写时返回 None，让监控只剩控制台输出也能跑。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "blocker"
+            blocker.write_text("not a directory", encoding="utf-8")
+            handler = logutil.safe_rotating_file_handler(blocker / "x.log")
+        self.assertIsNone(handler)
+
 
 class EventFormatTest(unittest.TestCase):
     def test_event_has_stable_key_value_format(self):

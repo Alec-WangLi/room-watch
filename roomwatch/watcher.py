@@ -160,6 +160,23 @@ class EventStore:
 class Watcher:
     def __init__(self, cfg: dict, dry_run: bool = False,
                  diagnostics: Diagnostics | None = None):
+        """配置类型写错时按「配置错误」退出，而不是「未处理异常」。
+
+        后者会写 EXIT_UNHANDLED（5），guardian 会当成崩溃并触发恢复/告警；
+        而一个 `imgsz: abc` 的笔误应该是可读的配置错误（退出码 2），
+        修配置后重启即可，不该进入崩溃统计。
+        """
+        try:
+            self._init_impl(cfg, dry_run, diagnostics)
+        except SystemExit:
+            raise
+        except (ValueError, TypeError) as exc:
+            log.error("配置项类型不合法，无法启动：%s（检查 config.yaml 与 config.local.yaml）",
+                      exc)
+            raise SystemExit(health.EXIT_CONFIG) from exc
+
+    def _init_impl(self, cfg: dict, dry_run: bool = False,
+                   diagnostics: Diagnostics | None = None):
         self.cfg = cfg
         self.dry_run = dry_run
         self.diagnostics = diagnostics
@@ -1500,7 +1517,9 @@ def main(argv: list[str] | None = None) -> None:
 
     handlers = [logging.StreamHandler()]
     if args.log:
-        handlers.append(logutil.rotating_file_handler(args.log))
+        handler = logutil.safe_rotating_file_handler(args.log)
+        if handler is not None:
+            handlers.append(handler)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",

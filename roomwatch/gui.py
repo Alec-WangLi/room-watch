@@ -312,11 +312,6 @@ def _update_check(python: str, project: Path, timeout: float = 180.0):
     )
 
 
-def start_command(python: str, root: Path, config_path: str) -> list[str]:
-    log = Path(root) / "var" / "logs" / "watcher.log"
-    return [python, "-m", "roomwatch", "start", "--config", str(config_path), "--log", str(log)]
-
-
 def guard_command(python: str, root: Path, config_path: str, *, once: bool = False) -> list[str]:
     """启动守护进程；`once=True` 时立即触发一轮检查。"""
     log = Path(root) / "var" / "logs" / "guardian.log"
@@ -1394,6 +1389,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "MonitorState", "read_state", "read_events", "latest_snapshot", "preview_image",
     "gallery_state", "gallery_url", "gallery_pid",
-    "button_states", "start_command", "force_kill_command", "probe_command",
+    "button_states", "force_kill_command", "probe_command",
     "RoomWatchApp", "main",
 ]

@@ -693,7 +693,18 @@ def _cmd_stop(argv: Sequence[str]) -> int:
 
     root = paths.PROJECT_ROOT
     control.set_desired_state(root, "paused", by="cli")
-    gallery = control.stop_gallery(root)
+    # guardian.gallery_pid 允许自定义；读不到配置就按默认路径停。
+    pid_file = None
+    try:
+        from .config import load_config
+
+        configured = ((load_config(str(root / "config.yaml")).get("guardian") or {})
+                      .get("gallery_pid"))
+        if configured:
+            pid_file = Path(str(configured))
+    except Exception:  # noqa: BLE001 - 配置坏了也要能停监控
+        pid_file = None
+    gallery = control.stop_gallery(root, pid_file=pid_file)
 
     pid = _status_pid()
     if not pid or not procutil.pid_alive(pid):
@@ -891,8 +902,8 @@ def _cmd_autostart(argv: Sequence[str]) -> int:
     if "--help" in argv or "-h" in argv:
         print(
             "用法：rw autostart [--json] [--enable | --disable]\n"
-            "  --enable   写入 HKCU\\...\\Run\\RoomWatch（拉起守护进程）\n"
-            "  --disable  删除该注册表值"
+            "  --enable   注册登录时启动的计划任务（被安全策略拦截时回退 Run 键），拉起守护进程\n"
+            "  --disable  取消计划任务并删除 Run 回退值"
         )
         return 0
 
