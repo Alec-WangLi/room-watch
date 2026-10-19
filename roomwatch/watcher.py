@@ -51,6 +51,7 @@ from . import health
 from . import logutil
 from . import loudness
 from . import paths
+from . import selfcheck as selfcheck_mod
 from . import speaker
 from .diagnostics import Diagnostics
 from .paths import resolve
@@ -791,6 +792,15 @@ class Watcher:
         self.store.add(when, path, conf, notified, video=self.current_video)
 
     def run(self) -> None:
+        results = selfcheck_mod.run(self.cfg, self.root)
+        self.selfcheck = [
+            {"name": item.name, "ok": item.ok, "detail": item.detail}
+            for item in results
+        ]
+        for item in results:
+            if not item.ok:
+                log.warning("启动自检：%s 未通过（%s）", item.name, item.detail)
+
         if not self.open_camera():
             self.exit_reason = "camera"
             health.write_exit_record(
