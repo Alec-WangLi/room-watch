@@ -1,4 +1,4 @@
-"""设置窗口：推送 / 身份 / 自启 / 声音 四个页签。
+"""设置窗口：摄像头 / 推送 / 相册 / 身份 / 自启 / 声音 六个页签。
 
 设计约束（都很实在）
 --------------------
@@ -20,7 +20,7 @@ from typing import Optional
 
 
 # 页签顺序。必须与 settings.sections() 一致（tests/test_settings.py 钉住）。
-SECTIONS = ("推送", "身份", "自启", "声音")
+SECTIONS = ("摄像头", "推送", "相册", "身份", "自启", "声音")
 
 
 class SettingsDialog:
@@ -59,6 +59,8 @@ class SettingsDialog:
             holder.pack(fill="both", expand=True)
             self.rows_holder[name] = holder
 
+        self._build_camera_block(self.rows_holder["摄像头"])
+        self._build_gallery_block(self.rows_holder["相册"])
         self._build_identity_block(self.rows_holder["身份"])
         self._build_autostart_block(self.rows_holder["自启"])
         self._build_push_actions(self.tab_frames["推送"])
@@ -122,6 +124,60 @@ class SettingsDialog:
         self.ttk.Label(bar, text="会先保存当前页面，再发一条测试消息",
                        font=self.app.font_small, foreground="#888").pack(side="left", padx=8)
 
+    def _build_camera_block(self, parent) -> None:
+        box = self.ttk.LabelFrame(parent, text="验证", padding=8)
+        box.pack(fill="x", pady=(0, 8))
+        self.camera_label = self.tk.Label(box, text="改完先保存，再点「测试摄像头」。",
+                                          anchor="w", justify="left",
+                                          font=self.app.font_small, fg="#666")
+        self.camera_label.pack(fill="x")
+        bar = self.ttk.Frame(box)
+        bar.pack(fill="x", pady=(6, 0))
+        self.ttk.Button(bar, text="测试摄像头",
+                        command=self.on_test_camera).pack(side="left")
+        self.ttk.Button(bar, text="改回本机摄像头",
+                        command=self.on_clear_camera_source).pack(side="left", padx=6)
+        self.ttk.Label(box, text="测试需要摄像头空闲；监控运行中请先停止监控。",
+                       font=self.app.font_small, foreground="#888").pack(fill="x", pady=(6, 0))
+
+    def _build_gallery_block(self, parent) -> None:
+        box = self.ttk.LabelFrame(parent, text="如何用手机访问", padding=8)
+        box.pack(fill="x", pady=(0, 8))
+        self.gallery_label = self.tk.Label(box, text="读取中…", anchor="w", justify="left",
+                                           font=self.app.font_small, fg="#666")
+        self.gallery_label.pack(fill="x")
+        self.ttk.Label(box, text="手机与电脑要连同一个 Wi-Fi；首次访问可能需要在 Windows 防火墙里放行。",
+                       font=self.app.font_small, foreground="#888").pack(fill="x", pady=(6, 0))
+
+    def _show_gallery_info(self, info: dict) -> None:
+        if not info:
+            self.gallery_label.configure(text="相册地址读取失败。", fg="#993C1D")
+            return
+        local = str(info.get("local_url") or "")
+        if not info.get("lan_enabled"):
+            self.gallery_label.configure(
+                text=f"当前仅本机可访问：{local}\n"
+                     "要手机查看：把「允许局域网访问」改成 0.0.0.0，"
+                     "并设置至少 12 位密码，保存后重启监控。",
+                fg="#993C1D")
+            return
+        if not info.get("token_set"):
+            self.gallery_label.configure(
+                text="已允许局域网访问，但没有设置相册密码；相册会拒绝启动。\n"
+                     "请在上面设置至少 12 位密码。",
+                fg="#993C1D")
+            return
+        lines = [f"{item.get('interface')}：{item.get('url')}"
+                 for item in (info.get("lan_urls") or [])[:4]]
+        if not lines:
+            self.gallery_label.configure(
+                text="已允许局域网访问，但没有找到可用的局域网地址（检查 Wi-Fi/网线）。",
+                fg="#993C1D")
+            return
+        self.gallery_label.configure(
+            text="手机访问（同一 Wi-Fi，密码是上面设置的相册密码）：\n" + "\n".join(lines),
+            fg="#0F6E56")
+
     # ---------------- 读取 ----------------
 
     def reload(self) -> None:
@@ -139,6 +195,7 @@ class SettingsDialog:
             return
         self.labels = data["labels"]
         self._fill_rows(data.get("values") or {}, data.get("secrets") or {})
+        self._show_gallery_info(data.get("gallery") or {})
         self.status_label.configure(text="已读取。改完点「保存」，重启监控后生效。", fg="#666")
 
     def _fill_rows(self, values: dict, secrets: dict) -> None:
@@ -302,6 +359,85 @@ class SettingsDialog:
                 "\n\n常见原因：webhook 粘错（应形如 .../webhook/send?key=xxx）、"
                 "机器人已被移出群、当前渠道没有填凭据。")
         self.status_label.configure(text="测试未通过，配置已保存", fg="#993C1D")
+
+    # ---------------- 摄像头 ----------------
+
+    def on_test_camera(self) -> None:
+        if self._saving or not self._populated:
+            return
+        state = getattr(self.app, "_state", None)
+        if state is not None and state.pid:
+            self.app.messagebox.showwarning(
+                "请先停止监控", "摄像头同一时间只能被一个进程占用，先停止监控再测试。")
+            return
+        self._saving = True
+        self.btn_save.configure(state="disabled")
+        self.camera_label.configure(text="正在保存并测试摄像头…", fg="#666")
+        args = self._save_args()
+
+        def work() -> dict:
+            saved = self.app._run_cli(args, timeout=60)
+            if not saved.get("ok"):
+                return {"ok": False, "stage": "save", "detail": saved}
+            tested = self.app._run_cli(
+                ["probe", "--config", str(self.app.config), "--json"],
+                timeout=90, need_cv2=True,
+            )
+            return {"ok": bool(tested.get("ok")), "stage": "test", "detail": tested}
+
+        self.app._run_task(work, self._on_test_camera)
+
+    def _on_test_camera(self, result: dict) -> None:
+        self._saving = False
+        self.btn_save.configure(state="normal")
+        detail = result.get("detail") or {}
+        if result.get("ok"):
+            size = ""
+            if detail.get("width") and detail.get("height"):
+                size = f"（{detail['width']}×{detail['height']}）"
+            self.camera_label.configure(text=f"摄像头可用{size}，能读到画面。", fg="#0F6E56")
+            self.app.messagebox.showinfo("摄像头可用", f"已经拍到画面{size}。")
+            for key, var in self.vars.items():
+                if (self.labels.get(key) or {}).get("secret"):
+                    var.set("")
+            self.reload()
+            return
+        if result.get("stage") == "save":
+            errors = detail.get("errors") or {}
+            message = "\n".join(errors.values()) or str(detail.get("error") or "保存失败")
+            self.camera_label.configure(text="设置没有保存。", fg="#993C1D")
+            self.app.messagebox.showerror("保存失败，未测试摄像头", message)
+            return
+        message = str(detail.get("error") or detail.get("out") or detail.get("err") or "")
+        self.camera_label.configure(text="摄像头测试失败。", fg="#993C1D")
+        self.app.messagebox.showerror(
+            "摄像头不可用",
+            (message[-600:] or "没有拿到原因") +
+            "\n\n常见原因：编号不对、摄像头被别的程序占用、RTSP 地址或密码错误。")
+
+    def on_clear_camera_source(self) -> None:
+        if not self.app.messagebox.askyesno(
+                "改回本机摄像头",
+                "会删除本机配置里的网络摄像头地址，改用「本机摄像头编号」。\n\n继续吗？"):
+            return
+
+        def work() -> dict:
+            # backend 可能是当初配 RTSP 时写下的 ffmpeg；不清掉会让本机摄像头
+            # 继续走 FFmpeg 打开方式。source 和 backend 一起回落到默认值。
+            return self.app._run_cli(
+                ["config", "--unset", "camera.source", "camera.backend", "--json"],
+                timeout=30)
+
+        self.app._run_task(work, self._on_camera_source_cleared)
+
+    def _on_camera_source_cleared(self, result: dict) -> None:
+        if result.get("ok"):
+            self.camera_label.configure(text="已改回本机摄像头编号。", fg="#0F6E56")
+            self.reload()
+        else:
+            errors = result.get("errors") or {}
+            self.app.messagebox.showerror(
+                "操作失败", "\n".join(errors.values()) or str(result.get("error") or ""))
 
     # ---------------- 身份 ----------------
 

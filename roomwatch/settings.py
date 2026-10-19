@@ -21,7 +21,9 @@ config.yaml**。用户点界面存的东西若写进主配置，下次更新就�
 
 from __future__ import annotations
 
+import json
 import os
+import socket
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Any, Dict
@@ -32,7 +34,7 @@ from .config import load_config
 
 __all__ = [
     "Field", "SPEC", "LOCAL_NAME", "snapshot", "apply", "coerce",
-    "read_local", "write_local", "sections",
+    "read_local", "write_local", "sections", "unset", "gallery_info",
 ]
 
 MAIN_NAME = "config.yaml"
@@ -62,6 +64,7 @@ class Field:
     hi: float = 0.0
     secret: bool = False
     hint: str = ""
+    min_len: int = 0
 
     @property
     def path(self) -> tuple:
@@ -75,6 +78,12 @@ def _add(item: Field) -> None:
     SPEC[item.key] = item
 
 
+# ---- 摄像头 ----
+_add(Field("camera.index", "本机摄像头编号", "摄像头", "int", lo=0, hi=15,
+           hint="0 通常是第一个；不对就试 1、2。改完点「测试摄像头」验证"))
+_add(Field("camera.source", "网络摄像头地址", "摄像头", "secret", secret=True,
+           hint="rtsp://用户名:密码@IP:554/...；留空＝用本机编号"))
+
 # ---- 推送 ----
 _add(Field("notify.channel", "推送渠道", "推送", "choice",
            ("wecom_bot", "wxpusher", "serverchan", "none"),
@@ -86,6 +95,13 @@ _add(Field("notify.wecom_bot.send_video", "录像也推送", "推送", "bool",
 _add(Field("notify.wxpusher.app_token", "WxPusher appToken", "推送", "secret", secret=True))
 _add(Field("notify.wxpusher.uid", "WxPusher UID", "推送", "secret", secret=True))
 _add(Field("notify.serverchan.sendkey", "Server酱 SendKey", "推送", "secret", secret=True))
+
+# ---- 相册 ----
+_add(Field("gallery.host", "允许局域网访问", "相册", "choice",
+           ("127.0.0.1", "0.0.0.0"),
+           hint="127.0.0.1＝仅本机；0.0.0.0＝手机/局域网可访问（必须设置密码）"))
+_add(Field("gallery.token", "相册访问密码", "相册", "secret", secret=True, min_len=12,
+           hint="至少 12 位；留空＝不改。手机访问时用户名随意，密码填这个"))
 
 # ---- 身份 ----
 _add(Field("identity.threshold", "相似度阈值", "身份", "float", lo=0.1, hi=0.99,
@@ -111,7 +127,7 @@ _add(Field("voice.volume_mode", "如何让提示音听得见", "声音", "choice
 
 def sections() -> list[str]:
     """界面上页签的顺序。"""
-    return ["推送", "身份", "自启", "声音"]
+    return ["摄像头", "推送", "相册", "身份", "自启", "声音"]
 
 
 # ---------------------------------------------------------------- 值处理
@@ -136,6 +152,101 @@ def set_path(data: dict, key: str, value: Any) -> None:
             node[part] = child
         node = child
     node[parts[-1]] = value
+
+
+def del_path(data: dict, key: str) -> bool:
+    """删掉一个点分键；父节点空了也一并收掉。返回是否真的删到了。"""
+    parts = key.split(".")
+    node = data
+    parents = []
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            return False
+        parents.append((node, part))
+        node = child
+    if parts[-1] not in node:
+        return False
+    del node[parts[-1]]
+    for parent, part in reversed(parents):
+        if not parent.get(part):
+            del parent[part]
+    return True
+
+
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _lan_addresses() -> list[tuple[str, str]]:
+    """网卡名 + IPv4，排除回环与 169.254；常见家用网段优先。"""
+    try:
+        import psutil
+
+        stats = psutil.net_if_stats()
+        result = []
+        for name, addrs in psutil.net_if_addrs().items():
+            if not (stats.get(name) and stats[name].isup):
+                continue
+            for addr in addrs:
+                if addr.family != socket.AF_INET:
+                    continue
+                ip = str(addr.address)
+                if ip.startswith(("127.", "169.254.")):
+                    continue
+                result.append((name, ip))
+    except Exception:  # noqa: BLE001 - 网卡枚举失败不该影响设置读取
+        return []
+
+    def rank(item: tuple[str, str]) -> tuple:
+        ip = item[1]
+        if ip.startswith("192.168."):
+            return (0, ip)
+        if ip.startswith("10."):
+            return (1, ip)
+        if ip.startswith("172."):
+            return (2, ip)
+        return (3, ip)
+
+    return sorted(result, key=rank)
+
+
+def gallery_info(root: Path | str, cfg: dict | None = None) -> dict:
+    """相册实际监听地址 + 可用于手机访问的局域网地址。"""
+    root = Path(root)
+    cfg = cfg or load_config(str(root / MAIN_NAME))
+    gallery = cfg.get("gallery") or {}
+    host = str(gallery.get("host") or "127.0.0.1")
+    token = str(gallery.get("token") or "").strip()
+
+    port = 0
+    try:
+        state = json.loads((root / "var" / "state" / "gallery.json").read_text(encoding="utf-8"))
+        port = int(state.get("port") or 0)
+    except (OSError, ValueError, TypeError):
+        port = 0
+    if not 0 < port < 65536:
+        try:
+            port = int(gallery.get("port") or 8765)
+        except (TypeError, ValueError):
+            port = 8765
+
+    lan_enabled = host not in LOOPBACK_HOSTS
+    lan_urls = []
+    if lan_enabled:
+        for interface, address in _lan_addresses():
+            lan_urls.append({
+                "interface": interface,
+                "address": address,
+                "url": f"http://{address}:{port}/",
+            })
+    return {
+        "host": host,
+        "port": port,
+        "token_set": bool(token),
+        "lan_enabled": lan_enabled,
+        "local_url": f"http://127.0.0.1:{port}/",
+        "lan_urls": lan_urls,
+    }
 
 
 def coerce(field: Field, raw: Any) -> Any:
@@ -169,7 +280,10 @@ def coerce(field: Field, raw: Any) -> Any:
             raise ValueError(f"{field.label}只能是 {'/'.join(field.choices)}，收到：{raw}")
         return text
 
-    return str(raw).strip()
+    text = str(raw).strip()
+    if field.min_len and text and len(text) < field.min_len:
+        raise ValueError(f"{field.label}至少 {field.min_len} 位，收到 {len(text)} 位")
+    return text
 
 
 def secret_info(value: Any) -> dict:
@@ -201,6 +315,7 @@ def snapshot(root: Path | str) -> dict:
         "secrets": secrets,
         "files": {"main": str(root / MAIN_NAME), "local": str(root / LOCAL_NAME)},
         "sections": sections(),
+        "gallery": gallery_info(root, cfg),
         "labels": {key: {"label": f.label, "section": f.section, "kind": f.kind,
                          "choices": list(f.choices), "hint": f.hint,
                          "secret": f.secret}
@@ -257,6 +372,21 @@ def apply(root: Path | str, changes: dict) -> dict:
     if not coerced:
         return {"ok": True, "applied": [], "errors": {}}
 
+    # 跨字段校验：允许局域网访问时，生效密码必须够长。放在落盘前，
+    # 否则会出现「设置存进去了、相册却拒绝启动」。只在本次确实改了相册设置时
+    # 检查，避免一个历史遗留的无效相册配置挡住推送/声音等无关保存。
+    if any(key.startswith("gallery.") for key in coerced):
+        current = load_config(str(root / MAIN_NAME))
+        host = str(coerced.get("gallery.host",
+                               get_path(current, "gallery.host")) or "127.0.0.1")
+        token = str(coerced.get("gallery.token",
+                                get_path(current, "gallery.token")) or "").strip()
+        if host not in LOOPBACK_HOSTS and len(token) < 12:
+            errors["gallery.token"] = (
+                "允许局域网访问时必须设置至少 12 位相册密码（房间画面不能裸奔）"
+            )
+            return {"ok": False, "applied": [], "errors": errors}
+
     local_path = root / LOCAL_NAME
     data = read_local(local_path)
     for key, value in coerced.items():
@@ -271,3 +401,33 @@ def apply(root: Path | str, changes: dict) -> dict:
             errors[key] = f"复读不一致：期望 {value!r}，读回 {got!r}（检查 {LOCAL_NAME} 是否可写）"
 
     return {"ok": not errors, "applied": list(coerced), "errors": errors}
+
+
+def unset(root: Path | str, keys: list[str]) -> dict:
+    """从 config.local.yaml 删除指定键，回落到 config.yaml 的默认值。
+
+    主要给「改回本机摄像头」用：camera.source 是密钥字段，界面留空＝不改，
+    所以必须有一个明确的删除动作，否则换不回 USB 摄像头。
+    """
+    root = Path(root)
+    errors: dict = {}
+    for key in keys:
+        if not key or key.startswith(".") or key.endswith(".") or ".." in key:
+            errors[key] = f"键名不合法：{key!r}"
+    if errors:
+        return {"ok": False, "applied": [], "errors": errors}
+
+    local_path = root / LOCAL_NAME
+    data = read_local(local_path)
+    removed = [key for key in keys if del_path(data, key)]
+    try:
+        write_local(local_path, data)
+    except OSError as exc:
+        return {"ok": False, "applied": [],
+                "errors": {keys[0] if keys else "": f"写配置失败：{exc}"}}
+
+    reread = read_local(local_path)
+    for key in keys:
+        if get_path(reread, key) is not None:
+            errors[key] = f"删除后仍能读到 {key}（检查 {LOCAL_NAME} 是否可写）"
+    return {"ok": not errors, "applied": removed, "errors": errors}

@@ -17,6 +17,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -55,13 +56,15 @@ def make_project(root: Path, main_extra: str = "") -> Path:
 
 
 class SpecTest(unittest.TestCase):
-    def test_spec_covers_the_four_tabs(self) -> None:
+    def test_spec_covers_all_tabs(self) -> None:
         sections = {f.section for f in settings.SPEC.values()}
-        self.assertEqual(sections, {"推送", "身份", "自启", "声音"})
+        self.assertEqual(sections, set(settings.sections()))
+        self.assertEqual(len(sections), 6)
 
     def test_credentials_are_flagged_secret(self) -> None:
         for key in ("notify.wecom_bot.webhook", "notify.wxpusher.app_token",
-                    "notify.wxpusher.uid", "notify.serverchan.sendkey"):
+                    "notify.wxpusher.uid", "notify.serverchan.sendkey",
+                    "gallery.token", "camera.source"):
             self.assertTrue(settings.SPEC[key].secret, key)
 
 
@@ -189,6 +192,63 @@ class ApplyTest(unittest.TestCase):
                 settings.write_local = real  # type: ignore[assignment]
         self.assertFalse(result["ok"])
         self.assertTrue(any("复读" in msg for msg in result["errors"].values()))
+
+
+class GallerySettingsTest(unittest.TestCase):
+    def test_lan_requires_password(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"gallery.host": "0.0.0.0"})
+            self.assertFalse(result["ok"])
+            self.assertIn("gallery.token", result["errors"])
+            self.assertFalse((root / "config.local.yaml").exists())
+
+    def test_lan_with_short_password_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"gallery.host": "0.0.0.0",
+                                           "gallery.token": "short"})
+            self.assertFalse(result["ok"])
+            self.assertIn("gallery.token", result["errors"])
+
+    def test_lan_with_password_is_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"gallery.host": "0.0.0.0",
+                                           "gallery.token": "a-strong-passphrase"})
+            self.assertTrue(result["ok"], result)
+            data = yaml.safe_load((root / "config.local.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(data["gallery"]["host"], "0.0.0.0")
+        self.assertEqual(data["gallery"]["token"], "a-strong-passphrase")
+
+    def test_gallery_info_shows_local_only_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            info = settings.gallery_info(root)
+        self.assertFalse(info["lan_enabled"])
+        self.assertEqual(info["local_url"], "http://127.0.0.1:8765/")
+        self.assertEqual(info["lan_urls"], [])
+
+    def test_gallery_info_lists_lan_urls_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            settings.apply(root, {"gallery.host": "0.0.0.0",
+                                  "gallery.token": "a-strong-passphrase"})
+            with mock.patch.object(settings, "_lan_addresses",
+                                   return_value=[("WLAN", "192.168.1.3")]):
+                info = settings.gallery_info(root)
+        self.assertTrue(info["lan_enabled"])
+        self.assertTrue(info["token_set"])
+        self.assertEqual(info["lan_urls"][0]["url"], "http://192.168.1.3:8765/")
+
+    def test_unset_removes_local_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            settings.apply(root, {"camera.source": "rtsp://u:p@10.0.0.2:554/live"})
+            result = settings.unset(root, ["camera.source", "camera.backend"])
+            self.assertTrue(result["ok"], result)
+            data = yaml.safe_load((root / "config.local.yaml").read_text(encoding="utf-8"))
+        self.assertNotIn("camera", data)
 
 
 if __name__ == "__main__":

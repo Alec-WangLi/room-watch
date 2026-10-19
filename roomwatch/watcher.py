@@ -62,6 +62,7 @@ from .detector import FaceFinder
 from .gate import MotionGate
 from .onnx_detector import build_detector
 from .identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker
+from .labels import identity_text
 from .notifier import Notifier
 from .recorder import Recorder, video_path_for
 from .speaker import Speaker
@@ -97,10 +98,10 @@ def idle_seconds_windows() -> float:
 class EventStore:
     """极简 SQLite 事件日志，方便事后按时间查。"""
 
-    # 录像功能上线时给表加了一列。老库里没有这列，
+    # 录像功能上线时给表加了一列；0.1.13 又加了身份列。老库里没有这些列，
     # 而 CREATE TABLE IF NOT EXISTS 对「表已存在」是不做任何事的——
     # 所以新列必须由这里显式补齐，否则写事件直接报错。
-    SCHEMA_COLUMNS = {"video": "TEXT"}
+    SCHEMA_COLUMNS = {"video": "TEXT", "identity": "TEXT"}
 
     def __init__(self, db_path: str):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
@@ -138,11 +139,12 @@ class EventStore:
         conf: float,
         notified: bool,
         video: str | None = None,
+        identity: str | None = None,
     ) -> None:
         self.conn.execute(
-            "INSERT INTO events (ts, snapshot, confidence, notified, video) "
-            "VALUES (?,?,?,?,?)",
-            (ts.isoformat(), snapshot, conf, int(notified), video),
+            "INSERT INTO events (ts, snapshot, confidence, notified, video, identity) "
+            "VALUES (?,?,?,?,?,?)",
+            (ts.isoformat(), snapshot, conf, int(notified), video, identity),
         )
         self.conn.commit()
 
@@ -805,13 +807,15 @@ class Watcher:
         self.last_event_at = when
         notified = False
         if self.notify_allowed():
-            text = f"{when.strftime('%H:%M:%S')} 检测到有人进入房间\n存档: {path}"
+            text = (f"{when.strftime('%H:%M:%S')} 检测到有人进入房间"
+                    f"（{identity_text(self.last_identity_label)}）\n存档: {path}")
             if self.current_video:
                 text += f"\n录像: {self.current_video}"
             with open(path, "rb") as f:
                 notified = self.notifier.send(text, image_bytes=f.read())
 
-        self.store.add(when, path, conf, notified, video=self.current_video)
+        self.store.add(when, path, conf, notified, video=self.current_video,
+                       identity=self.last_identity_label)
 
     def run(self) -> None:
         results = selfcheck_mod.run(self.cfg, self.root)

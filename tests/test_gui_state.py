@@ -170,12 +170,43 @@ class ReadEventsTest(unittest.TestCase):
             events = gui.read_events(root)
         self.assertEqual([e["ts"] for e in events], ["2026-10-18T02:00:00", "2026-10-18T01:00:00"])
         self.assertEqual(events[0]["confidence"], 0.77)
+        self.assertIsNone(events[0]["identity"], "旧库没有身份列时应回退为空")
+
+    def test_identity_column_is_returned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_dir = root / "var" / "db"
+            db_dir.mkdir(parents=True)
+            conn = sqlite3.connect(db_dir / "events.db")
+            conn.execute(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, "
+                "snapshot TEXT, confidence REAL, notified INTEGER, video TEXT, identity TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO events (ts, snapshot, confidence, notified, video, identity) "
+                "VALUES (?,?,?,?,?,?)",
+                ("2026-10-18T03:00:00", "c.jpg", 0.8, 1, None, "other"),
+            )
+            conn.commit()
+            conn.close()
+            events = gui.read_events(root)
+        self.assertEqual(events[0]["identity"], "other")
 
     def test_limit_is_respected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.make_db(root)
             self.assertEqual(len(gui.read_events(root, limit=1)), 1)
+
+
+class IdentityLabelTest(unittest.TestCase):
+    def test_known_labels(self) -> None:
+        from roomwatch.labels import identity_text
+
+        self.assertEqual(identity_text("owner"), "本人")
+        self.assertEqual(identity_text("other"), "访客")
+        self.assertEqual(identity_text("unknown"), "认不出")
+        self.assertEqual(identity_text(None), "-")
 
 
 class LatestSnapshotTest(unittest.TestCase):
@@ -377,6 +408,15 @@ class GalleryUrlTest(unittest.TestCase):
             self.assertIsNone(gui.gallery_url(root))
             self._write_state(root, {"pid": 123, "port": 70000})
             self.assertIsNone(gui.gallery_url(root))
+
+    def test_zero_host_opens_via_loopback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_state(root, {
+                "pid": 123, "host": "0.0.0.0", "port": 18765,
+                "url": "http://0.0.0.0:18765/",
+            })
+            self.assertEqual(gui.gallery_url(root), "http://127.0.0.1:18765/")
 
 
 if __name__ == "__main__":

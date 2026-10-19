@@ -63,16 +63,20 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\room-watch.exe"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\room-watch.exe"; Tasks: desktopicon
 
 [Run]
-; 装完直接进配置向导。四问里的第 4 问就是「开机自启」，由向导决定，
-; 安装器这里不传 --autostart，避免「取消勾选仍然自启」的矛盾。
-; 升级时 config.local.yaml 会被卸载器保留：已经有配置就不要再弹首次向导，
-; 否则用户会以为配置丢了，甚至一路回车把原配置覆盖掉。
-Filename: "{app}\runtime\python\python.exe"; \
-  Parameters: "-m roomwatch setup"; \
-  WorkingDir: "{app}"; \
-  Description: "立即配置摄像头与微信推送"; \
+; 首次安装直接打开界面：摄像头、推送、相册都在「设置」里完成，
+; 不再弹一个黑框配置向导。升级时不重复打开（IsFirstRun 检查配置是否存在）。
+; 命令行用户仍可运行 `rw setup` 或「配置.bat」。
+Filename: "{app}\room-watch.exe"; \
+  Description: "打开配置界面"; \
   Flags: postinstall nowait skipifsilent; \
   Check: IsFirstRun
+; 升级时如果原来监控是在跑的，装完自动恢复；升级不该让用户以为监控还在跑，
+; 实际却停在暂停状态。
+Filename: "{app}\runtime\python\python.exe"; \
+  Parameters: "-m roomwatch start --config ""{app}\config.yaml"""; \
+  WorkingDir: "{app}"; \
+  Flags: runhidden nowait postinstall skipifsilent; \
+  Check: ShouldResume
 
 [UninstallRun]
 ; 取消开机自启（reg delete 找不到键会返回非 0，不当作失败）。
@@ -92,6 +96,40 @@ Type: filesandordirs; Name: "{app}\runtime"
 Type: filesandordirs; Name: "{app}\var\logs"
 
 [Code]
+var
+  WasRunning: Boolean;
+
+// 升级前记住「监控本来是否在跑」，装完据此恢复。
+function DesiredIsRunning(): Boolean;
+var
+  Lines: TStringList;
+  I: Integer;
+  Path: String;
+begin
+  Result := False;
+  Path := ExpandConstant('{app}\var\state\desired_state.json');
+  if not FileExists(Path) then
+    exit;
+  Lines := TStringList.Create;
+  try
+    try
+      Lines.LoadFromFile(Path);
+      for I := 0 to Lines.Count - 1 do
+        if Pos('"state"', Lines[I]) > 0 then
+          Result := Pos('running', Lines[I]) > 0;
+    except
+      Result := False;
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+function ShouldResume(): Boolean;
+begin
+  Result := WasRunning;
+end;
+
 // 升级前先停掉旧进程。否则 watcher/guardian 锁着 runtime\python，Inno 会弹
 // 「无法自动关闭所有应用程序」，用户只能手动去任务管理器里找。
 // 顺序：先用程序自己的 stop（让正在写的 mp4/音轨收尾），再按安装目录路径
@@ -137,6 +175,7 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  WasRunning := DesiredIsRunning();
   StopOldProcesses();
   Result := '';
 end;
@@ -154,6 +193,6 @@ begin
   if CurPageID = wpFinished then
     WizardForm.FinishedLabel.Caption :=
       '安装完成。' + #13#10 + #13#10 +
-      '如果刚才弹出的配置向导没配完，可以稍后双击桌面上的 room-watch，' + #13#10 +
-      '在界面里点「配置」重跑；或用开始菜单里的快捷方式启动。';
+      '如果刚才打开的界面还没配完，可以稍后双击桌面上的 room-watch，' + #13#10 +
+      '在界面里点「设置」继续；或用开始菜单里的快捷方式启动。';
 end;

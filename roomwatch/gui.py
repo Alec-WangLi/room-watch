@@ -52,6 +52,7 @@ from . import health
 from . import paths
 from . import procutil
 from . import updater
+from .labels import identity_text
 
 # 心跳超过这个秒数就算停了。与 config.yaml 的 heartbeat.stale_after_seconds 默认值一致；
 # 这里刻意不读 yaml，避免界面进程依赖 PyYAML（打包体积和启动速度都受益）。
@@ -207,9 +208,12 @@ def read_events(root: Path, limit: int = 10) -> list[dict]:
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        # 0.1.13 之前的事件表没有 identity 列；界面只读，不能指望别人先迁移。
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+        identity_col = "identity" if "identity" in cols else "NULL AS identity"
         rows = conn.execute(
-            "SELECT ts, snapshot, confidence, notified, video FROM events "
-            "ORDER BY ts DESC, id DESC LIMIT ?",
+            f"SELECT ts, snapshot, confidence, notified, video, {identity_col} "
+            "FROM events ORDER BY ts DESC, id DESC LIMIT ?",
             (int(limit),),
         ).fetchall()
         conn.close()
@@ -322,7 +326,11 @@ def gallery_state(root: Path) -> Optional[dict]:
     if not 0 < port < 65536:
         return None
     host = str(data.get("host") or "127.0.0.1")
-    url = str(data.get("url") or f"http://{host}:{port}/")
+    # 绑定 0.0.0.0 时浏览器未必认这个地址；本机打开一律走回环。
+    if host in ("0.0.0.0", "::"):
+        url = f"http://127.0.0.1:{port}/"
+    else:
+        url = str(data.get("url") or f"http://{host}:{port}/")
     return {"pid": data.get("pid"), "host": host, "port": port, "url": url}
 
 
@@ -418,8 +426,8 @@ class RoomWatchApp:
 
         self.win = tk_module.Tk()
         self.win.title(f"房间监控 {__version__}")
-        self.win.geometry("640x620")
-        self.win.minsize(580, 520)
+        self.win.geometry("680x740")
+        self.win.minsize(600, 640)
 
         base = font_module.nametofont("TkDefaultFont")
         self.font_big = (base.actual("family"), 16, "bold")
@@ -469,7 +477,7 @@ class RoomWatchApp:
         self.shot_box = ttk.LabelFrame(outer, text="最新抓拍", padding=8)
         self.shot_box.pack(fill="x", pady=(0, 10))
         self.shot_label = tk.Label(self.shot_box, text="暂无抓拍", anchor="center",
-                                   height=7, bg="#f0f0ee")
+                                   bg="#f0f0ee")
         self.shot_label.pack(fill="both", expand=True)
         self.shot_label.bind("<Button-1>", lambda _e: self.on_open_latest())
         tools = ttk.Frame(self.shot_box)
@@ -484,9 +492,10 @@ class RoomWatchApp:
         # 事件列表
         box = ttk.LabelFrame(outer, text="最近事件", padding=8)
         box.pack(fill="both", expand=True)
-        columns = ("ts", "conf", "video")
+        columns = ("ts", "identity", "conf", "video")
         self.tree = ttk.Treeview(box, columns=columns, show="headings", height=5)
-        for key, text, width in (("ts", "时间", 190), ("conf", "置信度", 80), ("video", "录像", 70)):
+        for key, text, width in (("ts", "时间", 190), ("identity", "身份", 70),
+                                 ("conf", "置信度", 70), ("video", "录像", 60)):
             self.tree.heading(key, text=text)
             self.tree.column(key, width=width, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
@@ -570,7 +579,9 @@ class RoomWatchApp:
             ts = str(row.get("ts") or "").replace("T", " ")
             conf = row.get("confidence")
             conf_text = f"{conf:.2f}" if isinstance(conf, (int, float)) else "-"
-            self.tree.insert("", "end", values=(ts, conf_text, "有" if row.get("video") else "-"))
+            self.tree.insert("", "end", values=(
+                ts, identity_text(row.get("identity")), conf_text,
+                "有" if row.get("video") else "-"))
 
     def _refresh_preview(self) -> None:
         path, kind = preview_image(self.project)
@@ -600,7 +611,7 @@ class RoomWatchApp:
         try:
             img = Image.open(path)
             width, height = img.size
-            img.thumbnail((520, 280))
+            img.thumbnail((560, 280))
             self._photo = ImageTk.PhotoImage(img)
             note = f"{path.name} · {width}×{height}"
             self.shot_label.configure(image=self._photo, text=note, compound="top",
@@ -968,6 +979,20 @@ class RoomWatchApp:
 
         gui_settings.open_settings(self)
 
+    def first_run_hint(self) -> None:
+        """首次启动：没有 config.local.yaml 时把用户带到设置页。
+
+        安装器不再启动黑框配置向导；摄像头、推送、相册都在设置里完成。
+        """
+        if (self.project / "config.local.yaml").is_file():
+            return
+        self.messagebox.showinfo(
+            "首次配置",
+            "还没有保存过本机配置。\n\n"
+            "接下来打开「设置」，按页签填好摄像头、推送和相册；\n"
+            "保存后点「启动监控」即可。")
+        self.on_settings()
+
     # ---------------- 更新 ----------------
     #
     # 界面不自己实现版本比对，一律走 `rw update --json`：版本纪律（同「主.次」
@@ -1197,7 +1222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                           ("更新", app.btn_update)):
             if not btn.winfo_exists():
                 problems.append(f"{name}按钮不存在")
-        if len(app.tree["columns"]) != 3:
+        if len(app.tree["columns"]) != 4:
             problems.append("事件表列数不对")
         if "本人模板" not in app.identity_label.cget("text"):
             problems.append("身份状态行没有渲染")
@@ -1215,8 +1240,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dialog = gui_settings.SettingsDialog(app, autoload=False)
         app.win.update()
         tabs = dialog.notebook.tabs()
-        if len(tabs) != 4:
-            problems.append(f"设置页签数量是 {len(tabs)}，应为 4")
+        if len(tabs) != 6:
+            problems.append(f"设置页签数量是 {len(tabs)}，应为 6")
         dialog.close()
 
         width = app.win.winfo_width()
@@ -1234,6 +1259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"界面自检通过（{__version__}），窗口 {width}x{height}，记录：{log}")
         return 0
 
+    app.win.after(500, app.first_run_hint)
     app.run()
     return 0
 

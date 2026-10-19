@@ -715,8 +715,7 @@ def _cmd_stop(argv: Sequence[str]) -> int:
     return 0 if result["method"] in ("graceful", "already-stopped", "forced") else 1
 
 
-def _pairs_after(argv: Sequence[str], flag: str) -> dict:
-    """收集 `--set 键=值 键=值` 里的键值对。值里含 = 也安全（只按第一个 = 切）。"""
+def _items_after(argv: Sequence[str], flag: str) -> list[str]:
     items: list[str] = []
     idx = 0
     while idx < len(argv):
@@ -727,8 +726,13 @@ def _pairs_after(argv: Sequence[str], flag: str) -> dict:
                 idx += 1
             continue
         idx += 1
+    return items
+
+
+def _pairs_after(argv: Sequence[str], flag: str) -> dict:
+    """收集 `--set 键=值 键=值` 里的键值对。值里含 = 也安全（只按第一个 = 切）。"""
     pairs: dict = {}
-    for item in items:
+    for item in _items_after(argv, flag):
         if "=" not in item:
             raise UsageError(f"{flag} 之后每项都要写成 键=值，收到：{item}")
         key, _, value = item.partition("=")
@@ -745,15 +749,30 @@ def _cmd_config(argv: Sequence[str]) -> int:
 
     if "--help" in argv or "-h" in argv:
         print(
-            "用法：rw config [--json] [--set 键=值 …] [--test]\n"
+            "用法：rw config [--json] [--set 键=值 …] [--unset 键 …] [--test]\n"
             "  --json       机器可读输出（界面用）\n"
             "  --set        保存一批设置到 config.local.yaml（先全量校验再落盘）\n"
+            "  --unset      删除本机覆盖，回落到 config.yaml 的默认值\n"
             "  --test       用当前生效的凭据发一条测试消息"
         )
         return 0
 
     if "--test" in argv:
         return _config_test(root, json_mode)
+
+    if "--unset" in argv:
+        keys = _items_after(argv, "--unset")
+        if not keys:
+            raise UsageError("--unset 后面要跟至少一个键")
+        result = settings.unset(root, keys)
+        if json_mode:
+            print(json.dumps(result, ensure_ascii=True))
+        else:
+            for key in result.get("applied") or []:
+                print(f"✓ 已删除 {key}")
+            for key, message in (result.get("errors") or {}).items():
+                print(f"✗ {key}: {message}")
+        return 0 if result["ok"] else 1
 
     if "--set" in argv:
         changes = _pairs_after(argv, "--set")
