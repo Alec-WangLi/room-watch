@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -30,13 +32,41 @@ EXIT_UNHANDLED = 5
 EXIT_STALLED = 6
 
 
+_ATOMIC_LOCK = threading.Lock()
+
+
 def write_json_atomic(path: str | Path, payload: dict) -> None:
-    """同目录写 .tmp 再替换，读侧永远不会看到半截 JSON。"""
+    """同目录写临时文件再替换，读侧永远不会看到半截 JSON。
+
+    临时文件名必须唯一：GUI 与 CLI 可能同时写 desired_state.json，
+    固定 `.tmp` 名会让两个进程互相覆盖/删除，最终抛 PermissionError。
+    同进程内再加一把锁，避免多个线程同时替换同一目标。
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, target)
+    data = json.dumps(payload, ensure_ascii=False, indent=2)
+    with _ATOMIC_LOCK:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=target.name + ".", suffix=".tmp", dir=str(target.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_name, target)
+                    break
+                except PermissionError:
+                    # Windows：目标恰好被读取/替换时可能瞬时报占用，重试即可
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
 
 def read_json(path: str | Path) -> Optional[dict]:

@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -588,24 +589,95 @@ class HistoryDetailTest(unittest.TestCase):
 
 
 class GalleryBackoffTest(unittest.TestCase):
+    def _cfg(self, root):
+        cfg = ExitAttributionTest()._cfg(root)
+        cfg["guardian"]["supervise_gallery"] = True
+        cfg["guardian"]["gallery_pid"] = str(root / "var/state/gallery.pid")
+        cfg["guardian"]["gallery_log"] = str(root / "var/logs/gallery.log")
+        return cfg
+
+    def _ready_root(self, tmp):
+        root = Path(tmp)
+        (root / "var/state").mkdir(parents=True)
+        (root / "var/state/status.json").write_text(json.dumps({
+            "pid": os.getpid(),
+            "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+            encoding="utf-8")
+        return root
+
     def test_gallery_failure_backs_off(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "var/state").mkdir(parents=True)
-            (root / "var/state/status.json").write_text(json.dumps({
-                "pid": os.getpid(),
-                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
-                encoding="utf-8")
-            cfg = ExitAttributionTest()._cfg(root)
-            cfg["guardian"]["supervise_gallery"] = True
-            cfg["guardian"]["gallery_pid"] = str(root / "var/state/gallery.pid")
-            cfg["guardian"]["gallery_log"] = str(root / "var/logs/gallery.log")
-            g = G.Guard(cfg, dry_run=True)
+            root = self._ready_root(tmp)
+            g = G.Guard(self._cfg(root), dry_run=True)
             calls = []
             g._start_gallery = lambda: calls.append(True) or None
             g.check_once()
             g.check_once()
         self.assertEqual(len(calls), 1)
+
+    def test_spawned_but_dead_gallery_counts_as_failure(self):
+        """拉起成功不等于健康：相册 bind 失败后立刻退出，必须累计失败。
+
+        真机事故：guardian 每分钟拉起一次、失败计数每次被清零，
+        永远进不了退避，也永远不告警。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._ready_root(tmp)
+            cfg = self._cfg(root)
+            cfg["guardian"]["crash_threshold"] = 2
+            g = G.Guard(cfg, dry_run=True)
+            g.state["last_gallery_spawn_at"] = (
+                datetime.now() - timedelta(minutes=5)
+            ).isoformat(timespec="seconds")
+            g.state["gallery_failures"] = 1
+            g._start_gallery = lambda: 999      # 进程起来了，但从不写 PID 文件
+            sent = []
+            g._notify = lambda text: sent.append(text)
+            g.check_once()
+        self.assertEqual(g.state["gallery_failures"], 2)
+        self.assertTrue(any("相册" in text or "重启" in text for text in sent))
+
+    def test_healthy_gallery_resets_failure_streak(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._ready_root(tmp)
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g.state["gallery_failures"] = 5
+            with mock.patch.object(G, "decide_gallery", return_value=G.ACT_OK):
+                g._check_gallery(datetime.now())
+        self.assertEqual(g.state["gallery_failures"], 0)
+
+    def test_long_healthy_run_then_death_is_not_crash_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._ready_root(tmp)
+            pid_file = root / "var/state/gallery.pid"
+            pid_file.write_text(str(DEAD_PID), encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(pid_file, (old, old))
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g.state["gallery_failures"] = 5
+            g.state["last_gallery_spawn_at"] = (
+                datetime.now() - timedelta(hours=2)
+            ).isoformat(timespec="seconds")
+            g._start_gallery = lambda: 111
+            g._check_gallery(datetime.now())
+        self.assertEqual(g.state["gallery_failures"], 1)
+
+    def test_stale_pid_file_does_not_hide_crash_loop(self):
+        """上一轮留下的旧 PID 文件不能被当成「刚健康运行过」。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._ready_root(tmp)
+            pid_file = root / "var/state/gallery.pid"
+            pid_file.write_text(str(DEAD_PID), encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(pid_file, (old, old))
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g.state["gallery_failures"] = 2
+            g.state["last_gallery_spawn_at"] = (
+                datetime.now() - timedelta(minutes=1)
+            ).isoformat(timespec="seconds")
+            g._start_gallery = lambda: 111
+            g._check_gallery(datetime.now())
+        self.assertEqual(g.state["gallery_failures"], 3)
 
 
 class OwnerLockValidationTest(unittest.TestCase):

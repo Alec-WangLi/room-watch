@@ -306,6 +306,39 @@ def _port_open(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
+def gallery_state(root: Path) -> Optional[dict]:
+    """相册实际监听的地址。
+
+    端口不再是常量：Windows 可能保留整段端口（本机 8748–8847），
+    相册会改用其它端口并把实际地址写进 gallery.json。
+    """
+    data = health.read_json(Path(root) / "var" / "state" / "gallery.json")
+    if not isinstance(data, dict):
+        return None
+    try:
+        port = int(data.get("port") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not 0 < port < 65536:
+        return None
+    host = str(data.get("host") or "127.0.0.1")
+    url = str(data.get("url") or f"http://{host}:{port}/")
+    return {"pid": data.get("pid"), "host": host, "port": port, "url": url}
+
+
+def gallery_url(root: Path) -> Optional[str]:
+    info = gallery_state(root)
+    return str(info["url"]) if info else None
+
+
+def gallery_pid(root: Path) -> int:
+    try:
+        return int((Path(root) / "var" / "state" / "gallery.pid")
+                   .read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
 def _tk_candidates() -> list[str]:
     """可能带 tkinter 的解释器，按发现顺序去重。"""
     seen: list[str] = []
@@ -779,11 +812,25 @@ class RoomWatchApp:
     # ---------------- 动作：相册 / 预览 / 注册 ----------------
 
     def on_gallery(self) -> None:
-        if not _port_open(8765):
+        info = gallery_state(self.project)
+        if info and _port_open(int(info["port"])):
+            webbrowser.open(str(info["url"]))
+            return
+        pid = gallery_pid(self.project)
+        if not (pid and procutil.pid_alive(pid)):
             self._spawn([self.python, "-m", "roomwatch", "gallery"])
-            self.win.after(900, lambda: webbrowser.open("http://127.0.0.1:8765/"))
-        else:
-            webbrowser.open("http://127.0.0.1:8765/")
+        self._open_gallery_soon(time.monotonic() + 8.0)
+
+    def _open_gallery_soon(self, deadline: float) -> None:
+        """相册启动后才知道实际端口，轮询状态文件再打开浏览器。"""
+        info = gallery_state(self.project)
+        if info and _port_open(int(info["port"])):
+            webbrowser.open(str(info["url"]))
+            return
+        if time.monotonic() < deadline:
+            self.win.after(300, lambda: self._open_gallery_soon(deadline))
+            return
+        webbrowser.open(str((info or {}).get("url") or "http://127.0.0.1:8765/"))
 
     def on_probe(self) -> None:
         if self._busy:
@@ -1155,6 +1202,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if "本人模板" not in app.identity_label.cget("text"):
             problems.append("身份状态行没有渲染")
 
+        # 打包后的界面必须自带 psutil：没有它，判活会回退到 tasklist，
+        # 而每 2 秒一次的 tasklist 会让窗口持续闪控制台。构建自检直接拦下。
+        if getattr(sys, "frozen", False):
+            try:
+                import psutil  # noqa: F401
+            except Exception:  # noqa: BLE001
+                problems.append("psutil 未打包进界面（判活会回退到 tasklist 并闪烁）")
+
         from . import gui_settings
 
         dialog = gui_settings.SettingsDialog(app, autoload=False)
@@ -1185,6 +1240,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "MonitorState", "read_state", "read_events", "latest_snapshot", "preview_image",
+    "gallery_state", "gallery_url", "gallery_pid",
     "button_states", "start_command", "force_kill_command", "probe_command",
     "RoomWatchApp", "main",
 ]

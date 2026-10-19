@@ -38,9 +38,15 @@ class Diagnostics:
     def install(self) -> None:
         if self._installed:
             return
-        self.fault_log.parent.mkdir(parents=True, exist_ok=True)
-        self.fault_file = open(self.fault_log, "ab", buffering=0)
-        faulthandler.enable(file=self.fault_file, all_threads=True)
+        try:
+            self.fault_log.parent.mkdir(parents=True, exist_ok=True)
+            self.fault_file = open(self.fault_log, "ab", buffering=0)
+            faulthandler.enable(file=self.fault_file, all_threads=True)
+        except OSError as exc:
+            # 磁盘满、权限不足、路径被目录占住：崩溃转储可以没有，
+            # 但监控必须照常启动，Python 异常钩子也仍然有效。
+            log.warning("无法启用原生崩溃转储（%s）：%s", self.fault_log, exc)
+            self.fault_file = None
 
         self._old_sys_hook = sys.excepthook
         self._old_thread_hook = threading.excepthook

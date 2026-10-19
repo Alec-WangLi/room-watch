@@ -42,11 +42,12 @@ if (-not (Test-Path ".venv-gui\Scripts\python.exe")) {
     Write-Host "创建 .venv-gui ..." -ForegroundColor Cyan
     & $sys -m venv .venv-gui
 }
-& ".venv-gui\Scripts\python.exe" -m pip install --quiet --upgrade pillow pyinstaller
+& ".venv-gui\Scripts\python.exe" -m pip install --quiet --upgrade pillow psutil pyinstaller
 
 Write-Host "开始打包 ..." -ForegroundColor Cyan
 & ".venv-gui\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed `
     --name room-watch --paths . `
+    --hidden-import psutil `
     --add-data "$root\VERSION;." `
     --icon "$root\assets\room-watch.ico" `
     --distpath dist --workpath build\pyi --specpath build `

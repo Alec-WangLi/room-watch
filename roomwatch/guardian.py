@@ -386,6 +386,8 @@ class Guard:
             "gallery_failures": 0,
             "last_gallery_restart_at": None,
             "last_gallery_alert_at": None,
+            "last_gallery_spawn_at": None,
+            "last_gallery_spawn_pid": None,
         }
         try:
             with open(self.state_path, "r", encoding="utf-8") as f:
@@ -399,8 +401,7 @@ class Guard:
     def _save_state(self) -> None:
         self.state["last_check_at"] = datetime.now().isoformat(timespec="seconds")
         try:
-            with open(self.state_path, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, ensure_ascii=False, indent=2)
+            health.write_json_atomic(self.state_path, self.state)
         except OSError as exc:
             log.warning("写守护状态失败: %s", exc)
 
@@ -597,21 +598,61 @@ class Guard:
         elapsed = (now - last).total_seconds()
         return wait - elapsed if elapsed < wait else None
 
+    def _gallery_pid_age(self, now: datetime) -> Optional[float]:
+        """PID 文件有多久没更新：相册只在启动成功时写它。
+
+        文件很旧说明上一次确实健康运行过；文件缺失或很新，说明刚拉起的
+        相册可能还没来得及监听就退了（端口被保留/占用时就是这样）。
+        """
+        try:
+            mtime = Path(self.gallery_pid_path).stat().st_mtime
+        except OSError:
+            return None
+        return max(0.0, now.timestamp() - mtime)
+
     def _check_gallery(self, now: datetime) -> str:
         pid = self._gallery_pid()
         action = decide_gallery(pid, pid_alive, cmdline=_psutil_cmdline)
+        if action == ACT_OK:
+            # 只有「下一次检查时还活着」才算恢复。拉起成功（Popen 返回 PID）
+            # 不代表监听成功——端口 bind 失败会立刻退出。
+            if int(self.state.get("gallery_failures", 0)):
+                log.info("相册已恢复，清空失败计数")
+                self.state["gallery_failures"] = 0
+                self._save_state()
+            return action
         if action != ACT_RESTART_GONE:
             return action
         if self._gallery_restart_blocked(now) is not None:
             return ACT_BACKOFF
 
-        new_pid = self._start_gallery()
         failures = int(self.state.get("gallery_failures", 0))
+        spawn_age = None
+        raw = self.state.get("last_gallery_spawn_at")
+        if raw:
+            try:
+                spawn_age = (now - datetime.fromisoformat(str(raw))).total_seconds()
+            except (TypeError, ValueError):
+                spawn_age = None
+        recent_spawn = spawn_age is not None and spawn_age < self.crash_window_minutes * 60
+        age = self._gallery_pid_age(now)
+        # 旧 PID 文件可能一直留在盘上。只有「最近没有拉起过」且文件很旧，
+        # 才能认定上一轮活过了整个崩溃窗口；否则会把崩溃循环误判成健康。
+        if not recent_spawn and age is not None and age >= self.crash_window_minutes * 60:
+            failures = 0
+        first_start = not self.state.get("last_gallery_spawn_at")
+
+        new_pid = self._start_gallery()
         if new_pid:
-            self.state["gallery_failures"] = 0
+            self.state["last_gallery_spawn_at"] = now.isoformat(timespec="seconds")
+            self.state["last_gallery_spawn_pid"] = int(new_pid)
+            # 成功拉起 ≠ 健康；除了第一次启动，每次重启都先记一次失败，
+            # 等下一次检查看到它还活着再清零。
+            if not first_start:
+                failures += 1
         else:
             failures += 1
-            self.state["gallery_failures"] = failures
+        self.state["gallery_failures"] = failures
         self.state["last_gallery_restart_at"] = now.isoformat(timespec="seconds")
         append_history(self.history_path, {
             "at": now.isoformat(timespec="seconds"),
@@ -620,6 +661,7 @@ class Guard:
             "exit_code": None,
             "exit_reason": "not-running" if not pid else "unknown",
             "new_pid": new_pid,
+            "failures": failures,
         })
 
         if failures >= self.crash_threshold:

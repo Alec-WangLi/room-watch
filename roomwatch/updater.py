@@ -357,7 +357,8 @@ def stop_watcher(status_path: Optional[Path] = None, *, grace: float = 8.0) -> b
     try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, timeout=grace + 5)
+                           capture_output=True, timeout=grace + 5,
+                           creationflags=procutil.no_window_flags())
         else:
             import signal
 
@@ -515,7 +516,8 @@ def _pid_alive(pid: int) -> bool:
     if os.name == "nt":
         try:
             r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                               capture_output=True, timeout=8)
+                               capture_output=True, timeout=8,
+                               creationflags=procutil.no_window_flags())
             # 不 text=True：中文 Windows 的 tasklist 输出是 GBK，
             # 按 UTF-8 解码会在 subprocess 的读线程里抛 UnicodeDecodeError。
             return str(pid).encode("ascii") in (r.stdout or b"")

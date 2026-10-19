@@ -17,6 +17,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 import contextlib
 import io
+import json
 import os
 import shutil
 import socket
@@ -28,6 +29,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -362,6 +364,102 @@ class GalleryPidTest(unittest.TestCase):
     def test_remove_missing_is_safe(self):
         with tempfile.TemporaryDirectory() as tmp:
             gallery.remove_pid_file(Path(tmp) / "nope.pid", 123)
+
+
+class BindFallbackTest(unittest.TestCase):
+    """Windows 可能把端口段保留给系统（WinError 10013）。
+
+    真机事故：8765 落在保留段 8748–8847 里，相册每次启动都直接崩，
+    guardian 每分钟重启一次。不能让一个被系统占用的端口把相册彻底钉死。
+    """
+
+    def test_preferred_port_used_when_free(self):
+        class FakeServer:
+            def __init__(self, address, handler):
+                self.server_address = address
+
+        with mock.patch.object(gallery, "GalleryServer", FakeServer):
+            server, port, reason = gallery.open_server("127.0.0.1", 8765, object())
+        self.assertEqual(port, 8765)
+        self.assertIsNone(reason)
+
+    def test_reserved_port_falls_back_to_stable_offset(self):
+        calls = []
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                calls.append(address)
+                if address[1] == 8765:
+                    raise PermissionError(10013, "访问权限不允许")
+                self.server_address = address
+
+        with mock.patch.object(gallery, "GalleryServer", FakeServer):
+            server, port, reason = gallery.open_server("127.0.0.1", 8765, object())
+        self.assertEqual(port, 18765)
+        self.assertEqual(calls, [("127.0.0.1", 8765), ("127.0.0.1", 18765)])
+        self.assertIsInstance(reason, OSError)
+
+    def test_all_offsets_blocked_falls_back_to_os_assigned(self):
+        calls = []
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                calls.append(address)
+                if address[1] != 0:
+                    raise PermissionError(10013, "访问权限不允许")
+                self.server_address = ("127.0.0.1", 54321)
+
+        with mock.patch.object(gallery, "GalleryServer", FakeServer):
+            server, port, reason = gallery.open_server("127.0.0.1", 8765, object())
+        self.assertEqual(port, 54321)
+        self.assertEqual(
+            calls,
+            [("127.0.0.1", 8765), ("127.0.0.1", 18765),
+             ("127.0.0.1", 28765), ("127.0.0.1", 0)],
+        )
+        self.assertIsInstance(reason, OSError)
+
+    def test_port_zero_goes_straight_to_os(self):
+        calls = []
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                calls.append(address)
+                self.server_address = ("127.0.0.1", 44000)
+
+        with mock.patch.object(gallery, "GalleryServer", FakeServer):
+            server, port, reason = gallery.open_server("127.0.0.1", 0, object())
+        self.assertEqual(calls, [("127.0.0.1", 0)])
+        self.assertEqual(port, 44000)
+        self.assertIsNone(reason)
+
+
+class GalleryStateTest(unittest.TestCase):
+    def test_state_records_actual_address_and_is_removed_by_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gallery.json"
+            gallery.write_state_file(
+                path, pid=123, host="127.0.0.1", port=54321,
+                started_at="2026-10-19T15:00:00",
+            )
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["pid"], 123)
+            self.assertEqual(data["host"], "127.0.0.1")
+            self.assertEqual(data["port"], 54321)
+            self.assertEqual(data["url"], "http://127.0.0.1:54321/")
+
+            gallery.remove_state_file(path, 999)
+            self.assertTrue(path.exists())
+            gallery.remove_state_file(path, 123)
+            self.assertFalse(path.exists())
+
+    def test_remove_missing_or_corrupt_is_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gallery.json"
+            gallery.remove_state_file(path, 123)
+            path.write_text("not json", encoding="utf-8")
+            gallery.remove_state_file(path, 123)
+            self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":

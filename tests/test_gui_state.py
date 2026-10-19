@@ -341,5 +341,43 @@ class HeadlessSubprocessTest(unittest.TestCase):
         self.assertEqual(kwargs.get("creationflags"), gui._headless_flags())
 
 
+class GalleryUrlTest(unittest.TestCase):
+    """相册端口不再写死：相册可能因系统保留端口而改用别的端口。"""
+
+    def _write_state(self, root: Path, payload) -> None:
+        state = root / "var" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "gallery.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def test_missing_state_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(gui.gallery_url(Path(tmp)))
+
+    def test_reads_actual_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_state(root, {
+                "pid": 123, "host": "127.0.0.1", "port": 54321,
+                "url": "http://127.0.0.1:54321/",
+            })
+            self.assertEqual(gui.gallery_url(root), "http://127.0.0.1:54321/")
+
+    def test_builds_url_from_host_and_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_state(root, {"pid": 123, "host": "127.0.0.1", "port": 54321})
+            self.assertEqual(gui.gallery_url(root), "http://127.0.0.1:54321/")
+
+    def test_invalid_state_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_state(root, {"pid": 123, "port": "not-a-port"})
+            self.assertIsNone(gui.gallery_url(root))
+            self._write_state(root, {"pid": 123, "port": 70000})
+            self.assertIsNone(gui.gallery_url(root))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,7 @@ _STATE_FILES = (
     "var/state/guardian_history.jsonl",
     "var/state/desired_state.json",
     "var/state/gallery.pid",
+    "var/state/gallery.json",
 )
 
 _LOG_TAIL_BYTES = 2 * 1024 * 1024

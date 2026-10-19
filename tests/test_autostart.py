@@ -16,8 +16,9 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from roomwatch import autostart
+from roomwatch import autostart, procutil
 
 ROOT = Path("C:/Users/Alec/AppData/Local/Programs/room-watch")
 PYTHONW = "C:/Users/Alec/AppData/Local/Programs/room-watch/runtime/python/pythonw.exe"
@@ -201,6 +202,17 @@ class BackendStatusTest(unittest.TestCase):
                                 runner=lambda cmd: (0, "", ""), platform="win32")
         self.assertEqual(info["backend"], "conflict")
         self.assertTrue(info["conflict"])
+
+
+class DefaultRunnerTest(unittest.TestCase):
+    def test_schtasks_is_hidden_when_parent_has_no_console(self):
+        """界面里切换自启时，schtasks 不能弹控制台。"""
+        fake = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(autostart.subprocess, "run", return_value=fake) as run:
+            autostart._default_runner(["schtasks", "/Query"])
+        self.assertEqual(
+            run.call_args.kwargs.get("creationflags"), procutil.no_window_flags()
+        )
 
 
 if __name__ == "__main__":

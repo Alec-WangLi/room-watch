@@ -301,8 +301,16 @@ def _check_port(port: int = 8765) -> Check:
     try:
         sock.bind(("127.0.0.1", port))
         return Check("相册端口", True, f"127.0.0.1:{port} 空闲", fatal=False)
-    except OSError:
-        return Check("相册端口", False, f"127.0.0.1:{port} 已被占用（相册可能已在跑）", fatal=False)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 10013:
+            return Check(
+                "相册端口", False,
+                f"127.0.0.1:{port} 被 Windows 保留（端口排除范围）；"
+                "相册启动时会自动改用其它端口，不需要手工处理",
+                fatal=False,
+            )
+        return Check("相册端口", False,
+                     f"127.0.0.1:{port} 已被占用（相册可能已在跑）", fatal=False)
     finally:
         sock.close()
 

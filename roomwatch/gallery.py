@@ -26,11 +26,13 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote, urlparse
 
 from .config import load_config
 from .paths import CAPTURES_DIR, STATE_DIR, resolve
 from .rules import gap_seconds
+from . import health
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
@@ -453,6 +455,63 @@ def remove_pid_file(path: str | Path, pid: int) -> None:
         pass
 
 
+def open_server(host: str, port: int, handler) -> tuple:
+    """绑定端口；首选端口不可用时换一个稳定端口，最后才让系统分配。
+
+    Windows 会为 Hyper-V/WinNAT 等保留整段 TCP 端口（本机实测
+    8748–8847），落在保留段里的 bind 会以 WinError 10013 失败。
+    先试 +10000/+20000 这类固定偏移，能保持「每次启动地址一样」，
+    方便用户收藏相册地址；都不行再让系统分配，并把实际端口写进
+    状态文件供界面读取。
+    """
+    reason: Optional[OSError] = None
+    candidates = []
+    if port:
+        candidates.append(int(port))
+        for offset in (10000, 20000):
+            candidate = int(port) + offset
+            if candidate < 65536:
+                candidates.append(candidate)
+    else:
+        candidates.append(0)
+
+    for candidate in candidates:
+        try:
+            server = GalleryServer((host, candidate), handler)
+            return server, int(server.server_address[1]), reason
+        except OSError as exc:
+            if reason is None:
+                reason = exc
+    server = GalleryServer((host, 0), handler)
+    return server, int(server.server_address[1]), reason
+
+
+def write_state_file(
+    path: str | Path, *, pid: int, host: str, port: int,
+    started_at: Optional[str] = None,
+) -> None:
+    """记录相册实际在哪个地址监听，界面据此打开正确的 URL。"""
+    url = f"http://{host}:{int(port)}/"
+    health.write_json_atomic(Path(path), {
+        "pid": int(pid),
+        "host": host,
+        "port": int(port),
+        "url": url,
+        "started_at": started_at or datetime.now().isoformat(timespec="seconds"),
+    })
+
+
+def remove_state_file(path: str | Path, pid: int) -> None:
+    """只删自己写的状态文件，避免把新实例的地址删掉。"""
+    target = Path(path)
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        if int(data.get("pid") or 0) == int(pid):
+            target.unlink()
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="本地抓拍相册")
     ap.add_argument("--config", default=str(resolve("config.yaml")),
@@ -465,6 +524,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--stale-after", type=float, default=120.0)
     ap.add_argument("--pid-file", default=str(STATE_DIR / "gallery.pid"),
                     help="运行中写 PID，供守护进程判活")
+    ap.add_argument("--state-file", default=None,
+                    help="实际监听地址（默认与 pid 文件同目录的 gallery.json）")
     args = ap.parse_args(argv)
 
     gallery_cfg: dict = {}
@@ -488,16 +549,25 @@ def main(argv: list[str] | None = None) -> None:
     Handler.stale_after = args.stale_after
     Handler.auth_token = token
 
-    url = f"http://{host}:{port}/"
+    pid_file = os.path.abspath(args.pid_file)
+    state_file = os.path.abspath(
+        args.state_file or str(Path(pid_file).with_name("gallery.json"))
+    )
+    server, actual_port, fallback_reason = open_server(host, port, Handler)
+    if fallback_reason is not None:
+        print(
+            f"端口 {port} 不可用（{fallback_reason}），"
+            f"已改用 {actual_port}（Windows 保留端口段常见原因）"
+        )
+    url = f"http://{host}:{actual_port}/"
     if token:
         print(f"相册地址 {url}（需要登录：用户名随意，密码 = gallery.token）")
     else:
         print(f"相册地址 {url}（仅本机，Ctrl+C 停止）")
     if host not in LOOPBACK:
         print("提示：Basic 认证走明文 HTTP，只适合家庭/办公内网；公网请套 HTTPS。")
-    server = GalleryServer((host, port), Handler)
-    pid_file = os.path.abspath(args.pid_file)
     write_pid_file(pid_file, os.getpid())
+    write_state_file(state_file, pid=os.getpid(), host=host, port=actual_port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -505,6 +575,7 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         server.server_close()
         remove_pid_file(pid_file, os.getpid())
+        remove_state_file(state_file, os.getpid())
 
 
 if __name__ == "__main__":

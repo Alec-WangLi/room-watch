@@ -211,12 +211,15 @@ def has_module(name: str, python: Optional[str] = None) -> bool:
     """检查某个解释器能否 import 指定模块（给 `rw doctor` 用）。"""
     import subprocess
 
+    from . import procutil
+
     exe = python or find_python()
     try:
         proc = subprocess.run(
             [exe, "-c", f"import {name}"],
             capture_output=True,
             timeout=20,
+            creationflags=procutil.no_window_flags(),
         )
         return proc.returncode == 0
     except Exception:  # noqa: BLE001

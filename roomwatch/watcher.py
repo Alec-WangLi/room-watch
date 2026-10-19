@@ -261,6 +261,10 @@ class Watcher:
 
         storage = cfg.get("storage") or {}
         self.status_path = storage.get("status") or resolve("var/state/status.json")
+        # 磁盘满/权限抖动时状态文件可能写不出去；主循环不能因此退出。
+        # 只在「好→坏」和「坏→好」时各记一条，避免每秒刷屏。
+        self._status_write_failed = False
+        self._health_write_failed = False
         self.store = EventStore(storage.get("database") or resolve("var/db/events.db"))
         self.notifier = Notifier(cfg.get("notify") or {})
         # 录像推送：转码+上传要几十秒，走后台队列，不在主循环里等
@@ -486,10 +490,15 @@ class Watcher:
             "recording": self.recorder.recording,
             "dry_run": self.dry_run,
         }
-        tmp = self.status_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, self.status_path)
+        try:
+            health.write_json_atomic(self.status_path, payload)
+            if getattr(self, "_status_write_failed", False):
+                log.info("状态文件已恢复写入")
+                self._status_write_failed = False
+        except OSError as exc:
+            if not getattr(self, "_status_write_failed", False):
+                log.warning("写状态文件失败（主循环继续）: %s", exc)
+                self._status_write_failed = True
 
     def write_health(self) -> None:
         """每秒写一次的健康快照，供 guardian / 界面 / 诊断包读取。"""
@@ -513,7 +522,15 @@ class Watcher:
             selfcheck=self.selfcheck,
             extra=extra,
         )
-        health.write_health(self.health_path, payload)
+        try:
+            health.write_health(self.health_path, payload)
+            if getattr(self, "_health_write_failed", False):
+                log.info("健康快照已恢复写入")
+                self._health_write_failed = False
+        except OSError as exc:
+            if not getattr(self, "_health_write_failed", False):
+                log.warning("写健康快照失败（主循环继续）: %s", exc)
+                self._health_write_failed = True
 
     def _dump_stacks(self) -> None:
         fault = getattr(self.diagnostics, "fault_file", None)
@@ -551,9 +568,13 @@ class Watcher:
         if self.diagnostics is not None:
             self.diagnostics.note_exit(code, reason)
             return
-        health.write_exit_record(
-            self.exit_record_path, pid=os.getpid(), code=code, reason=reason
-        )
+        try:
+            health.write_exit_record(
+                self.exit_record_path, pid=os.getpid(), code=code, reason=reason
+            )
+        except OSError:
+            # 退出路径上写文件失败不能反过来把进程搞挂
+            pass
 
     def maybe_speak(self, frame, dets: list, now: datetime) -> None:
         """有人进入时，对现场的人播报语音提示。

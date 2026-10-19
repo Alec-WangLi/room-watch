@@ -18,10 +18,23 @@ import re
 import subprocess
 import time
 
-__all__ = ["pid_alive", "wait_pid_exit", "kill_pid", "POLL_SECONDS"]
+__all__ = ["pid_alive", "wait_pid_exit", "kill_pid", "no_window_flags", "POLL_SECONDS"]
 
 # 轮询步长。0.2 秒在「人手感觉」上足够快，又不会把 CPU 吃出可见占用。
 POLL_SECONDS = 0.2
+
+
+def no_window_flags() -> int:
+    """Windows 下隐藏子进程控制台的 creationflags；非 Windows 为 0。
+
+    界面是 `--windowed` 打包的，自身没有控制台。它启动任何控制台程序
+    （tasklist/taskkill/python）时如果不带这个标志，Windows 会新建一个
+    可见控制台窗口——表现为界面打开期间不停「闪屏」。
+    """
+    if os.name != "nt":
+        return 0
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
 
 
 def _psutil_module():
@@ -53,6 +66,7 @@ def pid_alive(pid: int) -> bool:
             proc = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True, timeout=8,
+                creationflags=no_window_flags(),
             )
         except (OSError, subprocess.SubprocessError):
             return False
@@ -94,7 +108,10 @@ def kill_pid(pid: int, *, timeout: float = 5.0, force: bool = True) -> bool:
     try:
         if os.name == "nt":
             cmd = ["taskkill", "/PID", str(pid), "/T"] + (["/F"] if force else [])
-            subprocess.run(cmd, capture_output=True, timeout=timeout + 5)
+            subprocess.run(
+                cmd, capture_output=True, timeout=timeout + 5,
+                creationflags=no_window_flags(),
+            )
         else:
             import signal
 

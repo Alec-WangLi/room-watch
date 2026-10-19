@@ -88,6 +88,23 @@ class DiagnosticsTest(unittest.TestCase):
             d = diagnostics.Diagnostics(Path(tmp) / "fault.log", Path(tmp) / "last_exit.json")
             d.uninstall()
 
+    def test_install_survives_unwritable_fault_log(self):
+        """磁盘满/权限不足时，崩溃转储开不了也不能拖死监控启动。"""
+        old_sys, old_thread = sys.excepthook, threading.excepthook
+        with tempfile.TemporaryDirectory() as tmp:
+            fault = Path(tmp) / "fault.log"
+            fault.mkdir()          # 目录占住文件名，open 必然失败
+            d = diagnostics.Diagnostics(fault, Path(tmp) / "last_exit.json")
+            d.install()
+            try:
+                self.assertIsNone(d.fault_file)
+                self.assertIsNot(sys.excepthook, old_sys)
+                self.assertIsNot(threading.excepthook, old_thread)
+            finally:
+                d.uninstall()
+        self.assertIs(sys.excepthook, old_sys)
+        self.assertIs(threading.excepthook, old_thread)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
