@@ -32,18 +32,25 @@ from .rules import (
     ACTION_FIRE,
     ACTION_START,
     RECORD_STOP_MAX,
+    STORAGE_OVER,
+    STORAGE_WARNING,
     Detection,
     RecordPolicy,
     TriggerState,
+    allow_notify,
+    allow_record,
     gap_seconds,
     humanize_duration,
     is_stale,
     iter_media_files,
+    normalize_owner_policy,
     prune_by_size,
     prune_old,
     should_heartbeat,
     should_speak,
     snapshot_path,
+    storage_forecast,
+    storage_summary,
     usage_bytes,
 )
 from . import audio_device
@@ -220,7 +227,9 @@ class Watcher:
         self.draw_boxes = bool(snap.get("draw_boxes", True))
 
         behavior = cfg.get("behavior") or {}
-        self.skip_when_active = bool(behavior.get("skip_when_user_active", True))
+        # 旧键只表达「要不要推送」；新键 record.owner_at_computer 优先。
+        # 保留原始值（不填默认），让 normalize_owner_policy 能区分「没配」和「配了 false」。
+        self.legacy_skip_when_active = behavior.get("skip_when_user_active")
         self.idle_threshold = float(behavior.get("idle_threshold_seconds", 120))
 
         voice = cfg.get("voice") or {}
@@ -301,10 +310,21 @@ class Watcher:
         self.min_free_bytes = int(float(storage.get("min_free_gb", 3)) * (1024 ** 3))
         self.storage_check_seconds = float(storage.get("check_minutes", 10)) * 60.0
         self.storage_protect_seconds = float(storage.get("protect_seconds", 300))
+        self.storage_warn_days = float(storage.get("warn_days", 7))
         self.last_storage_check = None
+        # 最近一次容量预测。None 表示还没算过（或容量完全不受限）。
+        self.storage_forecast: dict | None = None
+        # 预警每个自然日最多写一条日志，避免十分钟刷一次。
+        self.storage_warned_on = None
 
         rec_cfg = cfg.get("record") or {}
         self.recorder = Recorder(rec_cfg, self.fps)
+        # 本人在电脑前时：keep 照录照推 / mute 照录不推 / skip 不录不推。
+        # 旧配置 behavior.skip_when_user_active 仍可推导出同样的语义。
+        self.owner_policy = normalize_owner_policy(
+            rec_cfg.get("owner_at_computer"),
+            legacy_skip=self.legacy_skip_when_active,
+        )
         # 音轨单独一路：VideoWriter 写不了声音，录成 WAV 收尾再并进 mp4
         self.audio = AudioRecorder(rec_cfg.get("audio") or {})
         # 「录到什么时候为止」是纯逻辑，放在 logic 里便于单测
@@ -399,10 +419,12 @@ class Watcher:
             return []
 
     def user_is_active(self) -> bool:
-        """人在电脑前（刚有键鼠输入）就不推送，避免给自己发自己的照片。"""
-        if not self.skip_when_active:
-            return False
+        """键鼠是否活跃（人在电脑前）。策略怎么用这个信号由调用方决定。"""
         return idle_seconds_windows() < self.idle_threshold
+
+    def record_allowed(self) -> bool:
+        """本人在电脑前时，按策略决定要不要开录。进行中的录像不走这里。"""
+        return allow_record(self.owner_policy, self.user_is_active())
 
     def enqueue_notification(self, items: list[dict]) -> int:
         """把一批通知写进 outbox。数据库故障只降级为「本次没入队」，不拖垮监控。"""
@@ -415,12 +437,12 @@ class Watcher:
             return 0
 
     def notify_allowed(self) -> bool:
-        """图片和视频共用同一道闸门：dry-run 不发，本人坐在电脑前不发。"""
+        """图片和视频共用同一道闸门：dry-run 不发，本人坐在电脑前按策略不发。"""
         if self.dry_run:
             log.info("dry-run 模式，跳过推送")
             return False
-        if self.user_is_active():
-            log.info("检测到你本人正在电脑前，跳过推送")
+        if not allow_notify(self.owner_policy, self.user_is_active()):
+            log.info("检测到你本人正在电脑前，按策略跳过推送")
             return False
         return True
 
@@ -511,6 +533,9 @@ class Watcher:
         """
         now = datetime.now()
         outbox_stats = self._outbox_stats()
+        storage = getattr(self, "storage_forecast", None) or {}
+        used_bytes = storage.get("used_bytes")
+        max_bytes = storage.get("max_bytes")
         payload = {
             "pid": os.getpid(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
@@ -535,6 +560,14 @@ class Watcher:
             "pending_outbox": outbox_stats.get("pending", 0),
             "last_push_success_at": outbox_stats.get("last_success_at"),
             "notify_channels": len(enabled_channels(getattr(self, "notify_cfg", {}))),
+            "storage_status": storage.get("status"),
+            "storage_days_left": storage.get("projected_days"),
+            "storage_used_gb": (
+                round(used_bytes / (1024 ** 3), 2) if used_bytes is not None else None
+            ),
+            "storage_max_gb": (
+                round(max_bytes / (1024 ** 3), 2) if max_bytes is not None else None
+            ),
         }
         try:
             health.write_json_atomic(self.status_path, payload)
@@ -684,6 +717,9 @@ class Watcher:
         """
         if not self.recorder.enabled or self.recorder.recording:
             return
+        if not self.record_allowed():
+            log.info("本人在电脑前，按策略不开始录像")
+            return
         target = video_path_for(snapshot_path(self.snap_dir, when))
         started = self.recorder.start(target, when)
         if started:
@@ -807,6 +843,7 @@ class Watcher:
                 used,
                 self.max_total_bytes / (1024 ** 3),
             )
+        self._update_storage_forecast(now)
 
         if self.min_free_bytes <= 0:
             return
@@ -830,6 +867,41 @@ class Watcher:
         )
         if more:
             log.info("额外清理 %d 个文件", len(more))
+            self._update_storage_forecast(now)
+
+    def _update_storage_forecast(self, now: datetime) -> None:
+        """按最近几天的实际写入量预测还能撑多久；预警每天最多说一次。"""
+        try:
+            files = iter_media_files(self.snap_dir)
+        except OSError:
+            return
+        forecast = storage_forecast(
+            files,
+            now=now,
+            max_bytes=self.max_total_bytes,
+            keep_days=self.keep_days,
+            warn_days=self.storage_warn_days,
+        )
+        self.storage_forecast = forecast
+        if forecast["status"] not in (STORAGE_WARNING, STORAGE_OVER):
+            return
+        if self.storage_warned_on == now.date():
+            return
+        self.storage_warned_on = now.date()
+        if forecast["status"] == STORAGE_OVER:
+            log.warning(
+                "存储预警：已用 %.2f GB，超过上限 %.2f GB，正在按最旧优先清理",
+                forecast["used_bytes"] / (1024 ** 3),
+                forecast["max_bytes"] / (1024 ** 3),
+            )
+        else:
+            log.warning(
+                "存储预警：已用 %.2f GB，按最近增速约 %.1f 天后达到上限 %.2f GB"
+                "（可调 storage.max_total_gb / snapshot.keep_days）",
+                forecast["used_bytes"] / (1024 ** 3),
+                forecast["days_to_cap"] or 0.0,
+                forecast["max_bytes"] / (1024 ** 3),
+            )
 
     def maybe_heartbeat(self, now: datetime) -> None:
         """定时报平安。收不到心跳，就说明它挂了。"""
@@ -1317,8 +1389,8 @@ def whoami(cfg: dict, image_path: str) -> int:
     return 0
 
 
-def print_storage(config_path: str) -> None:
-    """看存储占用、上限，以及最旧/最新文件。"""
+def print_storage(config_path: str, as_json: bool = False) -> None:
+    """看存储占用、上限、容量预测，以及最旧/最新文件。"""
     cfg = load_config(config_path)
     snap = cfg.get("snapshot") or {}
     directory = snap.get("dir") or resolve("data/captures")
@@ -1326,13 +1398,32 @@ def print_storage(config_path: str) -> None:
     max_gb = float(st.get("max_total_gb", 20))
     min_free_gb = float(st.get("min_free_gb", 3))
     keep_days = int(snap.get("keep_days", 30))
+    warn_days = float(st.get("warn_days", 7))
+    max_bytes = int(max_gb * (1024 ** 3))
+
+    try:
+        free = shutil.disk_usage(directory).free if os.path.isdir(directory) else None
+    except OSError:
+        free = None
+
+    summary = storage_summary(
+        directory,
+        max_bytes=max_bytes,
+        keep_days=keep_days,
+        warn_days=warn_days,
+        free_bytes=free,
+    )
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=False))
+        return
 
     if not os.path.isdir(directory):
         print(f"存档目录还不存在：{directory}")
         return
 
+    forecast = summary["forecast"]
     files = iter_media_files(directory)
-    total = sum(size for _m, _p, size in files)
+    total = summary["used_bytes"]
 
     print("=== 存储占用 ===")
     print(f"目录        : {os.path.abspath(directory)}")
@@ -1340,11 +1431,28 @@ def print_storage(config_path: str) -> None:
     print(f"当前占用    : {total / (1024 ** 3):.2f} GB")
     print(f"容量上限    : {max_gb:.0f} GB" + ("（0 = 不限）" if max_gb <= 0 else ""))
     print(f"按天保留    : {keep_days} 天" + ("（0 = 不限）" if keep_days <= 0 else ""))
-    try:
-        free = shutil.disk_usage(directory).free
+    if free is not None:
         print(f"磁盘剩余    : {free / (1024 ** 3):.2f} GB（低于 {min_free_gb:.0f} GB 会逼近清理）")
-    except OSError:
-        pass
+
+    daily_mb = forecast["daily_bytes"] / (1024 ** 2)
+    print(f"最近增速    : {daily_mb:.1f} MB/天（按最近完整自然日估算）")
+    if forecast["projected_days"] is None:
+        print("预计可用    : 不受容量或保留期限制")
+    else:
+        print(f"预计可用    : {forecast['projected_days']:.1f} 天"
+              "（取容量上限与保留期中较早到的那个）")
+
+    status = forecast["status"]
+    if status == "over":
+        print("状态        : ⚠ 已超过容量上限，下一轮检查会删掉最旧的文件")
+    elif status == "warning":
+        days = forecast["days_to_cap"]
+        print(f"状态        : ⚠ 按当前增速约 {days:.1f} 天后达到容量上限"
+              "（可调大 storage.max_total_gb 或调小 snapshot.keep_days）")
+    elif status == "unlimited":
+        print("状态        : 不限容量与天数（磁盘由你自行管理）")
+    else:
+        print("状态        : 正常")
 
     if files:
         def fmt(ts: float) -> str:
@@ -1354,11 +1462,6 @@ def print_storage(config_path: str) -> None:
         newest = max(files, key=lambda x: x[0])
         print(f"最旧文件    : {fmt(oldest[0])}  {oldest[1]}")
         print(f"最新文件    : {fmt(newest[0])}  {newest[1]}")
-
-        if max_gb > 0:
-            over = total - max_gb * (1024 ** 3)
-            if over > 0:
-                print(f"⚠ 已超出上限 {over / (1024 ** 3):.2f} GB，下一轮检查会删掉最旧的文件")
 
         by_ext: dict = {}
         for _m, path, size in files:
@@ -1376,7 +1479,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dry-run", action="store_true", help="抓拍但不推送")
     parser.add_argument("--probe", action="store_true", help="只拍一张预览图然后退出")
     parser.add_argument("--json", action="store_true",
-                        help="配合 --probe：额外输出一行 JSON（界面用）")
+                        help="配合 --probe / --storage：输出一行 JSON（界面用）")
     parser.add_argument("--status", action="store_true", help="打印监控是否还在线")
     parser.add_argument("--say", action="store_true", help="试听语音提示（响度处理后的版本）然后退出")
     parser.add_argument("--say-raw", action="store_true", help="试听未处理的原始语音，用来做对比")
@@ -1424,7 +1527,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.storage:
-        print_storage(args.config)
+        print_storage(args.config, as_json=args.json)
         return
 
     cfg = load_config(args.config)

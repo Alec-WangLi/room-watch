@@ -22,8 +22,18 @@ from roomwatch.rules import (
     RECORD_CONTINUE,
     RECORD_STOP_IDLE,
     RECORD_STOP_MAX,
+    OWNER_KEEP,
+    OWNER_MUTE,
+    OWNER_SKIP,
+    STORAGE_OK,
+    STORAGE_OVER,
+    STORAGE_UNLIMITED,
+    STORAGE_WARNING,
     RecordPolicy,
+    allow_notify,
+    allow_record,
     gap_seconds,
+    normalize_owner_policy,
     ACTION_BEST,
     ACTION_FIRE,
     ACTION_NONE,
@@ -37,6 +47,8 @@ from roomwatch.rules import (
     should_heartbeat,
     should_speak,
     snapshot_path,
+    storage_forecast,
+    storage_summary,
 )
 
 FRAME = (1280, 720)
@@ -477,6 +489,133 @@ class TestRecordPolicy(unittest.TestCase):
         p.begin(T0 + timedelta(seconds=20), continuing=True)
         p.finish(T0 + timedelta(seconds=30))       # 累计 30 >= 25
         self.assertTrue(p.exhausted)
+
+
+class TestStorageForecast(unittest.TestCase):
+    """存储预测：增长率按完整自然日算，今天只作为兜底。"""
+
+    NOW = datetime(2026, 10, 19, 12, 0, 0)
+    MB = 1024 * 1024
+    GB = 1024 ** 3
+
+    def _file(self, days_ago: int, mb: float) -> tuple:
+        when = self.NOW - timedelta(days=days_ago)
+        return (when.timestamp(), f"{days_ago}.mp4", int(mb * self.MB))
+
+    def test_empty_directory_is_ok(self):
+        f = storage_forecast([], now=self.NOW, max_bytes=10 * self.GB, keep_days=30)
+        self.assertEqual(f["status"], STORAGE_OK)
+        self.assertEqual(f["daily_bytes"], 0)
+        self.assertEqual(f["used_bytes"], 0)
+        self.assertIsNone(f["days_to_cap"])
+
+    def test_daily_growth_uses_complete_days_not_today(self):
+        """今天的半天量不能当成一整天的增长率，否则预警会虚高。"""
+        files = [self._file(1, 500), self._file(2, 500), self._file(0, 5000)]
+        f = storage_forecast(files, now=self.NOW, max_bytes=100 * self.GB)
+        self.assertEqual(f["daily_bytes"], 500 * self.MB)
+
+    def test_today_only_falls_back_to_today_usage(self):
+        files = [self._file(0, 300)]
+        f = storage_forecast(files, now=self.NOW, max_bytes=100 * self.GB)
+        self.assertEqual(f["daily_bytes"], 300 * self.MB)
+
+    def test_days_to_cap_is_remaining_over_daily(self):
+        # 20 天前的 7GB 已超出增长率窗口，只计入已用；昨天 1GB 决定增速
+        files = [self._file(20, 7 * 1024), self._file(1, 1024)]
+        f = storage_forecast(files, now=self.NOW, max_bytes=10 * self.GB,
+                             keep_days=30, window_days=7)
+        self.assertEqual(f["used_bytes"], 8 * self.GB)
+        self.assertEqual(f["daily_bytes"], self.GB)
+        self.assertAlmostEqual(f["days_to_cap"], 2.0, places=2)
+
+    def test_over_cap_reports_over(self):
+        files = [self._file(1, 2048)]
+        f = storage_forecast(files, now=self.NOW, max_bytes=1 * self.GB)
+        self.assertEqual(f["status"], STORAGE_OVER)
+        self.assertEqual(f["days_to_cap"], 0.0)
+
+    def test_no_cap_no_keep_is_unlimited(self):
+        f = storage_forecast([self._file(1, 100)], now=self.NOW,
+                             max_bytes=0, keep_days=0)
+        self.assertEqual(f["status"], STORAGE_UNLIMITED)
+        self.assertIsNone(f["projected_days"])
+
+    def test_warning_when_cap_projection_below_warn_days(self):
+        files = [self._file(1, 1024)]  # 已用 1GB，每天 1GB，上限 3GB
+        f = storage_forecast(files, now=self.NOW, max_bytes=3 * self.GB,
+                             keep_days=30, warn_days=7)
+        self.assertAlmostEqual(f["days_to_cap"], 2.0, places=2)
+        self.assertEqual(f["status"], STORAGE_WARNING)
+
+    def test_keep_days_limits_display_but_not_cap_warning(self):
+        """保留期是用户自己选的，不该因为它比 warn_days 短就一直报预警。"""
+        files = [self._file(1, 1024)]
+        f = storage_forecast(files, now=self.NOW, max_bytes=1000 * self.GB,
+                             keep_days=5, warn_days=7)
+        self.assertEqual(f["days_to_keep_expiry"], 5.0)
+        self.assertAlmostEqual(f["projected_days"], 5.0, places=2)
+        self.assertEqual(f["status"], STORAGE_OK)
+
+    def test_old_files_outside_window_do_not_inflate_growth(self):
+        files = [self._file(40, 9000)]
+        f = storage_forecast(files, now=self.NOW, max_bytes=100 * self.GB,
+                             keep_days=30, window_days=7)
+        self.assertEqual(f["daily_bytes"], 0)
+        self.assertIsNone(f["days_to_cap"])
+
+
+class TestOwnerPolicy(unittest.TestCase):
+    """本人在电脑前：keep 照录照推 / mute 照录不推 / skip 不录不推。"""
+
+    def test_normalize_accepts_known_values(self):
+        for value in (OWNER_KEEP, OWNER_MUTE, OWNER_SKIP):
+            self.assertEqual(normalize_owner_policy(value), value)
+
+    def test_legacy_true_maps_to_mute(self):
+        self.assertEqual(normalize_owner_policy(None, legacy_skip=True), OWNER_MUTE)
+
+    def test_legacy_false_maps_to_keep(self):
+        self.assertEqual(normalize_owner_policy(None, legacy_skip=False), OWNER_KEEP)
+
+    def test_unknown_falls_back_to_mute(self):
+        self.assertEqual(normalize_owner_policy("pause"), OWNER_MUTE)
+
+    def test_keep_records_and_notifies_while_active(self):
+        self.assertTrue(allow_record(OWNER_KEEP, True))
+        self.assertTrue(allow_notify(OWNER_KEEP, True))
+
+    def test_mute_records_but_does_not_notify(self):
+        self.assertTrue(allow_record(OWNER_MUTE, True))
+        self.assertFalse(allow_notify(OWNER_MUTE, True))
+
+    def test_skip_records_and_notifies_nothing_while_active(self):
+        self.assertFalse(allow_record(OWNER_SKIP, True))
+        self.assertFalse(allow_notify(OWNER_SKIP, True))
+
+    def test_policy_only_applies_when_user_active(self):
+        for policy in (OWNER_KEEP, OWNER_MUTE, OWNER_SKIP):
+            self.assertTrue(allow_record(policy, False))
+            self.assertTrue(allow_notify(policy, False))
+
+
+class TestStorageSummary(unittest.TestCase):
+    def test_summary_uses_one_forecast_shape(self):
+        base = tempfile.mkdtemp()
+        try:
+            day = os.path.join(base, "2026-10-18")
+            os.makedirs(day)
+            with open(os.path.join(day, "a.mp4"), "wb") as f:
+                f.write(b"x" * 1024)
+            summary = storage_summary(
+                base, max_bytes=10 * 1024 ** 3, keep_days=30, free_bytes=123,
+            )
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+        self.assertEqual(summary["used_bytes"], 1024)
+        self.assertEqual(summary["free_bytes"], 123)
+        self.assertEqual(summary["forecast"]["used_bytes"], 1024)
+        self.assertIn("status", summary["forecast"])
 
 
 if __name__ == "__main__":
