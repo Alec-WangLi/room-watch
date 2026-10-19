@@ -74,6 +74,7 @@
 | `roomwatch/diagnostics.py` | faulthandler 与 excepthooks | |
 | `roomwatch/logutil.py` | 日志轮转与固定字段事件 | |
 | `roomwatch/diag.py` | 脱敏诊断包 | **不收 `data/`** |
+| `roomwatch/benchcodec.py` | 编码基准（cv2 + ffmpeg 硬件编码器） | 只测量，不在主链路 |
 | `roomwatch/selfcheck.py` | 启动自检（模型/目录/推送/磁盘） | |
 | `roomwatch/procutil.py` | 进程判活 / 等退出 / 结束 | 判活的唯一实现，updater 也用它 |
 | `roomwatch/control.py` | 停止协议 + 期望状态 + gallery PID | 不许再用 taskkill 当主路径 |
@@ -174,7 +175,8 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 | 验证识别 | `rw whoami IMG` |
 | 试听语音 | `rw say` / `rw say-raw` / `rw ab` |
 | 音量 | `rw volume-check` / `rw volume-set 70` |
-| 磁盘占用 | `rw storage` |
+| 磁盘占用 | `rw storage`（`--json` 供界面/脚本） |
+| 编码基准 | `rw bench-encode`（只测量，不改默认编码器） |
 | 相册 | `rw gallery [--port 9000]` |
 | 守护（监控 + 相册） | `rw guard [--once\|--status\|--dry-run]` |
 | 推送配置 | `rw push` |
@@ -666,8 +668,10 @@ room-watch-<版本>\
 1. ~~**gallery 的长期守护方案未定**~~（**0.1.12 已修**）—— guardian 现在同时守护
    watcher 与 gallery：gallery 写 `var/state/gallery.pid`，guardian 用 PID + 命令行
    校验判活，挂了拉起并写历史。保留这条记录，避免有人再退回「只守 watcher」。
-2. **录像在本人坐在电脑前时仍会录** —— `behavior.skip_when_user_active` 只抑制推送。
-   实测约 65.6 MB/分钟，长期会吃满盘。**暂缓原因**：这是产品决策，需用户拍板。
+2. ~~**录像在本人坐在电脑前时仍会录**~~（**0.1.17 已提供选项**）——
+   `record.owner_at_computer` 三档 keep / mute / skip，默认 `mute`（照录不推，
+   与旧版一致）；想连录像一起停下来的人显式设 `skip`。默认值不为省磁盘牺牲取证：
+   你坐在电脑前时有人进来，仍然要录到。保留这条记录，避免有人把默认值悄悄改成 skip。
 3. ~~桌面的「停止监控」不优雅~~（**0.1.9 已修**）—— 改成 `stop.request` + 两段式停止，
    见 F.17。保留这条记录，避免有人再「优化」回 `taskkill /F`。
 4. **~~`install-autostart.ps1` 硬编码绝对路径~~（已在 v0.1.0 修掉）** ——
