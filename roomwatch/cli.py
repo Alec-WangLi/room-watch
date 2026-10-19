@@ -93,6 +93,7 @@ COMMANDS: dict[str, Command] = {
     "autostart": Command("开机自启：查看状态或开启/关闭（--json / --enable / --disable）"),
     "identity": Command("查看或清除本人人脸模板（--json / --clear）"),
     "heartbeat": Command("测试外部心跳 URL（--test / --json）"),
+    "verify": Command("验证摄像头、推送与自检是否真的在工作（--json）"),
     "guard": Command("守护进程：保证监控进程一直活着", "guardian"),
     "push": Command("配置微信/Server酱推送渠道", "setup_push"),
     "setup": Command("首次配置向导：摄像头、微信推送、相册密码、开机自启", "wizard"),
@@ -1018,6 +1019,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             from . import benchdetect
 
             return benchdetect.main(rest)
+        if name == "verify":
+            from . import verify
+
+            return verify.main(rest)
 
         spec = COMMANDS[name]
         translated = translate(name, rest)

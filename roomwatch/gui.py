@@ -492,8 +492,9 @@ class RoomWatchApp:
         self.btn_gallery = ttk.Button(bar, text="打开相册", command=self.on_gallery)
         self.btn_probe = ttk.Button(bar, text="拍预览图", command=self.on_probe)
         self.btn_enroll = ttk.Button(bar, text="注册本人", command=self.on_enroll)
+        self.btn_verify = ttk.Button(bar, text="验证", command=self.on_verify)
         for btn in (self.btn_start, self.btn_stop, self.btn_gallery,
-                    self.btn_probe, self.btn_enroll):
+                    self.btn_probe, self.btn_enroll, self.btn_verify):
             btn.pack(side="left", padx=(0, 6))
         self.btn_update = ttk.Button(bar, text="检查更新", command=self.on_update)
         self.btn_update.pack(side="right")
@@ -554,6 +555,8 @@ class RoomWatchApp:
             self.status_label.configure(text="● 正在拍预览图…", fg="#666")
         elif self._busy == "enroll":
             self.status_label.configure(text="● 正在注册本人…（请正对镜头）", fg="#666")
+        elif self._busy == "verify":
+            self.status_label.configure(text="● 正在验证（摄像头/推送/自检）…", fg="#666")
         else:
             self.status_label.configure(text=f"● {state.caption}", fg=color)
 
@@ -963,6 +966,45 @@ class RoomWatchApp:
             "诊断包生成失败",
             (result.get("error") or result.get("out") or "没有拿到原因"))
 
+    def on_verify(self) -> None:
+        """一次确认「真的在工作」：自检、摄像头、推送、可选心跳。"""
+        if self._busy:
+            return
+        running = bool(read_state(self.project).pid)
+        self._busy = "verify"
+        self.status_label.configure(
+            text="● 正在验证（摄像头/推送/自检）…", fg="#666")
+
+        def work() -> dict:
+            args = ["verify", "--json"]
+            if running:
+                # 监控运行中摄像头被占用；跳过它，其余照测。
+                args.append("--no-camera")
+            return self._run_cli(args, timeout=180, need_cv2=not running)
+
+        self._run_task(work, self._on_verify_done)
+
+    def _on_verify_done(self, result: dict) -> None:
+        self._finish_busy()
+        self.refresh_soon()
+        items = result.get("items") or []
+        if not items:
+            self.messagebox.showerror(
+                "验证失败",
+                result.get("error") or result.get("out") or "没有拿到验证结果")
+            return
+        lines = []
+        for item in items:
+            mark = "–" if item.get("skipped") else ("✓" if item.get("ok") else "✗")
+            lines.append(f"{mark} {item['name']}：{item.get('detail') or ''}")
+        text = "\n".join(lines)
+        if result.get("ok"):
+            self.messagebox.showinfo(
+                "验证通过", text + "\n\n监控已经真的在工作。")
+        else:
+            self.messagebox.showwarning(
+                "还有项目没通过", text + "\n\n按上面的提示处理后重新验证。")
+
     def on_enroll(self) -> None:
         if self._busy:
             return
@@ -1071,8 +1113,9 @@ class RoomWatchApp:
         self.messagebox.showinfo(
             "首次配置",
             "还没有保存过本机配置。\n\n"
-            "接下来打开「设置」，按页签填好摄像头、推送和相册；\n"
-            "保存后点「启动监控」即可。")
+            "接下来打开「设置」，按页签填好摄像头、推送和相册。\n"
+            "保存后回到主界面点「验证」，确认摄像头和推送真的可用，"
+            "再点「启动监控」。")
         self.on_settings()
 
     # ---------------- 更新 ----------------
@@ -1300,7 +1343,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             problems.append("状态标签没有渲染")
         for name, btn in (("启动", app.btn_start), ("停止", app.btn_stop),
                           ("相册", app.btn_gallery), ("预览", app.btn_probe),
-                          ("注册", app.btn_enroll), ("设置", app.btn_settings),
+                          ("注册", app.btn_enroll), ("验证", app.btn_verify),
+                          ("设置", app.btn_settings),
                           ("更新", app.btn_update), ("诊断", app.btn_diag)):
             if not btn.winfo_exists():
                 problems.append(f"{name}按钮不存在")
