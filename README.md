@@ -81,8 +81,14 @@ scripts\setup-hooks.bat
 ./rw doctor            # 先自检：解释器、依赖、模型、目录、端口、钩子
 ./rw probe             # 拍一张预览图，确认角度（写到 var/media/preview.jpg）
 ./rw dry-run           # 试跑：只存档不推送，观察误报率
-./rw start             # 正式运行（前台常驻）
+./rw start             # 后台启动：写 running 并交给 guardian 托管
+./rw start --foreground  # 前台常驻，Ctrl+C 退出（调试用）
+./rw stop              # 优雅停止：先暂停，再停相册与监控
 ```
+
+> USB 摄像头只能在**用户登录会话**里采集（Windows 服务跑在 Session 0，
+> 没有受支持的摄像头路径）。所以电脑需要保持登录：可以开自动登录后锁屏，
+> 或者让家人账号保持登录。安装器/向导会注册登录时静默启动。
 
 Windows 下把 `./rw` 换成 `rw`（`rw.cmd` 会自己找对解释器）。
 
@@ -145,19 +151,19 @@ powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 
 | 命令 | 作用 |
 |---|---|
-| `rw start` | 启动监控（前台常驻，Ctrl+C 退出） |
+| `rw start` | 后台启动监控，交给 guardian 托管（`--foreground` 前台调试） |
 | `rw dry-run` | 抓拍存档但不推送 |
 | `rw probe` | 拍预览图后退出 |
 | `rw status` | 是否在线（读取时重算心跳） |
 | `rw gallery [--host H] [--port 8765]` | 相册（非回环地址必须配 token） |
-| `rw guard [--once\|--status\|--dry-run]` | 守护进程 |
+| `rw guard [--once\|--status\|--dry-run]` | 守护进程：监控 + 相册 |
 | `rw enroll [--from IMG]` | 注册本人人脸 |
 | `rw whoami IMG` | 判断某张图是不是本人 |
 | `rw say` / `rw say-raw` / `rw ab` | 试听语音（处理后 / 原始 / 对比） |
 | `rw volume-check` / `rw volume-set 70` | 音量诊断 / 设置主音量 |
-| `rw stop` | 优雅停止（先收尾再退出，超时才强杀） |
+| `rw stop` | 暂停并优雅停止相册与监控（先收尾，超时才强杀） |
 | `rw config [--json\|--set 键=值\|--test]` | 读/改界面设置、发测试消息 |
-| `rw autostart [--json\|--enable\|--disable]` | 开机自启 |
+| `rw autostart [--json\|--enable\|--disable]` | 开机自启（计划任务优先，失败回退 Run 键） |
 | `rw identity [--json\|--clear]` | 查看/清除本人模板元信息 |
 | `rw storage` | 磁盘占用与最旧文件 |
 | `rw push` | 配置推送渠道 |
@@ -316,9 +322,10 @@ rw test --fast   # 跳过最慢的集成测试（约 55 秒）
 
 - **录像不知道「你是不是在电脑前」**：`behavior.skip_when_user_active` 只抑制推送，
   不抑制录像。按 65.6 MB/分钟算，全天办公能写数 GB。
-- **gallery 没有自愈**：`guardian` 只管监控进程，相册挂了需要手动 `rw gallery`
-  或用计划任务托管。
-- 桌面程序的「停止监控」是强制终止（`taskkill`），不保证 mp4 收尾。
+- **相册只按 PID 判活**：进程还在但 HTTP 卡死时，guardian 不会发现；
+  这时看 `var/logs/gallery.log` 或手动重启相册。
+- **暂停后需要显式启动**：`rw stop` / 界面「停止监控」会写 `paused`，
+  之后必须 `rw start` / 界面「启动监控」才会恢复；guardian 不会自动拉起。
 
 原生崩溃转储（WER LocalDumps）默认不开启：它需要注册表写权限，普通安装不应
 擅自修改系统设置。要抓 cv2 或驱动层崩溃时，按

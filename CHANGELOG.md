@@ -14,6 +14,39 @@
 
 ---
 
+## [0.1.12] - 2026-10-19
+
+> M1：guardian 成为唯一启动者，并同时守护监控与相册；用户主动停止后不会被拉起。
+
+### 变更
+
+- **`rw start` 改为后台启动**：写 `desired_state=running`，拉起常驻 guardian，
+  并立即触发一次 `guard --once`。旧的现场调试行为保留为 `rw start --foreground`。
+- **`rw stop` 同时停止相册**：先写 `desired_state=paused`，再停 gallery 与 watcher；
+  guardian 看到 paused 后不再重启任何服务。
+- **暂停语义**：GUI「停止监控」同样先写 paused；guardian 不会发送「已恢复」通知。
+
+### 新增
+
+- **guardian 守护 gallery**：相册写 `var/state/gallery.pid`；guardian 用
+  PID + 命令行校验判活，PID 复用不会误杀，挂了自动拉起并写重启历史。
+- **guardian 单实例**：`var/state/guardian.owner.lock` 由常驻 guardian 持有，
+  重复启动的实例直接退出；`--once` 仍用原来的短锁。
+- **恢复/崩溃通知**：watcher 重启后，下一次健康检查通过时发一条
+  「已恢复，上次退出原因」；窗口内重启次数达到 `guardian.crash_threshold`
+  （默认 10 分钟 3 次）时发「反复崩溃」告警。通知走后台线程，不阻塞守护。
+- **启动自检**：模型文件、运行目录可写、推送凭据、磁盘余量四项；失败项写入
+  `health.json`，guardian 会通知一次，GUI 状态栏显示。
+- **自启抽象**：优先注册计划任务（登录触发、失败自动重启、零闪窗）；
+  被安全策略拦截时回退 HKCU Run + VBS，并清理另一条旧入口，避免双实例。
+
+### 文档
+
+- README 说明电脑需保持登录、自启可能走计划任务或 Run 键；
+- AGENTS 增加暂停语义与新增状态文件；architecture 更新 guardian 职责。
+
+---
+
 ## [0.1.11] - 2026-10-19
 
 > M0：先把「为什么退出」变成可回答的问题。不改变监控行为，只增加观测能力。

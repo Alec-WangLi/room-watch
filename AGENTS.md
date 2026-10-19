@@ -69,11 +69,16 @@
 | `roomwatch/notifier.py` | 推送渠道（文字 + 图片） | |
 | `roomwatch/videopush.py` | 录像推送：ffmpeg 瘦身 → `upload_media` → 发文件 | 后台单线程队列，队列满即丢弃，不阻塞主循环 |
 | `roomwatch/gallery.py` | 本地相册 HTTP | 只用标准库，自实现 Range |
-| `roomwatch/guardian.py` | 守护进程（判活/退避/单实例锁） | |
+| `roomwatch/guardian.py` | 守护 watcher + gallery（暂停/退避/单实例/通知） | |
+| `roomwatch/health.py` | 健康快照、退出码、退出记录、停滞判定 | |
+| `roomwatch/diagnostics.py` | faulthandler 与 excepthooks | |
+| `roomwatch/logutil.py` | 日志轮转与固定字段事件 | |
+| `roomwatch/diag.py` | 脱敏诊断包 | **不收 `data/`** |
+| `roomwatch/selfcheck.py` | 启动自检（模型/目录/推送/磁盘） | |
 | `roomwatch/procutil.py` | 进程判活 / 等退出 / 结束 | 判活的唯一实现，updater 也用它 |
-| `roomwatch/control.py` | 停止协议：`stop.request` + 两段式停止 | 不许再用 taskkill 当主路径 |
+| `roomwatch/control.py` | 停止协议 + 期望状态 + gallery PID | 不许再用 taskkill 当主路径 |
 | `roomwatch/settings.py` | 界面设置的后端：读生效值、写 `config.local.yaml`、复读校验 | 凭据只回掩码 |
-| `roomwatch/autostart.py` | 开机自启（winreg + VBS） | 向导与界面设置共用 |
+| `roomwatch/autostart.py` | 开机自启（计划任务优先，Run 键回退） | 向导与界面设置共用 |
 | `roomwatch/setup_push.py` | 推送配置引导 | |
 | `roomwatch/gui.py` | 桌面界面（主窗口） | 独立进程，不 import cv2 / yaml |
 | `roomwatch/gui_settings.py` | 设置窗口（四个页签） | 同样不 import tkinter/yaml，靠注入 |
@@ -163,7 +168,7 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 | 诊断包（脱敏） | `rw diag` |
 | 拍预览图 | `rw probe` |
 | 试跑（不推送） | `rw dry-run` |
-| 正式运行 | `rw start` |
+| 后台启动（guardian 托管） | `rw start`；前台调试用 `rw start --foreground` |
 | 看是否在线 | `rw status` |
 | 注册人脸 | `rw enroll` / `rw enroll --from IMG` |
 | 验证识别 | `rw whoami IMG` |
@@ -171,12 +176,12 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 | 音量 | `rw volume-check` / `rw volume-set 70` |
 | 磁盘占用 | `rw storage` |
 | 相册 | `rw gallery [--port 9000]` |
-| 守护 | `rw guard [--once\|--status\|--dry-run]` |
+| 守护（监控 + 相册） | `rw guard [--once\|--status\|--dry-run]` |
 | 推送配置 | `rw push` |
 | 验证录像推送 | `rw push-video PATH`（需 webhook 已配好） |
 | 测试 | `rw test [--fast]` |
 | 版本 | `rw version`（带 git 短哈希） |
-| 停止监控（优雅） | `rw stop` |
+| 暂停并停止（优雅） | `rw stop`（同时停相册；之后需 `rw start` 恢复） |
 | 读/改设置 | `rw config`（`--json` / `--set 键=值` / `--test`） |
 | 开机自启 | `rw autostart`（`--json` / `--enable` / `--disable`） |
 | 本人模板 | `rw identity`（`--json` / `--clear`） |
@@ -214,7 +219,7 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 | `data/captures/<日期>/` | 抓拍 jpg、录像 mp4、音频 wav | 否（隐私） |
 | `data/identity/owner.npz` | 本人人脸特征 | 否（生物特征） |
 | `var/logs/` | watcher / gallery / probe / gui-selftest / watcher-fault | 否 |
-| `var/state/` | status.json / health.json / last_exit.json / guardian_state.json / guardian_history.jsonl / guardian.lock / **stop.request** / **volume_backup.json** | 否 |
+| `var/state/` | status.json / health.json / last_exit.json / guardian_state.json / guardian_history.jsonl / guardian.lock / **guardian.owner.lock** / **desired_state.json** / **gallery.pid** / **stop.request** / **volume_backup.json** | 否 |
 | `var/db/events.db` | 事件库 | 否 |
 | `var/media/` | preview.jpg 等临时产物 | 否 |
 | `var/cache/voice/` | 语音缓存（可重建） | 否 |
@@ -525,6 +530,17 @@ room-watch-<版本>\
   WER LocalDumps 默认不开，需要注册表写权限，只在排障时手动启用。
 - 反馈问题先跑 `rw diag`：诊断包会脱敏配置、只收 `var/` 与配置，**不收 `data/`**。
 
+### F.24 用户暂停后 guardian 不许拉起
+
+- `var/state/desired_state.json` 是用户意图：`running` / `paused`；缺失或损坏按 `running`。
+- `rw stop` / 界面「停止监控」：先写 `paused`，再停 gallery 与 watcher；guardian 看到
+  paused 直接返回 `ACT_PAUSED`，不启动/重启任何服务，也不发「已恢复」通知。
+- `rw start` / 界面「启动监控」：写 `running`，启动常驻 guardian，并跑一次
+  `guard --once` 立即检查，避免等一个 `check_seconds` 周期。
+- 常驻 guardian 用 `guardian.owner.lock` 保证单实例；`--once` 只用原来的短锁。
+- gallery 用 `gallery.pid` + 命令行（必须同时含 `roomwatch` 与 `gallery`）判活，
+  PID 复用不会误杀；挂了由 guardian 拉起并写历史。
+
 ---
 
 ## G. Git、隐私与钩子
@@ -640,9 +656,9 @@ room-watch-<版本>\
 
 ## I. 已知待办（含为何暂缓）
 
-1. **gallery 的长期守护方案未定** —— 后台任务方式会被系统回收；`guardian.py` 目前只守护监控。
-   候选：Windows 计划任务 / 让 `start-guardian.bat` 同时拉起两个服务。
-   **暂缓原因**：需要用户确认机器安全策略（WMI 与 `Start-Process` 都被拦）。
+1. ~~**gallery 的长期守护方案未定**~~（**0.1.12 已修**）—— guardian 现在同时守护
+   watcher 与 gallery：gallery 写 `var/state/gallery.pid`，guardian 用 PID + 命令行
+   校验判活，挂了拉起并写历史。保留这条记录，避免有人再退回「只守 watcher」。
 2. **录像在本人坐在电脑前时仍会录** —— `behavior.skip_when_user_active` 只抑制推送。
    实测约 65.6 MB/分钟，长期会吃满盘。**暂缓原因**：这是产品决策，需用户拍板。
 3. ~~桌面的「停止监控」不优雅~~（**0.1.9 已修**）—— 改成 `stop.request` + 两段式停止，
