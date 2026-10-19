@@ -34,7 +34,7 @@ import yaml
 
 from . import health
 from .config import load_config
-from .delivery import KNOWN_CHANNELS, enabled_channels
+from .delivery import KNOWN_CHANNELS, channel_accepts, enabled_channels
 from .heartbeat import load_heartbeat
 from .rules import storage_summary
 
@@ -72,6 +72,9 @@ class Field:
     secret: bool = False
     hint: str = ""
     min_len: int = 0
+    # 配置里缺这个键时的生效默认值。None = 没有默认，界面显示空。
+    # 主要用于「代码默认开启、老配置里没有这一行」的布尔项。
+    default: Any = None
 
     @property
     def path(self) -> tuple:
@@ -107,6 +110,26 @@ _add(Field("notify.webhook.url", "通用 webhook 地址", "推送", "secret", se
 _add(Field("notify.webhook.timeout_seconds", "webhook 超时（秒）", "推送", "int", lo=3, hi=120))
 _add(Field("notify.webhook.max_image_mb", "webhook 内联图片上限（MB）", "推送", "int",
            lo=0, hi=20, hint="超过就只发文字；0 = 不内联"))
+
+# 按渠道过滤消息类型。critical（崩溃/恢复/自检失败/相机失联）永不过滤，
+# 只能靠取消勾选整个渠道来关闭。
+_add(Field("notify.wecom_bot.events", "企业微信 · 人员事件", "推送", "bool",
+           hint="关闭后该渠道不收人员进入事件（含图片/录像）；critical 告警仍会发",
+           default=True))
+_add(Field("notify.wecom_bot.digest", "企业微信 · 每日报平安", "推送", "bool",
+           default=True))
+_add(Field("notify.wxpusher.events", "WxPusher · 人员事件", "推送", "bool",
+           default=True))
+_add(Field("notify.wxpusher.digest", "WxPusher · 每日报平安", "推送", "bool",
+           default=True))
+_add(Field("notify.serverchan.events", "ServerChan · 人员事件", "推送", "bool",
+           default=True))
+_add(Field("notify.serverchan.digest", "ServerChan · 每日报平安", "推送", "bool",
+           default=True))
+_add(Field("notify.webhook.events", "Webhook · 人员事件", "推送", "bool",
+           default=True))
+_add(Field("notify.webhook.digest", "Webhook · 每日报平安", "推送", "bool",
+           default=True))
 
 # ---- 相册 ----
 _add(Field("gallery.host", "允许局域网访问", "相册", "choice",
@@ -492,6 +515,8 @@ def snapshot(root: Path | str) -> dict:
             )
             continue
         raw = get_path(cfg, field.key)
+        if raw is None and field.default is not None:
+            raw = field.default
         if field.kind == "choice" and isinstance(raw, bool):
             # YAML 1.1 把裸 off/on 当布尔：界面要看到 "off" 而不是 False
             raw = "on" if raw else "off"
@@ -509,6 +534,10 @@ def snapshot(root: Path | str) -> dict:
         "outbox": outbox_info(root, cfg),
         "storage": storage_info(root, cfg),
         "channels": enabled_channels(cfg.get("notify") or {}),
+        "events_deliverable": any(
+            channel_accepts(cfg.get("notify") or {}, channel, "event")
+            for channel in enabled_channels(cfg.get("notify") or {})
+        ),
         "channel_issues": channel_issues(cfg),
         "labels": {key: {"label": f.label, "section": f.section, "kind": f.kind,
                          "choices": list(f.choices), "hint": f.hint,

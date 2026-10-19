@@ -341,6 +341,51 @@ class HeartbeatSettingTest(unittest.TestCase):
         self.assertEqual(found, [("WLAN", "192.168.1.3")])
 
 
+class ChannelFilterSettingTest(unittest.TestCase):
+    """按渠道过滤的开关：老配置没这几行时，界面必须显示「开」。"""
+
+    FILTER_KEYS = (
+        "notify.wecom_bot.events", "notify.wecom_bot.digest",
+        "notify.wxpusher.events", "notify.wxpusher.digest",
+        "notify.serverchan.events", "notify.serverchan.digest",
+        "notify.webhook.events", "notify.webhook.digest",
+    )
+
+    def test_missing_keys_default_to_true(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            snap = settings.snapshot(root)
+        for key in self.FILTER_KEYS:
+            self.assertIs(snap["values"][key], True, key)
+
+    def test_filter_round_trips_to_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {
+                "notify.wxpusher.events": "false",
+                "notify.wecom_bot.digest": False,
+            })
+            self.assertTrue(result["ok"], result)
+            data = yaml.safe_load((root / "config.local.yaml").read_text(encoding="utf-8"))
+            snap = settings.snapshot(root)
+        self.assertIs(data["notify"]["wxpusher"]["events"], False)
+        self.assertIs(data["notify"]["wecom_bot"]["digest"], False)
+        self.assertIs(snap["values"]["notify.wxpusher.events"], False)
+        self.assertIs(snap["values"]["notify.wecom_bot.digest"], False)
+
+
+    def test_events_deliverable_detects_all_channels_filtered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            settings.apply(root, {
+                "notify.channels": "wecom_bot,wxpusher",
+                "notify.wecom_bot.events": False,
+                "notify.wxpusher.events": False,
+            })
+            snap = settings.snapshot(root)
+        self.assertFalse(snap["events_deliverable"])
+
+
 class RecordSettingsTest(unittest.TestCase):
     """录像策略与存储预算：默认值安全、跨字段校验、写 local 并复读。"""
 

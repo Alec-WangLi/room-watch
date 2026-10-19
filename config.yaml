@@ -269,14 +269,20 @@ notify:
   # 2. 创建一个应用，拿到 appToken（AT_ 开头）
   # 3. 关注该应用后，在「用户」页面拿到你的 UID（UID_ 开头）
   # 注意：只能发文字。照片留在本机，用 gallery.py 看
+  # events/digest 是每渠道的过滤开关：false = 该渠道不收这类消息；
+  # critical（崩溃/恢复/自检失败/相机失联）不受过滤，只能禁用整个渠道来关掉。
   wxpusher:
     app_token: "AT_xxx_replace_me"
     uid: "UID_xxx_replace_me"
+    events: true            # 人员进入事件（文字/图片/录像）
+    digest: true            # 每日/定时「监控在线」报平安
 
   # —— 渠道二：Server酱（微信服务号）——
   # sct.ftqq.com 登录，复制 SendKey（SCT 开头）
   serverchan:
     sendkey: "SCTxxx_replace_me"
+    events: true
+    digest: true
 
   # —— 渠道三：企业微信群机器人（唯一能把照片直接发到微信的）——
   # 群设置 → 群机器人 → 添加，复制 Webhook 地址
@@ -284,6 +290,8 @@ notify:
   wecom_bot:
     webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_ME"
     send_video: true        # 录像收尾后也发一段（先压缩到 max_mb 以内）
+    events: true            # false 时连录像一起不发
+    digest: true
     video:
       max_mb: 18            # 官方硬上限 20，留 2MB 余量；压不到就只发文字
       width: 854            # 压缩后的宽度，高度按比例（480p）
@@ -297,6 +305,8 @@ notify:
     url: ""
     timeout_seconds: 10
     max_image_mb: 1
+    events: true
+    digest: true
 
 gallery:
   # 本地相册。默认只绑本机，手机看不到——要手机访问就把 host 改成 0.0.0.0，

@@ -90,6 +90,59 @@ class BuildItemsTest(unittest.TestCase):
         self.assertEqual([i["kind"] for i in items], ["text"])
 
 
+class ChannelFilterTest(unittest.TestCase):
+    """按渠道过滤事件类型：critical 永不过滤，event/digest 各自独立开关。"""
+
+    def test_defaults_receive_event_and_digest(self):
+        cfg = {"channels": ["wecom_bot", "wxpusher"]}
+        event = D.build_items(cfg, event_id="e1", text="有人", image_path="a.jpg")
+        digest = D.build_items(cfg, event_id="d1", text="在线", severity="digest")
+        self.assertEqual({i["channel"] for i in event}, {"wecom_bot", "wxpusher"})
+        self.assertEqual({i["channel"] for i in digest}, {"wecom_bot", "wxpusher"})
+
+    def test_events_false_drops_every_event_item_for_that_channel(self):
+        cfg = {
+            "channels": ["wecom_bot", "wxpusher"],
+            "wecom_bot": {"events": False},
+        }
+        items = D.build_items(
+            cfg, event_id="e1", text="有人", image_path="a.jpg", video_path="b.mp4",
+        )
+        self.assertNotIn("wecom_bot", {i["channel"] for i in items})
+        # 另一个渠道不受影响，仍然只拿到它支持的 text
+        self.assertEqual([(i["channel"], i["kind"]) for i in items],
+                         [("wxpusher", "text")])
+
+    def test_digest_false_only_drops_digest(self):
+        cfg = {"channels": ["wecom_bot", "wxpusher"],
+               "wecom_bot": {"digest": False}}
+        digest = D.build_items(cfg, event_id="d1", text="在线", severity="digest")
+        event = D.build_items(cfg, event_id="e1", text="有人")
+        self.assertEqual({i["channel"] for i in digest}, {"wxpusher"})
+        self.assertEqual({i["channel"] for i in event}, {"wecom_bot", "wxpusher"})
+
+    def test_critical_ignores_both_filters(self):
+        cfg = {
+            "channels": ["wecom_bot", "wxpusher"],
+            "wecom_bot": {"events": False, "digest": False},
+            "wxpusher": {"events": False, "digest": False},
+        }
+        items = D.build_items(cfg, event_id="c1", text="重启了",
+                              severity="critical")
+        self.assertEqual({i["channel"] for i in items},
+                         {"wecom_bot", "wxpusher"})
+
+    def test_string_false_is_understood(self):
+        """YAML/界面有时会把布尔写成字符串，别把 "false" 当成真。"""
+        cfg = {"channels": ["wecom_bot"], "wecom_bot": {"events": "false"}}
+        self.assertEqual(D.build_items(cfg, event_id="e1", text="x"), [])
+
+    def test_unknown_severity_is_not_filtered(self):
+        cfg = {"channels": ["wecom_bot"], "wecom_bot": {"events": False}}
+        items = D.build_items(cfg, event_id="x", text="x", severity="system")
+        self.assertEqual(len(items), 1)
+
+
 class NotifierDeliverTest(unittest.TestCase):
     def _notifier(self, **bot):
         return N.Notifier({"channel": "wecom_bot",

@@ -203,10 +203,15 @@ class SettingsDialog:
             fg="#8A5A00")
 
     def _show_channel_warning(self, channels: list, outbox: dict,
-                              issues: Optional[dict] = None) -> None:
+                              issues: Optional[dict] = None,
+                              events_deliverable: bool = True) -> None:
         issues = issues or {}
         if not channels:
             text = "告警不会送达：没有启用任何通知渠道。"
+            color = "#993C1D"
+        elif not events_deliverable:
+            text = ("人员事件不会送达：所有启用渠道都关闭了「人员事件」；"
+                    "崩溃/恢复等 critical 告警仍会发。")
             color = "#993C1D"
         elif issues:
             text = ("有渠道未配置完整，告警可能发不出去："
@@ -393,7 +398,8 @@ class SettingsDialog:
         self._show_storage_info(data.get("storage") or {})
         self._show_channel_warning(
             data.get("channels") or [], data.get("outbox") or {},
-            data.get("channel_issues") or {})
+            data.get("channel_issues") or {},
+            events_deliverable=bool(data.get("events_deliverable", True)))
         self.status_label.configure(text="已读取。改完点「保存」，重启监控后生效。", fg="#666")
 
     def _fill_rows(self, values: dict, secrets: dict) -> None:

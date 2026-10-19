@@ -69,6 +69,36 @@ def supports_video(channel: str) -> bool:
     return channel == "wecom_bot"
 
 
+# 事件类型过滤：critical 永不接受过滤；event/digest 各有一个独立开关。
+_FILTER_KEYS = {"event": "events", "digest": "digest"}
+
+
+def _as_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(value)
+
+
+def channel_accepts(notify_cfg: dict, channel: str, severity: str) -> bool:
+    """这个渠道要不要接收这一类消息？
+
+    - critical：始终接收（崩溃/恢复/自检失败/队列溢出/相机失联），
+      唯一能关掉它的方式是禁用整个渠道。
+    - event / digest：读 `notify.<channel>.events` / `.digest`，缺失默认 true。
+      过滤发生在入队之前，所以被关掉的渠道不会产生 outbox 行，也不会占 dedupe_key。
+    """
+    severity = str(severity or "").strip().lower()
+    if severity == "critical":
+        return True
+    key = _FILTER_KEYS.get(severity)
+    if key is None:
+        return True
+    block = (notify_cfg or {}).get(channel) or {}
+    return _as_bool(block.get(key), default=True)
+
+
 def build_items(
     notify_cfg: dict,
     *,
@@ -86,6 +116,9 @@ def build_items(
     items: list[dict] = []
 
     for channel in enabled_channels(cfg):
+        if not channel_accepts(cfg, channel, severity):
+            log.debug("渠道 %s 已关闭 %s 类消息，跳过入队", channel, severity)
+            continue
         base = {
             "event_id": str(event_id or ""),
             "channel": channel,
@@ -260,5 +293,6 @@ class DeliveryWorker:
 
 __all__ = [
     "KNOWN_CHANNELS", "channel_list", "enabled_channels", "supports_image",
-    "supports_video", "build_items", "ChannelDispatcher", "DeliveryWorker",
+    "supports_video", "channel_accepts", "build_items", "ChannelDispatcher",
+    "DeliveryWorker",
 ]
