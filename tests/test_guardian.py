@@ -244,5 +244,49 @@ class HistoryTest(unittest.TestCase):
             self.assertEqual(g.last_exit_reason(), "unhandled")
 
 
+class GalleryDecideTest(unittest.TestCase):
+    def test_dead_pid_restarts(self):
+        self.assertEqual(G.decide_gallery(None, lambda p: False), G.ACT_RESTART_GONE)
+        self.assertEqual(G.decide_gallery(123, lambda p: False), G.ACT_RESTART_GONE)
+
+    def test_alive_matching_pid_is_ok(self):
+        cmd = ["python", "-m", "roomwatch", "gallery"]
+        self.assertEqual(G.decide_gallery(123, lambda p: True,
+                                          cmdline=lambda p: cmd), G.ACT_OK)
+
+    def test_reused_pid_is_restart(self):
+        self.assertEqual(G.decide_gallery(123, lambda p: True,
+                                          cmdline=lambda p: ["notepad.exe"]),
+                         G.ACT_RESTART_GONE)
+
+
+class CrashWindowTest(unittest.TestCase):
+    def test_counts_only_inside_window(self):
+        now = datetime(2026, 10, 19, 12, 0, 0)
+        stamps = [(now - timedelta(minutes=m)).isoformat() for m in (1, 5, 15)]
+        self.assertEqual(G.crash_window_count(stamps, now, 10), 2)
+
+    def test_bad_timestamps_are_skipped(self):
+        now = datetime(2026, 10, 19, 12, 0, 0)
+        self.assertEqual(G.crash_window_count(["garbage", None], now, 10), 0)
+
+    def test_future_timestamp_is_skipped(self):
+        now = datetime(2026, 10, 19, 12, 0, 0)
+        future = (now + timedelta(minutes=5)).isoformat()
+        self.assertEqual(G.crash_window_count([future], now, 10), 0)
+
+
+class TextTest(unittest.TestCase):
+    def test_recovery_mentions_reason(self):
+        text = G.recovery_text("watcher", {"reason": "unhandled", "code": 5})
+        self.assertIn("watcher", text)
+        self.assertIn("unhandled", text)
+
+    def test_crash_alert_mentions_count(self):
+        text = G.crash_alert_text("watcher", 3, 10, {"reason": "unhandled"})
+        self.assertIn("3", text)
+        self.assertIn("10", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

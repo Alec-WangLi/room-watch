@@ -72,6 +72,7 @@ ACT_WAIT = "wait"                # 疑似卡死，再观察一轮
 ACT_RESTART_GONE = "restart_gone"      # 进程没了
 ACT_RESTART_STALLED = "restart_stalled"  # 进程在但心跳停了
 ACT_BACKOFF = "backoff"          # 在退避窗口内，先不动
+ACT_PAUSED = "paused"            # 用户主动暂停，不许拉起
 
 HERE = str(PROJECT_ROOT)
 
@@ -194,6 +195,60 @@ def backoff_seconds(consecutive_failures: int, cap: float = 900.0) -> float:
     if consecutive_failures <= 0:
         return 0.0
     return min(cap, 60.0 * (2 ** (consecutive_failures - 1)))
+
+
+def decide_gallery(pid: Optional[int], alive, *, cmdline=None) -> str:
+    """相册进程该怎么处理。
+
+    只看 PID 不够：PID 会被复用。调用方提供 cmdline 时，命令行里必须同时
+    出现 roomwatch 与 gallery，否则按「已死」处理，避免把别的进程当相册。
+    """
+    if not pid or not alive(pid):
+        return ACT_RESTART_GONE
+    if cmdline is not None:
+        try:
+            args = cmdline(pid)
+        except Exception:  # noqa: BLE001
+            return ACT_RESTART_GONE
+        text = " ".join(str(part) for part in (args or [])).lower()
+        if "roomwatch" not in text or "gallery" not in text:
+            return ACT_RESTART_GONE
+    return ACT_OK
+
+
+def crash_window_count(timestamps: list[str], now: datetime, window_minutes: float) -> int:
+    """统计窗口内的重启次数；坏时间与未来时间都跳过。"""
+    window = float(window_minutes) * 60.0
+    count = 0
+    for raw in timestamps or []:
+        try:
+            then = datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError):
+            continue
+        delta = (now - then).total_seconds()
+        if 0 <= delta <= window:
+            count += 1
+    return count
+
+
+def _exit_summary(exit_record: Optional[dict]) -> str:
+    rec = exit_record or {}
+    reason = str(rec.get("reason") or "unknown")
+    code = rec.get("code")
+    return f"{reason}，退出码 {code}" if code is not None else reason
+
+
+def recovery_text(service: str, exit_record: Optional[dict]) -> str:
+    return f"room-watch：{service} 已恢复运行（上次退出：{_exit_summary(exit_record)}）"
+
+
+def crash_alert_text(
+    service: str, count: int, window_minutes: float, exit_record: Optional[dict]
+) -> str:
+    return (
+        f"room-watch：{service} 在 {int(window_minutes)} 分钟内重启 {count} 次，"
+        f"最近退出：{_exit_summary(exit_record)}。请检查摄像头与配置。"
+    )
 
 
 class FileLock:
