@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from .config import load_config
@@ -436,6 +437,22 @@ class GalleryServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
+def write_pid_file(path: str | Path, pid: int) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(str(int(pid)), encoding="utf-8")
+
+
+def remove_pid_file(path: str | Path, pid: int) -> None:
+    """只删内容等于自己 PID 的文件，避免把新实例的 PID 文件删掉。"""
+    target = Path(path)
+    try:
+        if target.read_text(encoding="utf-8").strip() == str(int(pid)):
+            target.unlink()
+    except (OSError, ValueError):
+        pass
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="本地抓拍相册")
     ap.add_argument("--config", default=str(resolve("config.yaml")),
@@ -446,6 +463,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--token", default=None, help="访问密码；绑非回环地址时必填")
     ap.add_argument("--status-file", default=str(STATE_DIR / "status.json"))
     ap.add_argument("--stale-after", type=float, default=120.0)
+    ap.add_argument("--pid-file", default=str(STATE_DIR / "gallery.pid"),
+                    help="运行中写 PID，供守护进程判活")
     args = ap.parse_args(argv)
 
     gallery_cfg: dict = {}
@@ -477,11 +496,15 @@ def main(argv: list[str] | None = None) -> None:
     if host not in LOOPBACK:
         print("提示：Basic 认证走明文 HTTP，只适合家庭/办公内网；公网请套 HTTPS。")
     server = GalleryServer((host, port), Handler)
+    pid_file = os.path.abspath(args.pid_file)
+    write_pid_file(pid_file, os.getpid())
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
+    finally:
         server.server_close()
+        remove_pid_file(pid_file, os.getpid())
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -346,6 +347,21 @@ class TestClientDisconnect(GalleryFixture):
             "客户端 RST 被当成服务端故障打印了堆栈：\n" + noise,
         )
         self._assert_server_alive()
+
+
+class GalleryPidTest(unittest.TestCase):
+    def test_write_and_remove_only_own_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "gallery.pid"
+            gallery.write_pid_file(p, 123)
+            gallery.remove_pid_file(p, 999)
+            self.assertTrue(p.exists())
+            gallery.remove_pid_file(p, 123)
+            self.assertFalse(p.exists())
+
+    def test_remove_missing_is_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gallery.remove_pid_file(Path(tmp) / "nope.pid", 123)
 
 
 if __name__ == "__main__":
