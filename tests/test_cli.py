@@ -199,6 +199,23 @@ class StartStopSemanticsTest(unittest.TestCase):
         self.assertIn("diag", cli.COMMANDS)
 
 
+class DiagCommandTest(unittest.TestCase):
+    def test_json_mode_prints_one_json_object(self):
+        fake = Path("var/diag/room-watch-diag-test.zip")
+        with mock.patch("roomwatch.diag.build_bundle", return_value=fake):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli.main(["diag", "--json"])
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue().strip())
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["path"], str(fake))
+
+    def test_unknown_argument_is_rejected(self):
+        with self.assertRaises(cli.UsageError):
+            cli._cmd_diag(["--bundle"])
+
+
 class ConfigTestCommandTest(unittest.TestCase):
     class FakeResponse:
         status_code = 200

@@ -520,6 +520,8 @@ class RoomWatchApp:
                    ).pack(side="left", padx=6)
         ttk.Button(tools, text="日志",
                    command=lambda: self._open_dir(self.project / "var" / "logs")).pack(side="left")
+        self.btn_diag = ttk.Button(tools, text="诊断包", command=self.on_diag)
+        self.btn_diag.pack(side="left", padx=(6, 0))
 
         # 事件列表
         box = ttk.LabelFrame(outer, text="最近事件", padding=8)
@@ -933,6 +935,34 @@ class RoomWatchApp:
             "\n\n常见原因：摄像头被别的程序占用（会议软件/相册）、编号不对、RTSP 地址或密码错误。\n"
             "详细日志：var\\logs\\probe.log")
 
+    def on_diag(self) -> None:
+        """生成脱敏诊断包。不阻塞界面，也不占用摄像头。"""
+        if getattr(self, "_diag_running", False):
+            return
+        self._diag_running = True
+        self.btn_diag.configure(state="disabled")
+
+        def work() -> dict:
+            return self._run_cli(["diag", "--json"], timeout=120)
+
+        self._run_task(work, self._on_diag_done)
+
+    def _on_diag_done(self, result: dict) -> None:
+        self._diag_running = False
+        if self.btn_diag.winfo_exists():
+            self.btn_diag.configure(state="normal")
+        path = result.get("path")
+        if result.get("ok") and path:
+            self.messagebox.showinfo(
+                "诊断包已生成",
+                f"{path}\n\n"
+                "已脱敏：不含抓拍、录像、人脸模板和完整密钥。\n"
+                "反馈问题时把这个 zip 发出去即可。")
+            return
+        self.messagebox.showerror(
+            "诊断包生成失败",
+            (result.get("error") or result.get("out") or "没有拿到原因"))
+
     def on_enroll(self) -> None:
         if self._busy:
             return
@@ -1271,7 +1301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for name, btn in (("启动", app.btn_start), ("停止", app.btn_stop),
                           ("相册", app.btn_gallery), ("预览", app.btn_probe),
                           ("注册", app.btn_enroll), ("设置", app.btn_settings),
-                          ("更新", app.btn_update)):
+                          ("更新", app.btn_update), ("诊断", app.btn_diag)):
             if not btn.winfo_exists():
                 problems.append(f"{name}按钮不存在")
         if len(app.tree["columns"]) != 4:

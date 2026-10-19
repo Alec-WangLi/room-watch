@@ -956,13 +956,18 @@ def _cmd_identity(argv: Sequence[str]) -> int:
 
 
 def _cmd_diag(argv: Sequence[str]) -> int:
-    """生成诊断包并打印路径。"""
+    """生成诊断包并打印路径。--json 供界面调用，只输出一行。"""
     from . import diag
 
-    if argv:
-        raise UsageError(f"rw diag 不接受参数，收到：{' '.join(argv)}")
+    json_mode = "--json" in argv
+    rest = [arg for arg in argv if arg != "--json"]
+    if rest:
+        raise UsageError(f"rw diag 只接受 --json，收到：{' '.join(rest)}")
     path = diag.build_bundle(paths.PROJECT_ROOT)
-    print(f"诊断包已生成：{path}")
+    if json_mode:
+        print(json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False))
+    else:
+        print(f"诊断包已生成：{path}")
     return 0
 
 

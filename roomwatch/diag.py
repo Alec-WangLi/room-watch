@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import platform
+import sqlite3
 import sys
 import zipfile
 from datetime import datetime
@@ -92,6 +93,55 @@ def _system_text(root: Path) -> str:
     ])
 
 
+def _tail_text(path: Path, limit: int = _LOG_TAIL_BYTES) -> str:
+    try:
+        data = path.read_bytes()[-limit:]
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def _events_text(root: Path, limit: int = 20) -> str:
+    """最近事件摘要。只取时间/身份/置信度/是否通知，不带抓拍路径。"""
+    db = root / "var" / "db" / "events.db"
+    if not db.is_file():
+        return "（还没有事件库）\n"
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            rows = conn.execute(
+                "SELECT ts, confidence, notified, identity FROM events "
+                "ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return f"（读取事件库失败：{exc}）\n"
+    if not rows:
+        return "（事件库为空）\n"
+    lines = [f"最近 {len(rows)} 条事件（新→旧）："]
+    for ts, confidence, notified, identity in rows:
+        conf = "-" if confidence is None else f"{float(confidence):.2f}"
+        lines.append(
+            f"{ts}  identity={identity or '-'}  conf={conf}  "
+            f"notified={int(bool(notified))}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _log_events_text(paths: list[Path], limit: int = 50) -> str:
+    """从日志尾部提取结构化 event= 行，回答「进程为什么退出/重启」。"""
+    lines: list[str] = []
+    for path in paths:
+        for line in _tail_text(path).splitlines():
+            if "event=" in line:
+                lines.append(line.strip())
+    if not lines:
+        return "（日志里还没有结构化事件）\n"
+    return "\n".join(lines[-limit:]) + "\n"
+
+
 def build_bundle(root: str | Path, out_dir: Optional[str | Path] = None) -> Path:
     root = Path(root)
     target_dir = _output_dir(root, out_dir)
@@ -100,7 +150,10 @@ def build_bundle(root: str | Path, out_dir: Optional[str | Path] = None) -> Path
     bundle = target_dir / f"room-watch-diag-{stamp}.zip"
 
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as zf:
-        for log in sorted((root / "var" / "logs").glob("*.log")):
+        logs_dir = root / "var" / "logs"
+        # RotatingFileHandler 的备份名是 watcher.log.1 …，*.log 匹配不到。
+        log_paths = sorted(set(logs_dir.glob("*.log")) | set(logs_dir.glob("*.log.*")))
+        for log in log_paths:
             try:
                 data = log.read_bytes()[-_LOG_TAIL_BYTES:]
             except OSError:
@@ -133,5 +186,7 @@ def build_bundle(root: str | Path, out_dir: Optional[str | Path] = None) -> Path
 
         zf.writestr("doctor.txt", _doctor_text(root) + "\n")
         zf.writestr("system.txt", _system_text(root) + "\n")
+        zf.writestr("events.txt", _events_text(root))
+        zf.writestr("log_events.txt", _log_events_text(log_paths))
 
     return bundle
