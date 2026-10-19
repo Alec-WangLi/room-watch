@@ -21,7 +21,9 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
+from roomwatch import control
 from roomwatch import guardian as G
 
 
@@ -286,6 +288,131 @@ class TextTest(unittest.TestCase):
         text = G.crash_alert_text("watcher", 3, 10, {"reason": "unhandled"})
         self.assertIn("3", text)
         self.assertIn("10", text)
+
+
+class GuardPausedTest(unittest.TestCase):
+    def test_paused_does_not_start_anything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = {"guardian": {
+                       "desired_state": str(root / "var/state/desired_state.json"),
+                       "state": str(root / "var/state/guardian_state.json"),
+                       "lock": str(root / "var/state/guardian.lock"),
+                       "history": str(root / "var/state/h.jsonl"),
+                       "supervise_gallery": False},
+                   "health": {"exit_record": str(root / "var/state/last_exit.json")},
+                   "storage": {"status": str(root / "var/state/status.json")},
+                   "__config_path__": str(root / "config.yaml")}
+            control.set_desired_state(root, "paused")
+            g = G.Guard(cfg, dry_run=True)
+            with mock.patch.object(g, "_start_watcher") as sw, \
+                 mock.patch.object(g, "_start_gallery") as sg:
+                self.assertEqual(g.check_once(), G.ACT_PAUSED)
+                sw.assert_not_called()
+                sg.assert_not_called()
+
+
+class GuardRecoveryTest(unittest.TestCase):
+    def _cfg(self, root):
+        return {"guardian": {
+                    "desired_state": str(root / "var/state/desired_state.json"),
+                    "state": str(root / "var/state/guardian_state.json"),
+                    "lock": str(root / "var/state/guardian.lock"),
+                    "history": str(root / "var/state/h.jsonl"),
+                    "gallery_pid": str(root / "var/state/gallery.pid"),
+                    "gallery_log": str(root / "var/logs/gallery.log"),
+                    "supervise_gallery": False},
+                "health": {"path": str(root / "var/state/health.json"),
+                           "exit_record": str(root / "var/state/last_exit.json")},
+                "storage": {"status": str(root / "var/state/status.json")},
+                "__config_path__": str(root / "config.yaml")}
+
+    def test_recovery_notification_sent_once_after_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": os.getpid(),
+                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g.state["pending_recovery"] = {"service": "watcher", "reason": "unhandled"}
+            sent = []
+            g._notify = lambda text: sent.append(text)
+            self.assertEqual(g.check_once(), G.ACT_OK)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("unhandled", sent[0])
+            g.check_once()
+            self.assertEqual(len(sent), 1)
+
+    def test_selfcheck_failure_notifies_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": os.getpid(),
+                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+            (root / "var/state/health.json").write_text(json.dumps({
+                "selfcheck": [{"name": "推送", "ok": False, "detail": "未配置"}]}),
+                encoding="utf-8")
+            g = G.Guard(self._cfg(root), dry_run=True)
+            sent = []
+            g._notify = lambda text: sent.append(text)
+            g.check_once()
+            self.assertTrue(any("自检" in s for s in sent))
+
+
+class GuardSupervisionTest(unittest.TestCase):
+    def _cfg(self, root, **guardian):
+        base = {
+            "desired_state": str(root / "var/state/desired_state.json"),
+            "state": str(root / "var/state/guardian_state.json"),
+            "lock": str(root / "var/state/guardian.lock"),
+            "history": str(root / "var/state/h.jsonl"),
+            "gallery_pid": str(root / "var/state/gallery.pid"),
+            "gallery_log": str(root / "var/logs/gallery.log"),
+            "supervise_gallery": False,
+        }
+        base.update(guardian)
+        return {"guardian": base,
+                "health": {"path": str(root / "var/state/health.json"),
+                           "exit_record": str(root / "var/state/last_exit.json")},
+                "storage": {"status": str(root / "var/state/status.json")},
+                "__config_path__": str(root / "config.yaml")}
+
+    def test_missing_gallery_is_started(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": os.getpid(),
+                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+            g = G.Guard(self._cfg(root, supervise_gallery=True), dry_run=True)
+            started = []
+            g._start_gallery = lambda: started.append(True) or 999
+            self.assertEqual(g.check_once(), G.ACT_OK)
+            self.assertTrue(started)
+
+    def test_crash_threshold_sends_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": 999_999_999,
+                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+                encoding="utf-8")
+            g = G.Guard(self._cfg(root, crash_threshold=2, crash_window_minutes=10),
+                        dry_run=True)
+            g._start_watcher = lambda: 123
+            g.state["restart_times"] = [
+                (datetime.now() - timedelta(minutes=1)).isoformat(timespec="seconds")
+            ]
+            sent = []
+            g._notify = lambda text: sent.append(text)
+            self.assertEqual(g.check_once(), G.ACT_RESTART_GONE)
+            self.assertTrue(any("重启" in text for text in sent))
 
 
 if __name__ == "__main__":

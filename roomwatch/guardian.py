@@ -53,6 +53,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -60,6 +61,7 @@ from typing import Optional
 
 import yaml
 
+from . import control
 from . import health
 from . import logutil
 from .paths import PROJECT_ROOT, resolve
@@ -95,6 +97,15 @@ def pid_alive(pid: Optional[int]) -> bool:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+
+def _psutil_cmdline(pid: int) -> list[str]:
+    try:
+        import psutil
+
+        return list(psutil.Process(int(pid)).cmdline())
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def read_status(path: str) -> Optional[dict]:
@@ -324,6 +335,20 @@ class Guard:
         self.exit_record_path = _abs(
             health_cfg.get("exit_record") or "var/state/last_exit.json"
         )
+        self.health_path = _abs(health_cfg.get("path") or "var/state/health.json")
+        self.desired_state_path = _abs(
+            g.get("desired_state", "var/state/desired_state.json")
+        )
+        self.root = Path(self.desired_state_path).parents[2]
+        self.gallery_pid_path = _abs(g.get("gallery_pid", "var/state/gallery.pid"))
+        self.gallery_log = _abs(g.get("gallery_log", "var/logs/gallery.log"))
+        self.owner_lock_path = _abs(
+            g.get("owner_lock", "var/state/guardian.owner.lock")
+        )
+        self.supervise_gallery = bool(g.get("supervise_gallery", True))
+        self.notify_recovery = bool(g.get("notify_recovery", True))
+        self.crash_window_minutes = float(g.get("crash_window_minutes", 10))
+        self.crash_threshold = int(g.get("crash_threshold", 3))
         self.kill_grace = float(g.get("kill_grace_seconds", 8.0))
 
         storage = cfg.get("storage") or {}
@@ -345,6 +370,10 @@ class Guard:
             "last_restart_at": None,
             "last_action": "init",
             "last_check_at": None,
+            "pending_recovery": None,
+            "restart_times": [],
+            "last_crash_alert_at": None,
+            "last_selfcheck_alert_at": None,
         }
         try:
             with open(self.state_path, "r", encoding="utf-8") as f:
@@ -439,9 +468,103 @@ class Guard:
             log.error("拉起 watcher 失败: %s", exc)
             return None
 
+    def _start_gallery(self) -> Optional[int]:
+        cmd = [
+            self.python, "-m", "roomwatch", "gallery",
+            "--config", self.config_path,
+            "--pid-file", self.gallery_pid_path,
+        ]
+        if self.dry_run:
+            log.info("[dry-run] 本应执行: %s", " ".join(cmd))
+            return None
+        try:
+            log_path = Path(self.gallery_log)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "ab") as out:
+                flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+                )
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=HERE,
+                    stdout=out,
+                    stderr=out,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=flags,
+                    close_fds=True,
+                )
+            log.warning("已拉起 gallery，PID %s", proc.pid)
+            return proc.pid
+        except Exception as exc:  # noqa: BLE001
+            log.error("拉起 gallery 失败: %s", exc)
+            return None
+
+    def _gallery_pid(self) -> int:
+        try:
+            return int(
+                Path(self.gallery_pid_path).read_text(encoding="utf-8").strip() or 0
+            )
+        except (OSError, ValueError):
+            return 0
+
+    def _check_gallery(self) -> str:
+        pid = self._gallery_pid()
+        action = decide_gallery(pid, pid_alive, cmdline=_psutil_cmdline)
+        if action == ACT_RESTART_GONE:
+            new_pid = self._start_gallery()
+            append_history(self.history_path, {
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "service": "gallery",
+                "action": action,
+                "exit_code": None,
+                "exit_reason": "not-running" if not pid else "unknown",
+                "new_pid": new_pid,
+            })
+        return action
+
+    def _notify(self, text: str) -> None:
+        def send() -> None:
+            try:
+                from .notifier import Notifier
+
+                Notifier(self.cfg.get("notify") or {}).send(text)
+            except Exception as exc:  # noqa: BLE001 - 通知失败不能拖累守护
+                log.warning("发送守护通知失败: %s", exc)
+
+        threading.Thread(target=send, daemon=True, name="guardian-notify").start()
+
+    def _check_selfcheck(self, now: datetime) -> None:
+        data = health.read_json(self.health_path)
+        failures = [
+            item for item in ((data or {}).get("selfcheck") or [])
+            if isinstance(item, dict) and not item.get("ok", True)
+        ]
+        if not failures:
+            return
+        last = self.state.get("last_selfcheck_alert_at")
+        if last:
+            try:
+                if (now - datetime.fromisoformat(str(last))).total_seconds() < 600:
+                    return
+            except (TypeError, ValueError):
+                pass
+        detail = "；".join(
+            f"{item.get('name', '?')}: {item.get('detail', '')}" for item in failures
+        )
+        self._notify(f"room-watch：启动自检失败：{detail}")
+        self.state["last_selfcheck_alert_at"] = now.isoformat(timespec="seconds")
+
     def check_once(self) -> str:
         """检查一轮，必要时动手。返回动作字符串。"""
         now = datetime.now()
+
+        if control.read_desired_state(self.root) == "paused":
+            self.state["pending_recovery"] = None
+            self.state["stall_streak"] = 0
+            self.state["last_action"] = "paused"
+            self._save_state()
+            return ACT_PAUSED
+
         status = read_status(self.status_path)
 
         action = decide(
@@ -479,6 +602,19 @@ class Guard:
             self.state["consecutive_failures"] = 0
             self.state["last_action"] = "ok"
             self._save_state()
+
+            pending = self.state.get("pending_recovery")
+            if pending and self.notify_recovery:
+                self._notify(recovery_text(
+                    str(pending.get("service") or "watcher"),
+                    {"reason": pending.get("reason"), "code": pending.get("code")},
+                ))
+                self.state["pending_recovery"] = None
+                self._save_state()
+
+            self._check_selfcheck(now)
+            if self.supervise_gallery:
+                self._check_gallery()
             return ACT_OK
 
         # 需要重启的两种情况，先看退避
@@ -516,6 +652,35 @@ class Guard:
             "exit_reason": (exit_record or {}).get("reason", "unknown"),
         })
 
+        self.state["pending_recovery"] = {
+            "service": "watcher",
+            "reason": (exit_record or {}).get("reason", "unknown"),
+            "code": (exit_record or {}).get("code"),
+        }
+        times = [
+            str(item) for item in (self.state.get("restart_times") or [])
+            if isinstance(item, str)
+        ]
+        times.append(now.isoformat(timespec="seconds"))
+        self.state["restart_times"] = times[-20:]
+
+        count = crash_window_count(times, now, self.crash_window_minutes)
+        should_alert = count >= self.crash_threshold
+        last_alert = self.state.get("last_crash_alert_at")
+        if last_alert:
+            try:
+                elapsed = (now - datetime.fromisoformat(str(last_alert))).total_seconds()
+                if elapsed < self.crash_window_minutes * 60:
+                    should_alert = False
+            except (TypeError, ValueError):
+                pass
+        if should_alert:
+            self._notify(crash_alert_text(
+                "watcher", count, self.crash_window_minutes, exit_record
+            ))
+            self.state["last_crash_alert_at"] = now.isoformat(timespec="seconds")
+        self._save_state()
+
         log.warning("已重启（%s），累计第 %s 次", reason, self.state["restart_count"])
         return action
 
@@ -524,19 +689,26 @@ class Guard:
     def run_forever(self) -> None:
         log.info("守护启动：每 %d 秒检查一次，卡死判据 %d 秒",
                  self.check_seconds, self.stale_seconds)
-        while True:
-            try:
-                with FileLock(self.lock_path) as got:
-                    if got:
-                        self.check_once()
-                    else:
-                        log.debug("另一个守护实例正在检查，跳过本轮")
-            except KeyboardInterrupt:
-                log.info("收到 Ctrl+C，守卫退出（watcher 不受影响）")
-                return
-            except Exception as exc:  # noqa: BLE001 - 守护者自己绝不能崩
-                log.error("检查轮次异常（已吞掉，继续看守）: %s", exc)
-            time.sleep(self.check_seconds)
+        owner = FileLock(self.owner_lock_path)
+        if not owner.acquire():
+            log.info("已有 guardian 实例在运行，本实例退出")
+            return
+        try:
+            while True:
+                try:
+                    with FileLock(self.lock_path) as got:
+                        if got:
+                            self.check_once()
+                        else:
+                            log.debug("另一个守护实例正在检查，跳过本轮")
+                except KeyboardInterrupt:
+                    log.info("收到 Ctrl+C，守卫退出（watcher 不受影响）")
+                    return
+                except Exception as exc:  # noqa: BLE001 - 守护者自己绝不能崩
+                    log.error("检查轮次异常（已吞掉，继续看守）: %s", exc)
+                time.sleep(self.check_seconds)
+        finally:
+            owner.release()
 
 
 def load_config(path: str) -> dict:
@@ -583,6 +755,10 @@ def main(argv: list[str] | None = None) -> None:
         status = read_status(guard.status_path)
         age = frame_age_seconds(status)
         print("=== 守护状态 ===")
+        print(f"期望状态     : {control.read_desired_state(guard.root)}")
+        gpid = guard._gallery_pid()
+        galive = bool(gpid) and pid_alive(gpid)
+        print(f"相册         : PID {gpid or '无'}（{'存活' if galive else '未运行'}）")
         print(f"监控状态文件 : {guard.status_path}")
         if status is None:
             print("  内容        : 读不到（监控可能从未启动过）")
