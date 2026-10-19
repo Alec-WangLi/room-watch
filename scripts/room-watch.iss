@@ -45,6 +45,9 @@ SetupIconFile=..\assets\room-watch.ico
 ; 首次装完自动弹向导，不额外显示「是否立即运行」的勾选页
 DisableReadyPage=no
 ShowLanguageDialog=no
+; 安装前由 [Code] 主动停掉旧进程；不让 Inno 去猜哪个应用占着文件。
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "inno\ChineseSimplified.isl"
@@ -86,6 +89,55 @@ Type: filesandordirs; Name: "{app}\runtime"
 Type: filesandordirs; Name: "{app}\var\logs"
 
 [Code]
+// 升级前先停掉旧进程。否则 watcher/guardian 锁着 runtime\python，Inno 会弹
+// 「无法自动关闭所有应用程序」，用户只能手动去任务管理器里找。
+// 顺序：先用程序自己的 stop（让正在写的 mp4/音轨收尾），再按安装目录路径
+// 强停剩余进程（不碰用户自己的 Python）。
+function StopOldProcesses(): Boolean;
+var
+  ResultCode: Integer;
+  Py, Config, ScriptPath, Script, EscapedRoot, Cmd: String;
+begin
+  Result := True;
+  Py := ExpandConstant('{app}\runtime\python\python.exe');
+  Config := ExpandConstant('{app}\config.yaml');
+
+  if FileExists(Py) and FileExists(Config) then
+  begin
+    Cmd := AddQuotes(Py) + ' -m roomwatch stop --config ' + AddQuotes(Config);
+    Exec(ExpandConstant('{cmd}'), '/c ' + Cmd, ExpandConstant('{app}'),
+         SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+
+  EscapedRoot := ExpandConstant('{app}');
+  StringChangeEx(EscapedRoot, '''', '''''', True);
+  ScriptPath := ExpandConstant('{tmp}\roomwatch-stop.ps1');
+  Script :=
+    '$root = ''' + EscapedRoot + '''' + #13#10 +
+    'Get-CimInstance Win32_Process | ForEach-Object {' + #13#10 +
+    '  if ($_.ExecutablePath -and $_.ExecutablePath -like "$root*") {' + #13#10 +
+    '    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue' + #13#10 +
+    '  }' + #13#10 +
+    '}' + #13#10;
+  if SaveStringToFile(ScriptPath, Script, False) then
+  begin
+    Cmd := 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' + AddQuotes(ScriptPath);
+    Exec(ExpandConstant('{cmd}'), '/c ' + Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    DeleteFile(ScriptPath);
+  end;
+
+  // 兜底：界面 exe 的路径信息拿不到时也能关掉。
+  Exec(ExpandConstant('{cmd}'), '/c taskkill /F /IM room-watch.exe /T >nul 2>&1',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(800);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  StopOldProcesses();
+  Result := '';
+end;
+
 // 装完在完成页说清下一步，客户不用猜「然后呢」。
 procedure CurPageChanged(CurPageID: Integer);
 begin
