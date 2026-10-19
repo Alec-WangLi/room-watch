@@ -1292,8 +1292,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         dialog = gui_settings.SettingsDialog(app, autoload=False)
         app.win.update()
         tabs = dialog.notebook.tabs()
-        if len(tabs) != 7:
-            problems.append(f"设置页签数量是 {len(tabs)}，应为 7")
+        expected_tabs = len(gui_settings.SECTIONS)
+        if len(tabs) != expected_tabs:
+            problems.append(f"设置页签数量是 {len(tabs)}，应为 {expected_tabs}")
         dialog.close()
 
         width = app.win.winfo_width()
