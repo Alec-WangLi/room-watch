@@ -712,39 +712,36 @@ room-watch-<版本>\
    命令行推不上去。
 6. **旧企业微信 webhook 必须作废重建** —— 那个 key 曾进过 git 历史（已重写清除），
    按泄露处理：企业微信后台删掉该群机器人重建，新 key 只进 `config.local.yaml`。
-   **待所有者本人操作**，代码侧已无需改动。
+   **待所有者本人操作**；代码侧已于 0.2.0 清理：`tests/test_settings.py` 里的
+   真实地址已换成假值。
 7. **Watcher 每 30~63 分钟静默退出未根治** —— 0.1.11 已加健康快照、退出记录、
    崩溃栈、看门狗与 guardian 历史，先用真机数据定位；guardian 仍常驻兜底。
-8. **未在干净机器上验证过安装包** —— 0.1.21 已本地构建
-   `dist\room-watch-0.1.21-setup.exe`，但同机存在开发环境，仍需干净机器验证。
+8. **未在干净机器上验证过安装包** —— 0.2.0 已本地构建
+   `dist\room-watch-0.2.0-setup.exe`，但同机存在开发环境，仍需干净机器验证。
 
 ---
 
-## J. 当前状态（2026-10-20 晚）
+## J. 当前状态（2026-10-20 深夜 · 0.2.0）
 
-- **分支**：`main` = `b63f8a2`（稳定版 0.1.12）；`beta` = `4b801d7`（0.1.22，
-  已发 `v0.1.22-beta` 预发布）；本轮功能分支 `feat/0.1.22-ui-fixes` 已合回 beta。
-- **本机安装**：已用 `dist\room-watch-0.1.22-setup.exe` 覆盖安装，`VERSION` 与
-  卸载项均显示 0.1.22；配置、本人模板与抓拍/录像数据保留。
-- **已完成（0.1.22）**：更新通道代次与保存后重查、底栏/设置页版面修复、
-  保存提示保留、构建自检扩成九个设置页 × 两档尺寸；真机发现并修复
-  guardian 与 `guard --once` 双起 watcher、安装器失败不回显两个问题。
-- **真机验证**：安装后 `rw start` 只有一个 watcher 与一个 guardian，gallery 正常；
-  `room-watch.exe --selftest` 通过；更新检查返回「测试版通道」；保存提示保留；
-  九页两档尺寸无裁切（详见 `ui-check/` 与 `var/logs/gui-selftest.log`）。
-- **已发布**：`v0.1.22-beta`（prerelease，tag 指向 `4b801d7`）：
-  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.1.22-beta
-  资产 `room-watch-0.1.22-setup.exe` + `.sha256`；简介取自 CHANGELOG。
-- **0.1.23（已发 `v0.1.23-beta`，tag `96328cb`）**：gallery `/healthz` +
-  guardian 假活重启、`rw doctor` 安装版本检查；已真机安装验证。
-- **0.1.24（已发 `v0.1.24-beta`，tag `d852c2c`）**：0.1.22/0.1.23 的更新
-  交接脚本在分离 cmd 里用 `tasklist | find` 等更新器 PID，`find` 会一直等管道
-  EOF，安装器根本不启动。已改成 tasklist 先写临时文件再 find；真实会话用
-  本地安装包走交接脚本验证 `installer rc=0`、监控自动恢复、界面自动重开。
-  0.1.22/0.1.23 用户需要手动安装一次 0.1.24；0.1.23 的 Release 保留。
-  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.1.24-beta
-- **未做**：托盘（需 pystray + 真机）、M6 平台抽象、干净机器安装验证。
-- **下一步**：观察 0.1.22 真机运行与后续自动更新；稳定后升修订号合 `main`，
-  从 `main` 发 stable。发版仍需所有者明确同意。
-- **详细交接**：`docs/handoff/2026-10-19-session.md`（第 18 节为 0.1.21）、
-  `docs/handoff/2026-10-20-next-session.md`（下一轮入口）；新会话入口 `CLAUDE.md`。
+- **版本基线**：所有者明确同意从 0.1.x 升到 0.2.0，`VERSION-APPROVED` 已改为 `0.2`。
+- **分支**：`main` 与 `beta` 均为 0.2.0（main 含 beta 的合并提交 `bc3192c`；
+  发布 tag `v0.2.0` 指向该提交）。
+- **已发布**：`v0.2.0` 稳定版（普通 Release，非 prerelease）：
+  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.2.0
+  资产 `room-watch-0.2.0-setup.exe`（143.1MB）+ `.sha256`；
+  sha256 `0cbe2f1d14ad7fec996521b1e460348fb0f4754866a849120ba3987252ee34ed`；
+  简介取自 CHANGELOG。
+- **内容**：0.1.13–0.1.24 的稳定化改动合入 `main`；测试代码不再带真实
+  企业微信 webhook。
+- **测试**：`beta` 与合并后的 `main` 全量 `rw test` 均通过；GUI 0.2.0
+  `--selftest` 通过；便携包 `rw doctor` 全部通过。
+- **本机安装**：仍是 0.1.24（所有者要求自己更新，自动更新在安装前已停止）；
+  GUI 已显示「有新版本 0.2.0」。自动更新链路实测：检查到 0.2.0（跨次版本
+  需确认）、真实下载到 89%（约 128MB）；GitHub 边缘节点速度随机（首连
+  5–12 KB/s，重连后 629 KB/s），若界面更新卡在低速可取消重试。
+- **待所有者操作**：① 在 GUI 点「有新版本 0.2.0」或运行
+  `dist\room-watch-0.2.0-setup.exe` 完成安装；② 企业微信后台删除旧机器人
+  重建，更新 `config.local.yaml`；③ CI 工作流粘贴（token 缺 workflow scope）。
+- **未做**：干净机器安装验证、托盘（pystray + 真机）、M6 平台抽象。
+- **详细交接**：`docs/handoff/2026-10-20-next-session.md`（第 8 节为 0.2.0）；
+  新会话入口 `CLAUDE.md`。

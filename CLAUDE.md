@@ -10,7 +10,7 @@
 - **分支**：`main` 是稳定版，`beta` 是测试版。新功能从 `beta` 切
   `feat/<主题>`，完成后先合回 `beta`，稳定后再合回 `main`；不要直接改 `main`。
 - **优先级**：稳定性 > 性能 > 功能数量。最在意「一直活着、真出事一定通知到」。
-- **版本**：只动第三位（0.1.x）；不替所有者宣布正式版；不擅自打 tag / 发 Release。
+- **版本**：只动第三位（0.2.x）；不替所有者宣布正式版；不擅自打 tag / 发 Release。
 - **测试**：改代码先写失败测试；合并前跑全量 `rw test`（含集成测试）。
 - **凭据**：只放 `config.local.yaml`，不打印、不提交、不贴进会话。
 - **平台**：Windows 桌面版 + 本机 USB 摄像头；Linux 是以后的事，
@@ -19,9 +19,8 @@
   `C:\Users\Alec\.workbuddy\binaries\python\envs\default\Scripts\python.exe`；
   默认 `python` 可能没有 cv2，以 `rw doctor` 为准。
 
-当前状态速览：`main` = 0.1.12（M0–M1），`beta` = 0.1.24（已发
-`v0.1.24-beta` 预发布）；本机已安装 0.1.24 并完成真机交接验证。
-0.1.22/0.1.23 用户需手动安装一次 0.1.24。详见
+当前状态速览：`main` 与 `beta` 均为 0.2.0；已发 `v0.2.0` 稳定版。
+本机仍是 0.1.24，所有者要求自己完成这次更新；更新入口见
 `docs/handoff/2026-10-20-next-session.md`。
 发版通道：稳定版从 `main` 走 plain Release，测试版从 `beta` 走 prerelease
 （`scripts/release.py --channel stable|beta`）；发版需所有者明确同意。
