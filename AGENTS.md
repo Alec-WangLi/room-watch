@@ -753,7 +753,7 @@ room-watch-<版本>\
   （PID 40228，`/healthz` ok）。通知类设置保存后需重启 watcher+guardian，
   界面会提示「需要重启」；热更新只覆盖语音。
 - **待所有者操作**：CI 工作流粘贴（token 缺 workflow scope）。
-- **0.2.2 已就绪**（`feat/m3-m4-performance`，未合并）：录像默认
+- **0.2.2 已合入 beta**（`276b95b`，未推送/未发版）：录像默认
   `h264_mf`、失败回退 cv2 并通知；M4 基准完成，数据支持 onnxruntime 但
   本轮不捆绑。本机已安装验证：doctor/卸载项/界面自检均为 0.2.2；
   同一文件源复放真实抓拍，h264_mf 2.1–3.3 MB/分钟 vs avc1 27.0–29.8。

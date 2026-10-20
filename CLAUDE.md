@@ -19,8 +19,8 @@
   `C:\Users\Alec\.workbuddy\binaries\python\envs\default\Scripts\python.exe`；
   默认 `python` 可能没有 cv2，以 `rw doctor` 为准。
 
-当前状态速览：`main` 为 0.2.0（已发 `v0.2.0` 稳定版）；`beta` 为 0.2.1
-（已发 `v0.2.1-beta` 测试版）。本机已安装 0.2.1 并完成真机验证；GUI 按需打开。详见
+当前状态速览：`main` 为 0.2.0（已发 `v0.2.0` 稳定版）；`beta` 为 0.2.2
+（已合入、未推送、未发版）。本机已安装 0.2.2 并完成真机验证；GUI 按需打开。详见
 `docs/handoff/2026-10-20-next-session.md`。
 发版通道：稳定版从 `main` 走 plain Release，测试版从 `beta` 走 prerelease
 （`scripts/release.py --channel stable|beta`）；发版需所有者明确同意。
