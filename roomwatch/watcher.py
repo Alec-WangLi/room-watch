@@ -19,7 +19,7 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import cv2
@@ -70,7 +70,14 @@ from .detector import FaceFinder
 from .gate import MotionGate
 from .onnx_detector import build_detector
 from .delivery import ChannelDispatcher, DeliveryWorker, build_items, enabled_channels
-from .identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker, save_owner_photo
+from .identity import (
+    LABEL_OTHER,
+    LABEL_OWNER,
+    LABEL_UNKNOWN,
+    Identity,
+    OwnerTracker,
+    save_owner_photo,
+)
 from .labels import identity_text
 from .outbox import OutboxStore
 from .recorder import Recorder, video_path_for
@@ -78,6 +85,15 @@ from .speaker import Speaker
 
 log = logging.getLogger("room-watch")
 
+# 事件触发后先压住通知多久，给「侧脸 → 正脸」留出本人识别时间。
+# 窗口内持续识别；确认本人则撤销整条事件，确认陌生人则立刻放行。
+OWNER_GRACE_SECONDS = 15.0
+# 连续几次「明确不像本人」才提前放行，避免单帧抖动误推。
+STRANGER_CONFIRM_CHECKS = 2
+# 相似度比本人阈值低这么多，才算「明确不是本人」；介于中间继续等。
+STRANGER_MARGIN = 0.20
+# 等待窗口内重新做身份识别的间隔。
+IDENTITY_RECHECK_SECONDS = 1.0
 # 人进来后最多重试找脸多久。够他走到镜头前转个身，又不会在长期停留时
 # 每秒跑一次人脸检测。
 VOICE_RETRY_SECONDS = 30.0
@@ -159,6 +175,12 @@ class EventStore:
             (ts.isoformat(), snapshot, conf, int(notified), video, identity),
         )
         self.conn.commit()
+
+    def delete_by_snapshot(self, snapshot: str) -> int:
+        """删掉某次抓拍对应的事件行；返回删除条数。晚到本人识别撤销事件时用。"""
+        cur = self.conn.execute("DELETE FROM events WHERE snapshot=?", (str(snapshot),))
+        self.conn.commit()
+        return int(cur.rowcount)
 
 
 class Watcher:
@@ -287,6 +309,8 @@ class Watcher:
         self.last_identity_label = "other"
         self.last_identity_score = 0.0
         self.identity_hits = 0
+        # 「明确不是本人」的阈值：比本人阈值低一截，避免侧脸被当成陌生人。
+        self.stranger_threshold = max(0.0, self.identity.threshold - STRANGER_MARGIN)
 
         heartbeat = cfg.get("heartbeat") or {}
         self.heartbeat_minutes = float(heartbeat.get("interval_minutes", 30))
@@ -363,6 +387,16 @@ class Watcher:
         self.current_video: str | None = None
         # 录像收尾时才知道文件名，推送文案要用事件发生的时刻，先存着
         self.last_event_at: datetime | None = None
+
+        # 「事件已触发但通知还在等待窗口」的状态。None/True 表示没有待决事件。
+        self.event_snapshot: str | None = None
+        self.event_event_id: str | None = None
+        self.event_hold_until: datetime | None = None
+        self.event_resolved = True
+        self.stranger_streak = 0
+        self.last_identity_check_at: datetime | None = None
+        # 已被晚到的本人识别撤销的事件 id；合并音轨等异步回调据此放弃入队。
+        self.cancelled_event_ids: set[str] = set()
 
         self.cap = None
         self.detector = None
@@ -455,7 +489,8 @@ class Watcher:
         """本人在电脑前时，按策略决定要不要开录。进行中的录像不走这里。"""
         return allow_record(self.owner_policy, self.user_is_active())
 
-    def enqueue_notification(self, items: list[dict]) -> int:
+    def enqueue_notification(self, items: list[dict],
+                             delay_seconds: float = 0.0) -> int:
         """把一批通知写进 outbox。数据库故障只降级为「本次没入队」，不拖垮监控。
 
         可能被主循环调用，也可能被 audio-merge 线程的完成回调调用
@@ -469,15 +504,15 @@ class Watcher:
         try:
             if owner is None or threading.get_ident() == owner:
                 if lock is None:
-                    return self.outbox.enqueue_many(items)
+                    return self.outbox.enqueue_many(items, delay_seconds=delay_seconds)
                 with lock:
-                    return self.outbox.enqueue_many(items)
+                    return self.outbox.enqueue_many(items, delay_seconds=delay_seconds)
             store = OutboxStore(self.outbox_path)
             try:
                 if lock is None:
-                    return store.enqueue_many(items)
+                    return store.enqueue_many(items, delay_seconds=delay_seconds)
                 with lock:
-                    return store.enqueue_many(items)
+                    return store.enqueue_many(items, delay_seconds=delay_seconds)
             finally:
                 store.close()
         except Exception as exc:  # noqa: BLE001 - 通知层故障不能影响采集
@@ -767,6 +802,108 @@ class Watcher:
         self.last_voice_check_at = now
         self.maybe_speak(frame, dets, now, force_check=True)
 
+    def check_pending_event(self, frame, dets: list, now: datetime) -> None:
+        """事件触发后的等待窗口：持续识别，决定撤销还是提前发送。
+
+        - 确认本人：删除抓拍/录像/音频、撤销未发通知、删除事件行。
+        - 明确陌生人（连续两次相似度远低于阈值）：立刻放行通知，不用等满窗口。
+        - 始终认不出：窗口到期按陌生人发送。
+        """
+        if self.event_resolved or self.event_hold_until is None:
+            return
+
+        if now >= self.event_hold_until:
+            if self.event_event_id:
+                try:
+                    self.outbox.release_event(self.event_event_id, now=now)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("释放等待窗口通知失败: %s", exc)
+            self.event_resolved = True
+            log.info("本人等待窗口结束，按当前身份「%s」发送", self.last_identity_label)
+            return
+
+        if (self.last_identity_check_at is not None
+                and (now - self.last_identity_check_at).total_seconds()
+                < IDENTITY_RECHECK_SECONDS):
+            return
+        self.last_identity_check_at = now
+        if not dets:
+            return
+
+        label = self.identify(frame, dets)
+        self.last_identity_label = label
+        self.owner_tracker.observe(label)
+        if self.is_owner_event():
+            self._cancel_owner_event(now, "等待窗口内识别为本人")
+            return
+
+        if label == LABEL_OTHER and self.last_identity_score <= self.stranger_threshold:
+            self.stranger_streak += 1
+        else:
+            self.stranger_streak = 0
+        if self.stranger_streak < STRANGER_CONFIRM_CHECKS:
+            return
+
+        released = 0
+        if self.event_event_id:
+            try:
+                released = self.outbox.release_event(self.event_event_id, now=now)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("提前发送通知失败: %s", exc)
+        self.event_resolved = True
+        log.info("确认陌生人（相似度 %.2f），提前发送告警（释放 %d 条）",
+                 self.last_identity_score, released)
+
+    def _cancel_owner_event(self, now: datetime, reason: str) -> None:
+        """晚到的本人识别：撤销整条事件，做到「什么动作都不做」。"""
+        event_id = self.event_event_id
+        snapshot = self.event_snapshot
+        if event_id:
+            self.cancelled_event_ids.add(event_id)
+
+        if self.recorder.recording:
+            self.stop_recording(reason, now, discard=True)
+        else:
+            # 录像已经收尾：按同名约定删除 mp4 / wav / jpg
+            if snapshot:
+                stem = os.path.splitext(snapshot)[0]
+                for path in (stem + ".mp4", stem + ".wav", snapshot):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+        if snapshot:
+            try:
+                self.store.delete_by_snapshot(snapshot)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("删除事件记录失败: %s", exc)
+        if snapshot and os.path.exists(snapshot):
+            try:
+                os.remove(snapshot)
+            except OSError:
+                pass
+        self.events_today = max(0, self.events_today - 1)
+
+        counts = {}
+        if event_id:
+            try:
+                counts = self.outbox.cancel_event(event_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("撤销通知失败: %s", exc)
+        if counts.get("delivered") or counts.get("sending"):
+            log.warning(
+                "识别为本人时已有 %d 条通知离开发件箱，无法撤回（已发 %d，发送中 %d）",
+                int(counts.get("delivered", 0)) + int(counts.get("sending", 0)),
+                int(counts.get("delivered", 0)), int(counts.get("sending", 0)))
+        log.info("识别为本人（晚到），事件已撤销：删除媒体并取消通知 %s", counts)
+
+        self.event_snapshot = None
+        self.event_event_id = None
+        self.event_hold_until = None
+        self.event_resolved = True
+        self.stranger_streak = 0
+
     # ---------- 录像 ----------
 
     def decorate_video_frame(self, frame, dets: list, when: datetime):
@@ -840,27 +977,40 @@ class Watcher:
 
         if video and wav:
             # 视频开头是预录画面（当时还没开始录音），音轨要补等长静音才对得上
-            # 合并完成后才推视频——合并前的 mp4 还没有音轨
+            # 合并完成后才推视频——合并前的 mp4 还没有音轨。
+            # 把事件 id 一起带过去：合并是异步的，期间可能已经触发下一个事件。
+            event_id = self.last_event_at.isoformat() if self.last_event_at else ""
             self.audio.merge_async(
-                video, wav, pre_roll_delay_ms(pre_frames, self.fps), on_done=self.push_video
+                video, wav, pre_roll_delay_ms(pre_frames, self.fps),
+                on_done=lambda path, eid=event_id: self.push_video(path, event_id=eid),
             )
         elif video:
-            self.push_video(video)
+            event_id = self.last_event_at.isoformat() if self.last_event_at else ""
+            self.push_video(video, event_id=event_id)
 
-    def push_video(self, video_path: str) -> None:
+    def push_video(self, video_path: str, event_id: str | None = None) -> None:
         """把一段收尾好的录像写进 outbox 的视频慢道。"""
         if not video_path or not os.path.exists(video_path):
             return
+        when = self.last_event_at
+        eid = str(event_id or (when.isoformat() if when else datetime.now().isoformat()))
+        # 晚到的本人识别已经撤销这条事件：不要再入队，把文件删掉。
+        if eid in self.cancelled_event_ids:
+            self.cancelled_event_ids.discard(eid)
+            try:
+                os.remove(video_path)
+            except OSError:
+                pass
+            log.info("事件已撤销，跳过录像推送并删除: %s", video_path)
+            return
         if not self.notify_allowed():
             return
-        when = self.last_event_at
         stamp = (when.strftime("%H:%M:%S") if when
                  else os.path.splitext(os.path.basename(video_path))[0])
         mb = os.path.getsize(video_path) / 1048576
-        event_id = when.isoformat() if when else datetime.now().isoformat()
         items = build_items(
             self.notify_cfg,
-            event_id=event_id,
+            event_id=eid,
             text=f"{stamp} 房间录像（{mb:.1f} MB，已压缩）",
             video_path=video_path,
             severity="event",
@@ -1013,11 +1163,25 @@ class Watcher:
         conf = max((d.conf for d in dets), default=0.0)
         path = self.save_snapshot(frame, dets, when)
         self.events_today += 1
-        log.info("事件已抓拍: %s (置信度 %.2f)，今日第 %d 次", path, conf, self.events_today)
+        log.info("事件已抓拍: %s (人体置信度 %.2f)，今日第 %d 次",
+                 path, conf, self.events_today)
         if self.current_video:
             log.info("配套录像: %s", self.current_video)
 
+        event_id = when.isoformat()
         self.last_event_at = when
+        # 通知先压住：窗口内继续识别，确认本人就整条撤销；确认陌生人则提前放行。
+        self.event_snapshot = path
+        self.event_event_id = event_id
+        self.event_hold_until = when + timedelta(seconds=OWNER_GRACE_SECONDS)
+        self.event_resolved = False
+        self.last_identity_check_at = when
+        self.stranger_streak = (
+            1 if (self.last_identity_label == LABEL_OTHER
+                  and self.last_identity_score <= self.stranger_threshold)
+            else 0
+        )
+
         notified = False
         if self.notify_allowed():
             text = (f"{when.strftime('%H:%M:%S')} 检测到有人进入房间"
@@ -1026,12 +1190,12 @@ class Watcher:
                 text += f"\n录像: {self.current_video}"
             notified = self.enqueue_notification(build_items(
                 self.notify_cfg,
-                event_id=when.isoformat(),
+                event_id=event_id,
                 text=text,
                 image_path=path,
                 severity="event",
                 owner=self.last_identity_label,
-            )) > 0
+            ), delay_seconds=OWNER_GRACE_SECONDS) > 0
 
         self.store.add(when, path, conf, notified, video=self.current_video,
                        identity=self.last_identity_label)
@@ -1235,6 +1399,10 @@ class Watcher:
                     if not self.is_owner_event():
                         self.start_recording(dets, now)
 
+                try:
+                    self.check_pending_event(frame, dets, now)
+                except Exception as exc:  # noqa: BLE001 - 等待窗口异常不能拖垮主循环
+                    log.warning("等待窗口身份检查异常: %s", exc)
                 self.retry_voice(frame, dets, now)
                 self.pump_recording(frame, dets, now)
                 self.enforce_storage(now)

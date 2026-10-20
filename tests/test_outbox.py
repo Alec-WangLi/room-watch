@@ -71,6 +71,48 @@ class EnqueueClaimTest(OutboxFixture):
         self.assertIsNotNone(item)
 
 
+class HoldReleaseCancelTest(OutboxFixture):
+    BASE = datetime(2026, 10, 20, 10, 0, 0)
+
+    def _pair(self, event_id="e1", delay_seconds=15.0):
+        for kind in ("text", "image"):
+            self.store.enqueue(
+                channel="wecom_bot", kind=kind, severity="event",
+                payload={"text": "x"} if kind == "text" else {"image_path": "x"},
+                event_id=event_id, dedupe_key=f"{event_id}:{kind}",
+                delay_seconds=delay_seconds, now=self.BASE,
+            )
+
+    def test_delay_keeps_items_out_of_claim_until_due(self):
+        self._pair()
+        self.assertIsNone(self.store.claim_next(now=self.BASE + timedelta(seconds=1)))
+        item = self.store.claim_next(now=self.BASE + timedelta(seconds=16))
+        self.assertIsNotNone(item)
+        self.assertEqual(item.severity, "event")
+
+    def test_release_event_makes_items_due_immediately(self):
+        self._pair()
+        changed = self.store.release_event("e1", now=self.BASE + timedelta(seconds=2))
+        self.assertEqual(changed, 2)
+        item = self.store.claim_next(now=self.BASE + timedelta(seconds=2))
+        self.assertIsNotNone(item)
+
+    def test_cancel_event_deletes_pending_but_keeps_delivered(self):
+        self.store.enqueue(channel="wecom_bot", kind="text", severity="event",
+                           payload={"text": "x"}, event_id="old",
+                           dedupe_key="old:text")
+        item = self.store.claim_next()
+        self.store.mark_delivered(item.id)
+        self._pair("e1")
+        result = self.store.cancel_event("e1")
+        self.assertEqual(result["pending"], 2)
+        self.assertEqual(result["delivered"], 0)
+        kept = self.store.cancel_event("old")
+        self.assertEqual(kept["delivered"], 1)
+        self.assertIsNone(self.store.claim_next(
+            now=self.BASE + timedelta(seconds=30)))
+
+
 class PriorityTest(OutboxFixture):
     def test_text_before_video(self):
         self.enqueue(kind="video", dedupe_key="e1:wecom_bot:video",

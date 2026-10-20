@@ -527,7 +527,7 @@ class RoomWatchApp:
         columns = ("ts", "identity", "conf", "video")
         self.tree = ttk.Treeview(box, columns=columns, show="headings", height=5)
         for key, text, width in (("ts", "时间", 190), ("identity", "身份", 70),
-                                 ("conf", "置信度", 70), ("video", "录像", 60)):
+                                 ("conf", "人体置信度", 90), ("video", "录像", 60)):
             self.tree.heading(key, text=text)
             self.tree.column(key, width=width, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)

@@ -26,7 +26,7 @@ import numpy as np
 
 from roomwatch.outbox import OutboxStore
 from roomwatch.rules import OWNER_KEEP, OWNER_MUTE, OWNER_SKIP
-from roomwatch.watcher import Watcher
+from roomwatch.watcher import EventStore, Watcher
 
 
 class FakeRecorder:
@@ -69,6 +69,16 @@ class FakeFaces:
     def find(self, frame, dets):
         self.calls += 1
         return self.faces
+
+
+class FakeOwnerTracker:
+    def __init__(self):
+        self.owner_present = False
+
+    def observe(self, label):
+        if label == "owner":
+            self.owner_present = True
+        return self.owner_present
 
 
 class WatcherPolicyTest(unittest.TestCase):
@@ -250,6 +260,100 @@ class WatcherPolicyTest(unittest.TestCase):
         with mock.patch("roomwatch.watcher.cv2.imwrite", return_value=True):
             path = Watcher.save_snapshot(w, frame, [], self.now)
         self.assertEqual(Path(path), day / "2026-10-20_094523.jpg")
+
+    # ---------- 晚到本人撤销 ----------
+
+    def _held_watcher(self, label="owner", score=0.8, recording=False):
+        w = Watcher.__new__(Watcher)
+        w.outbox = OutboxStore(self.root / "outbox.db")
+        w.store = EventStore(str(self.root / "events.db"))
+        day = self.root / "captures" / "2026-10-20"
+        day.mkdir(parents=True)
+        snapshot = day / "2026-10-20_100000.jpg"
+        snapshot.write_bytes(b"jpeg")
+        w.event_snapshot = str(snapshot)
+        w.event_event_id = self.now.isoformat()
+        w.event_hold_until = self.now + timedelta(seconds=15)
+        w.event_resolved = False
+        w.last_identity_check_at = self.now - timedelta(seconds=2)
+        w.stranger_streak = 0
+        w.cancelled_event_ids = set()
+        w.last_event_at = self.now
+        w.current_video = None
+        w.recorder = SimpleNamespace(recording=recording)
+
+        def fake_identify(frame, dets):
+            w.last_identity_score = score
+            return label
+
+        w.identify = fake_identify
+        w.owner_tracker = FakeOwnerTracker()
+        w.is_owner_event = lambda: w.owner_tracker.owner_present
+        w.last_identity_label = "other"
+        w.last_identity_score = score
+        w.stranger_threshold = 0.25
+        w.events_today = 1
+        w.store.add(self.now, str(snapshot), 0.9, True)
+        w.outbox.enqueue(
+            channel="wecom_bot", kind="text", severity="event",
+            payload={"text": "x"}, event_id=w.event_event_id,
+            dedupe_key=f"{w.event_event_id}:text",
+            delay_seconds=15, now=self.now)
+        return w
+
+    def _close(self, w):
+        w.outbox.close()
+        w.store.conn.close()
+
+    def test_late_owner_cancels_media_outbox_and_event_row(self):
+        w = self._held_watcher()
+        snapshot = w.event_snapshot
+        try:
+            Watcher.check_pending_event(
+                w, object(), [object()], self.now + timedelta(seconds=2))
+            self.assertTrue(w.event_resolved)
+            self.assertFalse(Path(snapshot).exists())
+            self.assertEqual(w.outbox.pending_count(), 0)
+            self.assertEqual(
+                w.store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+            self.assertEqual(w.events_today, 0)
+            self.assertIn(self.now.isoformat(), w.cancelled_event_ids)
+        finally:
+            self._close(w)
+
+    def test_clear_stranger_releases_hold_early(self):
+        w = self._held_watcher(label="other", score=0.10)
+        w.stranger_streak = 1
+        try:
+            Watcher.check_pending_event(
+                w, object(), [object()], self.now + timedelta(seconds=2))
+            self.assertTrue(w.event_resolved)
+            item = w.outbox.claim_next(now=self.now + timedelta(seconds=3))
+            self.assertIsNotNone(item, "确认陌生人后应立即放行通知")
+        finally:
+            self._close(w)
+
+    def test_expired_window_releases_notifications(self):
+        w = self._held_watcher(label="unknown", score=0.0)
+        w.event_hold_until = self.now - timedelta(seconds=1)
+        try:
+            Watcher.check_pending_event(w, object(), [object()], self.now)
+            self.assertTrue(w.event_resolved)
+            item = w.outbox.claim_next(now=self.now + timedelta(seconds=1))
+            self.assertIsNotNone(item)
+        finally:
+            self._close(w)
+
+    def test_late_owner_stops_active_recording_with_discard(self):
+        w = self._held_watcher(recording=True)
+        w.stop_recording = mock.Mock()
+        try:
+            Watcher.check_pending_event(
+                w, object(), [object()], self.now + timedelta(seconds=2))
+            w.stop_recording.assert_called_once()
+            self.assertTrue(w.stop_recording.call_args.kwargs["discard"])
+        finally:
+            self._close(w)
 
     # ---------- 状态文件 ----------
 

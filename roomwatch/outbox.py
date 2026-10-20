@@ -141,10 +141,16 @@ class OutboxStore:
         payload: dict,
         event_id: str = "",
         dedupe_key: str = "",
+        delay_seconds: float = 0.0,
         now: Optional[datetime] = None,
     ) -> Optional[int]:
-        """返回新行 id；dedupe_key 已存在时返回 None（幂等）。"""
+        """返回新行 id；dedupe_key 已存在时返回 None（幂等）。
+
+        `delay_seconds` 用于「先压住、等身份确认」的事件通知：行仍然是
+        pending，但 worker 要到期后才会领取。
+        """
         created = now or datetime.now()
+        ready = created + timedelta(seconds=max(0.0, float(delay_seconds)))
         key = dedupe_key or None
         try:
             cur = self.conn.execute(
@@ -158,7 +164,7 @@ class OutboxStore:
                     str(severity),
                     json.dumps(payload, ensure_ascii=False),
                     _iso(created),
-                    _iso(created),
+                    _iso(ready),
                     key,
                 ),
             )
@@ -168,7 +174,8 @@ class OutboxStore:
             raise
         return int(cur.lastrowid) if cur.rowcount else None
 
-    def enqueue_many(self, items: Iterable[dict], *, now: Optional[datetime] = None) -> int:
+    def enqueue_many(self, items: Iterable[dict], *, delay_seconds: float = 0.0,
+                     now: Optional[datetime] = None) -> int:
         """批量入队，返回真正新增的条数（重复的去重键不算）。"""
         added = 0
         for item in items:
@@ -179,11 +186,58 @@ class OutboxStore:
                 payload=item.get("payload") or {},
                 event_id=item.get("event_id", ""),
                 dedupe_key=item.get("dedupe_key", ""),
+                delay_seconds=delay_seconds,
                 now=now,
             )
             if new_id is not None:
                 added += 1
         return added
+
+    def release_event(self, event_id: str, *, now: Optional[datetime] = None) -> int:
+        """把某事件所有尚未到期的 pending 项立刻变为可投递。
+
+        用于「已经看清是陌生人，不用等满等待窗口」以及窗口到期。
+        """
+        moment = _iso(now)
+        try:
+            cur = self.conn.execute(
+                "UPDATE outbox SET next_attempt_at=? "
+                "WHERE event_id=? AND status=? AND next_attempt_at > ?",
+                (moment, str(event_id), STATUS_PENDING, moment),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+        return int(cur.rowcount)
+
+    def cancel_event(self, event_id: str) -> dict:
+        """撤销某事件尚未投递的通知，返回各状态的数量。
+
+        已经 delivered / sending 的项不能撤回（消息已经离开发件箱）；
+        调用方据此判断「是否还来得及做到什么动作都不做」。
+        """
+        try:
+            rows = self.conn.execute(
+                "SELECT status, COUNT(*) FROM outbox WHERE event_id=? GROUP BY status",
+                (str(event_id),),
+            ).fetchall()
+            counts = {str(row[0]): int(row[1]) for row in rows}
+            self.conn.execute(
+                "DELETE FROM outbox WHERE event_id=? AND status=?",
+                (str(event_id), STATUS_PENDING),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+        return {
+            "pending": counts.get(STATUS_PENDING, 0),
+            "sending": counts.get(STATUS_SENDING, 0),
+            "delivered": counts.get(STATUS_DELIVERED, 0),
+            "failed_permanent": counts.get(STATUS_FAILED, 0),
+            "expired": counts.get(STATUS_EXPIRED, 0),
+        }
 
     # ------------------------------------------------------------ 领取
 

@@ -32,6 +32,9 @@ class WatcherOutboxTest(unittest.TestCase):
         self.w.dry_run = False
         self.w.events_today = 0
         self.w.last_identity_label = "other"
+        self.w.last_identity_score = 0.0
+        self.w.stranger_threshold = 0.25
+        self.w.cancelled_event_ids = set()
         self.w.current_video = None
         self.w.last_event_at = None
         self.w.heartbeat_minutes = 30
@@ -61,6 +64,14 @@ class WatcherOutboxTest(unittest.TestCase):
             "SELECT identity, notified FROM events").fetchone()
         self.assertEqual(row[0], "other")
         self.assertEqual(row[1], 1)
+
+    def test_fire_event_holds_notifications_for_grace(self):
+        self.w.fire_event(None, [SimpleNamespace(conf=0.9)], datetime.now())
+        self.assertFalse(self.w.event_resolved)
+        self.assertIsNotNone(self.w.event_hold_until)
+        self.assertEqual(self.w.event_event_id, self.w.last_event_at.isoformat())
+        self.assertIsNone(self.w.outbox.claim_next(),
+                          "等待窗口内通知不应被 worker 领取")
 
     def test_user_active_suppresses_enqueue(self):
         self.w.notify_allowed = lambda: False
@@ -106,6 +117,22 @@ class WatcherOutboxTest(unittest.TestCase):
         data = json.loads((self.root / "status.json").read_text(encoding="utf-8"))
         self.assertEqual(data["pending_outbox"], 2)
         self.assertIn("last_push_success_at", data)
+
+
+class EventStoreDeleteTest(unittest.TestCase):
+    def test_delete_by_snapshot_removes_only_that_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = EventStore(str(Path(tmp) / "events.db"))
+            try:
+                now = datetime.now()
+                store.add(now, "a.jpg", 0.9, True)
+                store.add(now, "b.jpg", 0.8, True)
+                removed = store.delete_by_snapshot("a.jpg")
+                rows = store.conn.execute("SELECT snapshot FROM events").fetchall()
+            finally:
+                store.conn.close()
+        self.assertEqual(removed, 1)
+        self.assertEqual([row[0] for row in rows], ["b.jpg"])
 
 
 if __name__ == "__main__":
