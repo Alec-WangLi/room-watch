@@ -66,12 +66,16 @@ class SpecTest(unittest.TestCase):
         self.assertIn("更新", sections)
 
     def test_credentials_are_flagged_secret(self) -> None:
-        for key in ("notify.wecom_bot.webhook", "notify.wxpusher.app_token",
+        for key in ("notify.wxpusher.app_token",
                     "notify.wxpusher.uid", "notify.serverchan.sendkey",
                     "notify.webhook.url", "monitor.heartbeat_url",
                     "monitor.heartbeat_fail_url", "monitor.heartbeat_start_url",
                     "camera.source"):
             self.assertTrue(settings.SPEC[key].secret, key)
+
+    def test_wecom_webhook_is_visible_on_purpose(self) -> None:
+        """Webhook 要直接显示在输入框里，否则用户以为没填。"""
+        self.assertFalse(settings.SPEC["notify.wecom_bot.webhook"].secret)
 
     def test_gallery_password_is_visible_on_purpose(self) -> None:
         """相册密码要输到手机上，藏起来只会让人没法登录。"""
@@ -119,23 +123,31 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snap["values"]["notify.channels"], "")
         self.assertEqual(snap["values"]["identity.threshold"], 0.45)
 
-    def test_placeholder_credential_counts_as_unset(self) -> None:
+    def test_placeholder_webhook_is_shown_as_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_project(Path(tmp))
             snap = settings.snapshot(root)
-        self.assertFalse(snap["secrets"]["notify.wecom_bot.webhook"]["set"])
-        self.assertEqual(snap["secrets"]["notify.wecom_bot.webhook"]["tail"], "")
+        self.assertEqual(snap["values"]["notify.wecom_bot.webhook"], "")
 
-    def test_real_credential_is_masked_never_echoed(self) -> None:
+    def test_wecom_webhook_is_returned_in_full(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_project(Path(tmp))
             settings.apply(root, {"notify.wecom_bot.webhook": WEBHOOK})
             snap = settings.snapshot(root)
             dumped = json.dumps(snap, ensure_ascii=False)
-        info = snap["secrets"]["notify.wecom_bot.webhook"]
+        self.assertEqual(snap["values"]["notify.wecom_bot.webhook"], WEBHOOK)
+        self.assertNotIn("notify.wecom_bot.webhook", snap["secrets"])
+        self.assertIn("1fcbf0dc", dumped)
+
+    def test_other_credentials_are_still_masked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            settings.apply(root, {"notify.wxpusher.app_token": "AT_REAL_12345678"})
+            snap = settings.snapshot(root)
+            dumped = json.dumps(snap, ensure_ascii=False)
+        info = snap["secrets"]["notify.wxpusher.app_token"]
         self.assertTrue(info["set"])
-        self.assertEqual(info["tail"], "…5179")
-        self.assertNotIn("1fcbf0dc", dumped)   # 全文绝不出现在返回值里
+        self.assertNotIn("AT_REAL_12345678", dumped)
 
 
 class ApplyTest(unittest.TestCase):
@@ -179,10 +191,10 @@ class ApplyTest(unittest.TestCase):
     def test_blank_secret_means_keep_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = make_project(Path(tmp))
-            settings.apply(root, {"notify.wecom_bot.webhook": WEBHOOK})
-            settings.apply(root, {"notify.wecom_bot.webhook": "  "})
+            settings.apply(root, {"notify.wxpusher.app_token": "AT_real_12345678"})
+            settings.apply(root, {"notify.wxpusher.app_token": "  "})
             snap = settings.snapshot(root)
-        self.assertTrue(snap["secrets"]["notify.wecom_bot.webhook"]["set"])
+        self.assertTrue(snap["secrets"]["notify.wxpusher.app_token"]["set"])
 
     def test_readback_mismatch_is_reported(self) -> None:
         """写完必须复读；读回来不一样就是失败，不许静默成功。"""
@@ -416,6 +428,46 @@ class UpdateChannelSettingTest(unittest.TestCase):
             result = settings.apply(root, {"update.channel": "nightly"})
             self.assertFalse(result["ok"])
             self.assertIn("update.channel", result["errors"])
+
+
+class HotReloadSettingTest(unittest.TestCase):
+    def test_voice_change_writes_watcher_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {
+                "voice.text": "欢迎回来",
+                "voice.cooldown_seconds": 5,
+            })
+            marker = root / "var" / "state" / "reload.watcher"
+            self.assertTrue(marker.is_file())
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["requires_restart"], [])
+
+    def test_guardian_change_writes_guardian_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"guardian.check_seconds": 30})
+            marker = root / "var" / "state" / "reload.guardian"
+            self.assertTrue(marker.is_file())
+        self.assertEqual(result["requires_restart"], [])
+
+    def test_update_change_needs_no_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"update.channel": "beta"})
+        self.assertEqual(result["requires_restart"], [])
+
+    def test_camera_change_still_requires_monitor_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"camera.index": 1})
+        self.assertEqual(result["requires_restart"], ["watcher"])
+
+    def test_voice_volume_mode_still_requires_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"voice.volume_mode": "master"})
+        self.assertEqual(result["requires_restart"], ["watcher"])
 
 
 class RecordSettingsTest(unittest.TestCase):

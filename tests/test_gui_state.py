@@ -426,6 +426,18 @@ class GalleryUrlTest(unittest.TestCase):
             self.assertEqual(gui.gallery_url(root), "http://127.0.0.1:18765/")
 
 
+class UptimeStateTest(unittest.TestCase):
+    def test_uptime_and_start_time_are_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_status(root, seconds_ago=1, uptime="49m17s",
+                         started_at="2026-10-20T17:16:06")
+            state = gui.read_state(root, alive=ALIVE)
+        self.assertEqual(state.uptime, "49m17s")
+        self.assertEqual(state.started_at, "2026-10-20T17:16:06")
+        self.assertIn("已运行 49m17s", state.caption)
+
+
 class StorageStateTest(unittest.TestCase):
     """存储预警要从 status.json 一路带到界面状态，不能只写日志。"""
 

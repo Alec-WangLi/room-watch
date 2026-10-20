@@ -376,6 +376,22 @@ class GuardRecoveryTest(unittest.TestCase):
                 "storage": {"status": str(root / "var/state/status.json")},
                 "__config_path__": str(root / "config.yaml")}
 
+    def test_guardian_reload_updates_check_seconds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._cfg(root)
+            cfg["__config_path__"] = str(root / "config.yaml")
+            (root / "config.yaml").write_text(
+                "guardian:\n  check_seconds: 30\n", encoding="utf-8")
+            g = G.Guard(cfg, dry_run=True)
+            state = root / "var" / "state"
+            state.mkdir(parents=True, exist_ok=True)
+            marker = state / "reload.guardian"
+            marker.write_text("guardian", encoding="utf-8")
+            g.maybe_reload()
+            self.assertFalse(marker.exists())
+            self.assertEqual(g.check_seconds, 30.0)
+
     def test_recovery_notification_sent_once_after_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

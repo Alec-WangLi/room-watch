@@ -96,6 +96,8 @@ class MonitorState:
     storage_status: Optional[str] = None
     storage_days_left: Optional[float] = None
     storage_used_gb: Optional[float] = None
+    uptime: str = ""
+    started_at: Optional[str] = None
 
 
 def _age_seconds(ts: Optional[str]) -> Optional[float]:
@@ -181,6 +183,8 @@ def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> Mon
         notify_channels = int(notify_raw) if notify_raw is not None else None
     except (TypeError, ValueError):
         notify_channels = None
+    uptime = str(data.get("uptime") or "")
+    started_at = data.get("started_at")
 
     if stopping:
         phase = "stopping"
@@ -188,9 +192,13 @@ def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> Mon
     elif online:
         phase = "running"
         caption = "在线" + (" · 录制中" if recording else "")
+        if uptime:
+            caption += f" · 已运行 {uptime}"
     elif pid_ok:
         phase = "starting"
         caption = f"进程在，但已 {gap:.0f} 秒没有画面" if gap is not None else "启动中，暂无画面"
+        if uptime:
+            caption += f" · 已运行 {uptime}"
     elif desired == "paused":
         phase = "paused"
         caption = "已暂停（守护不会自动重启）"
@@ -216,6 +224,8 @@ def read_state(root: Path, alive: Optional[Callable[[int], bool]] = None) -> Mon
                         if data.get("storage_status") else None),
         storage_days_left=_opt_float(data.get("storage_days_left")),
         storage_used_gb=_opt_float(data.get("storage_used_gb")),
+        uptime=uptime,
+        started_at=started_at,
     )
 
 
@@ -559,6 +569,12 @@ class RoomWatchApp:
             self.status_label.configure(text=f"● {state.caption}", fg=color)
 
         bits = [f"PID {state.pid}" if state.pid else "无进程"]
+        if state.started_at:
+            try:
+                bits.append("启动 "
+                            + datetime.fromisoformat(str(state.started_at)).strftime("%H:%M"))
+            except (TypeError, ValueError):
+                pass
         if state.pid:
             bits.append(f"最后画面 {state.stale_seconds:.0f} 秒前")
         if state.events_today is not None:

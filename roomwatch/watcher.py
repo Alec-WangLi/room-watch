@@ -94,9 +94,6 @@ STRANGER_CONFIRM_CHECKS = 2
 STRANGER_MARGIN = 0.20
 # 等待窗口内重新做身份识别的间隔。
 IDENTITY_RECHECK_SECONDS = 1.0
-# 人进来后最多重试找脸多久。够他走到镜头前转个身，又不会在长期停留时
-# 每秒跑一次人脸检测。
-VOICE_RETRY_SECONDS = 30.0
 
 # 采集源解析（USB / RTSP / 文件）已搬到 camera.py。
 # 主循环只面对 cap 对象，不再关心背后是哪个后端。
@@ -185,7 +182,8 @@ class EventStore:
 
 class Watcher:
     def __init__(self, cfg: dict, dry_run: bool = False,
-                 diagnostics: Diagnostics | None = None):
+                 diagnostics: Diagnostics | None = None,
+                 config_path: str | None = None):
         """配置类型写错时按「配置错误」退出，而不是「未处理异常」。
 
         后者会写 EXIT_UNHANDLED（5），guardian 会当成崩溃并触发恢复/告警；
@@ -193,7 +191,7 @@ class Watcher:
         修配置后重启即可，不该进入崩溃统计。
         """
         try:
-            self._init_impl(cfg, dry_run, diagnostics)
+            self._init_impl(cfg, dry_run, diagnostics, config_path)
         except SystemExit:
             raise
         except (ValueError, TypeError) as exc:
@@ -202,8 +200,10 @@ class Watcher:
             raise SystemExit(health.EXIT_CONFIG) from exc
 
     def _init_impl(self, cfg: dict, dry_run: bool = False,
-                   diagnostics: Diagnostics | None = None):
+                   diagnostics: Diagnostics | None = None,
+                   config_path: str | None = None):
         self.cfg = cfg
+        self.config_path = str(config_path or resolve("config.yaml"))
         self.dry_run = dry_run
         self.diagnostics = diagnostics
         # 停止请求文件放在这个根下的 var/state/，与界面/`rw stop` 共用同一处
@@ -397,6 +397,7 @@ class Watcher:
         self.last_identity_check_at: datetime | None = None
         # 已被晚到的本人识别撤销的事件 id；合并音轨等异步回调据此放弃入队。
         self.cancelled_event_ids: set[str] = set()
+        self.last_reload_check_at: datetime | None = None
 
         self.cap = None
         self.detector = None
@@ -409,9 +410,6 @@ class Watcher:
         self.frames = 0
         self.last_spoke_at = None
         self.spoke_this_event = False
-        # 有人进来但一开始没正脸时，最多重试找脸多久（秒）。
-        self.voice_retry_started_at = None
-        self.last_voice_check_at = None
         self.empty_streak = 0
         # 连续这么久没检测到人，才算「这一波人走了」，语音重新武装。
         # 否则人一直站在原地，每 90 秒就会被自己的监控播报一次。
@@ -781,26 +779,36 @@ class Watcher:
         self.spoke_this_event = True
         log.info("语音提示已触发（检测到人脸: %s）", "是" if face_found else "否")
 
-    def retry_voice(self, frame, dets: list, now: datetime) -> None:
-        """人已经在画面里但还没出声时，定时重试找脸。
+    def maybe_reload(self, now: datetime) -> None:
+        """界面保存「立即生效」的设置后写 reload.watcher，这里应用。
 
-        真实场景：人推门进来时背对镜头，走两步才转身。只在触发那几帧
-        找脸会错过正脸；这里在事件开始后的 30 秒内每秒重试一次，
-        看到脸就播报。仍然遵守冷却、本人静默与 require_face 规则。
+        目前热更新的范围是语音（开关、文案、冷却、音量策略）。其余设置
+        要么每次用时现读（更新/推送），要么确实需要重启对应进程。
         """
-        if not dets or self.spoke_this_event:
+        if (self.last_reload_check_at is not None
+                and (now - self.last_reload_check_at).total_seconds() < 1.0):
             return
-        if self.is_owner_event() or self.last_identity_label == LABEL_OWNER:
+        self.last_reload_check_at = now
+        marker = Path(self.root) / "var" / "state" / "reload.watcher"
+        if not marker.exists():
             return
-        if self.voice_retry_started_at is None:
-            self.voice_retry_started_at = now
-        elif (now - self.voice_retry_started_at).total_seconds() > VOICE_RETRY_SECONDS:
+        try:
+            marker.unlink()
+        except OSError:
             return
-        if (self.last_voice_check_at is not None
-                and (now - self.last_voice_check_at).total_seconds() < 1.0):
-            return
-        self.last_voice_check_at = now
-        self.maybe_speak(frame, dets, now, force_check=True)
+        try:
+            cfg = load_config(self.config_path)
+            voice = cfg.get("voice") or {}
+            self.voice_cooldown = float(voice.get("cooldown_seconds", 60))
+            self.require_face = bool(voice.get("require_face", True))
+            old = getattr(self, "speaker", None)
+            if old is not None:
+                old.shutdown()
+            self.speaker = Speaker(voice)
+            log.info("设置已热更新：语音（enabled=%s，冷却 %.0f 秒）",
+                     self.speaker.enabled, self.voice_cooldown)
+        except Exception as exc:  # noqa: BLE001 - 热更新失败继续用旧配置
+            log.warning("热更新设置失败（继续用旧配置）: %s", exc)
 
     def check_pending_event(self, frame, dets: list, now: datetime) -> None:
         """事件触发后的等待窗口：持续识别，决定撤销还是提前发送。
@@ -818,6 +826,9 @@ class Watcher:
                     self.outbox.release_event(self.event_event_id, now=now)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("释放等待窗口通知失败: %s", exc)
+            # 窗口结束仍认不出：按陌生人处理，人在画面里才出声。
+            if dets:
+                self.maybe_speak(frame, dets, now, force_check=True)
             self.event_resolved = True
             log.info("本人等待窗口结束，按当前身份「%s」发送", self.last_identity_label)
             return
@@ -853,6 +864,8 @@ class Watcher:
         self.event_resolved = True
         log.info("确认陌生人（相似度 %.2f），提前发送告警（释放 %d 条）",
                  self.last_identity_score, released)
+        # 明确是陌生人：这时才出声，避免侧脸进门被误念。
+        self.maybe_speak(frame, dets, now, force_check=True)
 
     def _cancel_owner_event(self, now: datetime, reason: str) -> None:
         """晚到的本人识别：撤销整条事件，做到「什么动作都不做」。"""
@@ -1335,8 +1348,6 @@ class Watcher:
                     self.empty_streak += 1
                     if self.empty_streak >= self.empty_reset_frames:
                         self.spoke_this_event = False
-                        self.voice_retry_started_at = None
-                        self.last_voice_check_at = None
                         self.empty_streak = 0
                         # 人都走了：解除「本人已确认」。不重置的话，
                         # 你自己进来一次之后，接下来所有人都会被当成你——这是最危险的失效。
@@ -1359,11 +1370,9 @@ class Watcher:
                     self.candidate_frame = frame.copy()
                     self.candidate_dets = dets
                     # 本人不播报——否则你坐着工作，每过一阵就被自己念一次。
-                    # 这里比抓拍更严：**单帧**判定本人就不出声，不等投票确认。
-                    # 理由：播报是说错一句就打扰你一整天，而抓拍/录像才是证据，
-                    # 那两者仍走 confirm_frames 的确认流程，不能被单帧结果放行。
-                    if not self.is_owner_event() and self.last_identity_label != LABEL_OWNER:
-                        self.maybe_speak(frame, dets, now)
+                    # 语音不在这里响：先等身份等待窗口给出结论。
+                    # 否则侧脸进门会先念一句，随后认出本人再撤销事件——
+                    # 用户听到声音却看不到任何事件（0.1.20 真机反馈）。
                 elif action == ACTION_FIRE and self.candidate_frame is not None:
                     # 收尾这一帧再认一次：此刻人已站定，脸通常比第一帧清楚。
                     # 少了这一步，若中间帧的「适不适合存档」分数一直没创出新高，
@@ -1399,11 +1408,11 @@ class Watcher:
                     if not self.is_owner_event():
                         self.start_recording(dets, now)
 
+                self.maybe_reload(now)
                 try:
                     self.check_pending_event(frame, dets, now)
                 except Exception as exc:  # noqa: BLE001 - 等待窗口异常不能拖垮主循环
                     log.warning("等待窗口身份检查异常: %s", exc)
-                self.retry_voice(frame, dets, now)
                 self.pump_recording(frame, dets, now)
                 self.enforce_storage(now)
                 self.maybe_heartbeat(now)
@@ -1820,7 +1829,8 @@ def main(argv: list[str] | None = None) -> None:
         diagnostics.install()
 
     try:
-        w = Watcher(cfg, dry_run=args.dry_run, diagnostics=diagnostics)
+        w = Watcher(cfg, dry_run=args.dry_run, diagnostics=diagnostics,
+                    config_path=args.config)
     except SystemExit as exc:
         if diagnostics is not None:
             diagnostics.note_exit(int(exc.code or 0), "config")

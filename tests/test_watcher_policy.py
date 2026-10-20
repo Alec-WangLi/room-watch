@@ -60,6 +60,9 @@ class FakeSpeaker:
     def say(self):
         self.said += 1
 
+    def shutdown(self):
+        pass
+
 
 class FakeFaces:
     def __init__(self, faces):
@@ -198,55 +201,39 @@ class WatcherPolicyTest(unittest.TestCase):
         finally:
             w.outbox.close()
 
-    # ---------- 声音重试与文件名 ----------
+    # ---------- 语音与事件结论 ----------
 
-    def _voice_watcher(self, faces):
-        w = Watcher.__new__(Watcher)
-        w.speaker = FakeSpeaker()
-        w.face_finder = FakeFaces(faces)
-        w.spoke_this_event = False
-        w.require_face = True
-        w.face_every_n = 3
-        w.frames = 1
-        w.voice_cooldown = 60.0
-        w.last_spoke_at = None
-        w.volume_mode = "off"
-        w.last_identity_label = "other"
-        w.voice_retry_started_at = None
-        w.last_voice_check_at = None
-        w.is_owner_event = lambda: False
-        return w
+    def test_owner_cancel_does_not_speak(self):
+        """侧脸进门先触发、随后认出本人：不能已经念过一句。"""
+        w = self._held_watcher(label="owner", score=0.8)
+        w.face_finder = FakeFaces([object()])
+        try:
+            Watcher.check_pending_event(
+                w, object(), [object()], self.now + timedelta(seconds=2))
+            self.assertEqual(w.speaker.said, 0)
+        finally:
+            self._close(w)
 
-    def test_retry_voice_speaks_when_face_appears_later(self):
-        """人先背对镜头、后面转过脸：重试要找得到这张脸并出声。"""
-        w = self._voice_watcher([object()])
-        Watcher.retry_voice(w, object(), [object()], self.now)
-        self.assertEqual(w.speaker.said, 1)
-        self.assertTrue(w.spoke_this_event)
-        self.assertEqual(w.face_finder.calls, 1)
+    def test_confirmed_stranger_speaks(self):
+        w = self._held_watcher(label="other", score=0.10)
+        w.face_finder = FakeFaces([object()])
+        w.stranger_streak = 1
+        try:
+            Watcher.check_pending_event(
+                w, object(), [object()], self.now + timedelta(seconds=2))
+            self.assertEqual(w.speaker.said, 1)
+        finally:
+            self._close(w)
 
-    def test_retry_voice_waits_one_second_between_checks(self):
-        w = self._voice_watcher([])
-        Watcher.retry_voice(w, object(), [object()], self.now)
-        self.assertEqual(w.face_finder.calls, 1)
-        Watcher.retry_voice(w, object(), [object()], self.now + timedelta(seconds=0.5))
-        self.assertEqual(w.face_finder.calls, 1)
-        Watcher.retry_voice(w, object(), [object()], self.now + timedelta(seconds=1.1))
-        self.assertEqual(w.face_finder.calls, 2)
-
-    def test_retry_voice_gives_up_after_window(self):
-        w = self._voice_watcher([object()])
-        w.voice_retry_started_at = self.now - timedelta(seconds=31)
-        Watcher.retry_voice(w, object(), [object()], self.now)
-        self.assertEqual(w.face_finder.calls, 0)
-        self.assertEqual(w.speaker.said, 0)
-
-    def test_retry_voice_respects_owner(self):
-        w = self._voice_watcher([object()])
-        w.is_owner_event = lambda: True
-        Watcher.retry_voice(w, object(), [object()], self.now)
-        self.assertEqual(w.face_finder.calls, 0)
-        self.assertEqual(w.speaker.said, 0)
+    def test_window_expiry_with_person_speaks(self):
+        w = self._held_watcher(label="unknown", score=0.0)
+        w.face_finder = FakeFaces([object()])
+        w.event_hold_until = self.now - timedelta(seconds=1)
+        try:
+            Watcher.check_pending_event(w, object(), [object()], self.now)
+            self.assertEqual(w.speaker.said, 1)
+        finally:
+            self._close(w)
 
     def test_snapshot_uses_video_stem_so_photo_and_video_pair(self):
         w = Watcher.__new__(Watcher)
@@ -260,6 +247,40 @@ class WatcherPolicyTest(unittest.TestCase):
         with mock.patch("roomwatch.watcher.cv2.imwrite", return_value=True):
             path = Watcher.save_snapshot(w, frame, [], self.now)
         self.assertEqual(Path(path), day / "2026-10-20_094523.jpg")
+
+    def test_voice_settings_reload_from_marker(self):
+        w = Watcher.__new__(Watcher)
+        w.root = str(self.root)
+        w.config_path = str(self.root / "config.yaml")
+        w.last_reload_check_at = None
+        w.voice_cooldown = 60.0
+        w.require_face = True
+        w.volume_mode = "off"
+        w.speaker = FakeSpeaker()
+        (self.root / "config.yaml").write_text(
+            "voice:\n"
+            "  enabled: true\n"
+            "  text: 欢迎回来\n"
+            "  cooldown_seconds: 5\n"
+            "  volume_mode: 'off'\n",
+            encoding="utf-8")
+        state = self.root / "var" / "state"
+        state.mkdir(parents=True)
+        marker = state / "reload.watcher"
+        marker.write_text("voice", encoding="utf-8")
+
+        created = []
+
+        class NewSpeaker(FakeSpeaker):
+            def __init__(self, cfg):
+                super().__init__()
+                created.append(cfg)
+
+        with mock.patch("roomwatch.watcher.Speaker", NewSpeaker):
+            Watcher.maybe_reload(w, self.now)
+        self.assertFalse(marker.exists())
+        self.assertAlmostEqual(w.voice_cooldown, 5.0)
+        self.assertEqual(created[0]["text"], "欢迎回来")
 
     # ---------- 晚到本人撤销 ----------
 
@@ -293,6 +314,15 @@ class WatcherPolicyTest(unittest.TestCase):
         w.last_identity_score = score
         w.stranger_threshold = 0.25
         w.events_today = 1
+        w.speaker = FakeSpeaker()
+        w.face_finder = FakeFaces([])
+        w.spoke_this_event = False
+        w.require_face = True
+        w.face_every_n = 3
+        w.frames = 1
+        w.voice_cooldown = 60.0
+        w.last_spoke_at = None
+        w.volume_mode = "off"
         w.store.add(self.now, str(snapshot), 0.9, True)
         w.outbox.enqueue(
             channel="wecom_bot", kind="text", severity="event",

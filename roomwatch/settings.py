@@ -75,6 +75,9 @@ class Field:
     # 配置里缺这个键时的生效默认值。None = 没有默认，界面显示空。
     # 主要用于「代码默认开启、老配置里没有这一行」的布尔项。
     default: Any = None
+    # 改完这项后哪个进程需要重启：none / watcher / guardian / gallery。
+    # none 表示保存后立即生效（由保存方写 reload 标记或本身是即时读取）。
+    restart: str = "watcher"
 
     @property
     def path(self) -> tuple:
@@ -97,7 +100,7 @@ _add(Field("camera.source", "网络摄像头地址", "摄像头", "secret", secr
 # ---- 推送 ----
 _add(Field("notify.channels", "启用的渠道", "推送", "multi", KNOWN_CHANNELS,
            hint="勾选几个就同时发给几个；只选一个时没有冗余，建议至少两个"))
-_add(Field("notify.wecom_bot.webhook", "企业微信机器人 Webhook", "推送", "secret", secret=True,
+_add(Field("notify.wecom_bot.webhook", "企业微信机器人 Webhook", "推送", "secret",
            hint="整条地址直接粘贴；只填 key 也认"))
 _add(Field("notify.wecom_bot.send_video", "录像也推送", "推送", "bool",
            hint="收尾后压缩到 18MB 以内再发，压不到就只发文字"))
@@ -180,21 +183,23 @@ _add(Field("monitor.heartbeat_timeout_seconds", "心跳超时（秒）", "心跳
 # ---- 更新 ----
 _add(Field("update.channel", "更新通道", "更新", "choice", ("stable", "beta"),
            hint="stable=只收正式发布；beta=测试版预发布也收（更新更频繁，可能不稳定）",
-           default="stable"))
+           default="stable", restart="none"))
 _add(Field("update.check_interval_hours", "后台检查间隔（小时）", "更新", "int",
            lo=0, hi=720,
            hint="0 = 关闭启动时的后台检查；手动「检查更新」不受影响",
-           default=24))
+           default=24, restart="none"))
 
 # ---- 自启 ----
 # 开机自启拉起的是守护进程，所以「它多久确认一次」天然属于这一页。
 _add(Field("guardian.check_seconds", "守护检查间隔（秒）", "自启", "int", lo=15, hi=3600,
-           hint="开机自启拉起的是守护进程，它每隔这么久确认监控还活着"))
+           hint="开机自启拉起的是守护进程，它每隔这么久确认监控还活着",
+           restart="none"))
 
 # ---- 声音 ----
-_add(Field("voice.enabled", "检测到人时播报语音", "声音", "bool"))
-_add(Field("voice.text", "播报内容", "声音", "text"))
-_add(Field("voice.cooldown_seconds", "同一人冷却（秒）", "声音", "float", lo=0, hi=3600))
+_add(Field("voice.enabled", "检测到人时播报语音", "声音", "bool", restart="none"))
+_add(Field("voice.text", "播报内容", "声音", "text", restart="none"))
+_add(Field("voice.cooldown_seconds", "同一人冷却（秒）", "声音", "float", lo=0, hi=3600,
+           restart="none"))
 _add(Field("voice.volume_mode", "如何让提示音听得见", "声音", "choice",
            ("off", "session", "master"),
            hint="off=完全不碰系统音量；session=只提本程序音轨；master=保底主音量（会改你的系统音量）"))
@@ -526,6 +531,10 @@ def snapshot(root: Path | str) -> dict:
         raw = get_path(cfg, field.key)
         if raw is None and field.default is not None:
             raw = field.default
+        # 企业微信 webhook 改成明文显示；占位串不要当成用户已填的内容。
+        if (field.key == "notify.wecom_bot.webhook"
+                and PLACEHOLDER in str(raw or "").lower()):
+            raw = ""
         if field.kind == "choice" and isinstance(raw, bool):
             # YAML 1.1 把裸 off/on 当布尔：界面要看到 "off" 而不是 False
             raw = "on" if raw else "off"
@@ -550,7 +559,7 @@ def snapshot(root: Path | str) -> dict:
         "channel_issues": channel_issues(cfg),
         "labels": {key: {"label": f.label, "section": f.section, "kind": f.kind,
                          "choices": list(f.choices), "hint": f.hint,
-                         "secret": f.secret}
+                         "secret": f.secret, "restart": f.restart}
                    for key, f in SPEC.items()},
     }
 
@@ -662,7 +671,27 @@ def apply(root: Path | str, changes: dict) -> dict:
         except OSError:
             pass
 
-    return {"ok": not errors, "applied": list(coerced), "errors": errors}
+    scopes = sorted({
+        SPEC[key].restart for key in coerced
+        if key in SPEC and SPEC[key].restart != "none"
+    })
+    if not errors:
+        state = root / "var" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        if any(key.startswith("voice.") and key in SPEC
+               and SPEC[key].restart == "none" for key in coerced):
+            try:
+                (state / "reload.watcher").write_text("voice", encoding="utf-8")
+            except OSError:
+                pass
+        if any(key.startswith("guardian.") for key in coerced):
+            try:
+                (state / "reload.guardian").write_text("guardian", encoding="utf-8")
+            except OSError:
+                pass
+
+    return {"ok": not errors, "applied": list(coerced), "errors": errors,
+            "requires_restart": scopes}
 
 
 def unset(root: Path | str, keys: list[str]) -> dict:

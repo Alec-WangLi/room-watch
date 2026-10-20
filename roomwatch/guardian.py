@@ -1023,6 +1023,24 @@ class Guard:
 
     # ---------- 常驻 ----------
 
+    def maybe_reload(self) -> None:
+        """界面保存自启/守护设置后写 reload.guardian，这里应用检查间隔。"""
+        marker = Path(self.root) / "var" / "state" / "reload.guardian"
+        if not marker.exists():
+            return
+        try:
+            marker.unlink()
+        except OSError:
+            return
+        try:
+            cfg = _merge_config(self.config_path)
+            g = cfg.get("guardian") or {}
+            self.check_seconds = max(
+                15.0, float(g.get("check_seconds", self.check_seconds)))
+            log.info("守护配置已热更新：检查间隔 %.0f 秒", self.check_seconds)
+        except Exception as exc:  # noqa: BLE001 - 热更新失败继续用旧值
+            log.warning("守护配置热更新失败（继续用旧值）: %s", exc)
+
     def run_forever(self) -> None:
         log.info("守护启动：每 %d 秒检查一次，卡死判据 %d 秒",
                  self.check_seconds, self.stale_seconds)
@@ -1061,6 +1079,7 @@ class Guard:
                         self._heartbeat(datetime.now(), action)
                     except Exception as exc:  # noqa: BLE001 - 心跳不能拖垮守护
                         log.warning("外部心跳异常: %s", exc)
+                self.maybe_reload()
                 time.sleep(self.check_seconds)
         finally:
             if self.delivery_fast is not None:

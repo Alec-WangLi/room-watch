@@ -22,6 +22,14 @@ from typing import Optional
 # 页签顺序。必须与 settings.sections() 一致（tests/test_settings.py 钉住）。
 SECTIONS = ("摄像头", "推送", "相册", "身份", "录像", "心跳", "更新", "自启", "声音")
 
+# 每项设置生效方式的提示。none 由保存方写 reload 标记，进程内直接应用；
+# watcher 是默认值，不在每行重复，保存后会统一提示需要重启哪个进程。
+RESTART_TEXT = {
+    "none": "保存后立即生效",
+    "guardian": "需重启守护进程",
+    "gallery": "需重启相册",
+}
+
 
 class SettingsDialog:
     """一个 Toplevel。`autoload=False` 时只建骨架，供 --selftest 使用。"""
@@ -400,7 +408,7 @@ class SettingsDialog:
             data.get("channels") or [], data.get("outbox") or {},
             data.get("channel_issues") or {},
             events_deliverable=bool(data.get("events_deliverable", True)))
-        self.status_label.configure(text="已读取。改完点「保存」，重启监控后生效。", fg="#666")
+        self.status_label.configure(text="已读取。保存后会提示哪些设置需要重启。", fg="#666")
 
     def _fill_rows(self, values: dict, secrets: dict) -> None:
         """第一次建控件；之后只刷新值。
@@ -486,9 +494,16 @@ class SettingsDialog:
             info.pack(fill="x", padx=(200, 0), pady=(0, 2))
             self.secret_labels[key] = info
 
-        hint = meta.get("hint")
-        if hint:
-            ttk.Label(parent, text=hint, foreground="#888",
+        hint = str(meta.get("hint") or "")
+        extra = RESTART_TEXT.get(str(meta.get("restart") or "watcher"), "")
+        if extra and hint:
+            text = f"{hint} · {extra}"
+        elif extra:
+            text = extra
+        else:
+            text = hint
+        if text:
+            ttk.Label(parent, text=text, foreground="#888",
                       wraplength=560, justify="left",
                       font=self.app.font_small).pack(fill="x", padx=(200, 0))
 
@@ -542,7 +557,13 @@ class SettingsDialog:
             self.status_label.configure(text="没有保存：有设置项不合法", fg="#993C1D")
             self.app.messagebox.showerror("保存失败", detail)
             return
-        self.status_label.configure(text="已保存。重启监控后生效。", fg="#0F6E56")
+        scopes = result.get("requires_restart") or []
+        if scopes:
+            names = {"watcher": "监控", "guardian": "守护进程", "gallery": "相册"}
+            text = "已保存；需要重启：" + "、".join(names.get(s, s) for s in scopes)
+        else:
+            text = "已保存并立即生效。"
+        self.status_label.configure(text=text, fg="#0F6E56")
         for key, var in self.vars.items():
             if (self.labels.get(key) or {}).get("secret"):
                 var.set("")
