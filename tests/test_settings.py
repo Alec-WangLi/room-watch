@@ -25,7 +25,7 @@ import yaml
 
 from roomwatch import gui_settings, settings
 
-WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=1fcbf0dc-d33c-4dac-83d6-10c1c99a5179"
+WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=TEST-WEBHOOK-KEY-0000"
 
 
 def make_project(root: Path, main_extra: str = "") -> Path:
@@ -137,7 +137,7 @@ class SnapshotTest(unittest.TestCase):
             dumped = json.dumps(snap, ensure_ascii=False)
         self.assertEqual(snap["values"]["notify.wecom_bot.webhook"], WEBHOOK)
         self.assertNotIn("notify.wecom_bot.webhook", snap["secrets"])
-        self.assertIn("1fcbf0dc", dumped)
+        self.assertIn("TEST-WEBHOOK-KEY-0000", dumped)
 
     def test_other_credentials_are_still_masked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
