@@ -29,6 +29,8 @@ AUTO_CANDIDATES = ("h264_mf", "h264_nvenc")
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _PROBE_TIMEOUT = 15
 _VALIDATE_TIMEOUT = 30
+# NVENC 会拒绝 64×64（Invalid argument），256×144 是实测能通过的最小常用尺寸。
+_VALIDATE_SIZE = (256, 144)
 
 
 def parse_encoders(text: str) -> set[str]:
@@ -81,11 +83,12 @@ def validate_encoder(
     own_tmp = tmpdir is None
     tmpdir = tmpdir or tempfile.mkdtemp(prefix="rw-encoder-")
     path = os.path.join(tmpdir, f"probe-{encoder}.mp4")
-    frames = b"\x00" * (64 * 64 * 3 * 3)  # 3 帧黑画面
+    width, height = _VALIDATE_SIZE
+    frames = b"\x00" * (width * height * 3 * 3)  # 3 帧黑画面
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", "64x64", "-r", "10", "-i", "-",
+        "-s", f"{width}x{height}", "-r", "10", "-i", "-",
         "-frames:v", "3", "-c:v", encoder, "-pix_fmt", "yuv420p",
         "-y", path,
     ]
@@ -422,6 +425,8 @@ class WriterFactory:
                 if writer.open():
                     return writer
                 self.note_segment_failed(writer.error or "ffmpeg 打开失败")
+            else:
+                self.disabled_reason = "没有可用的 ffmpeg 编码器"
 
         writer = self._cv2_factory(path, size, fps, self.codec_preference)
         return writer if writer.open() else None

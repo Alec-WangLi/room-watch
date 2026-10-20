@@ -30,6 +30,7 @@ from roomwatch.videoenc import (
     WriterFactory,
     parse_encoders,
     probe_encoders,
+    validate_encoder,
 )
 
 
@@ -178,6 +179,28 @@ def make_frame(i, size=(128, 72)):
     f = np.zeros((size[1], size[0], 3), np.uint8)
     f[:] = (20 + (i * 11) % 200, 40, 90)
     return f
+
+
+class ValidateEncoderTest(unittest.TestCase):
+    def test_validation_uses_encoder_friendly_size(self):
+        """NVENC 在 64×64 上会以 Invalid argument 拒绝；探测必须用能过的尺寸。"""
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            with open(cmd[-1], "wb") as f:
+                f.write(b"x")
+            return type("R", (), {"returncode": 0})()
+
+        tmp = tempfile.mkdtemp()
+        try:
+            self.assertTrue(validate_encoder(
+                "ffmpeg", "h264_nvenc", runner=runner, tmpdir=tmp))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        cmd, kwargs = calls[0]
+        self.assertIn("256x144", cmd)
+        self.assertEqual(len(kwargs["input"]), 256 * 144 * 3 * 3)
 
 
 class FfmpegWriterTest(unittest.TestCase):
@@ -356,6 +379,8 @@ class TestWriterFactory(unittest.TestCase):
     def test_no_ffmpeg_encoder_uses_cv2(self):
         factory = self._factory(None)
         self.assertIsInstance(factory.open("a.mp4", (640, 360), 10.0), FakeCv2Writer)
+        self.assertIn("ffmpeg", factory.disabled_reason or "",
+                      "回退 cv2 时要说明为什么没用 ffmpeg")
 
     def test_ffmpeg_writer_is_used_when_available(self):
         FakeFfmpegWriter.created = 0

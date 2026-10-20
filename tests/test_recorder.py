@@ -321,6 +321,12 @@ class TestRecorderBackendFailure(unittest.TestCase):
         rec.stop()
         self.assertEqual(rec.last_encoder, "h264_mf", "收尾后也要保留，供状态展示")
 
+    def test_encoder_error_reports_factory_reason(self):
+        path = os.path.join(self.tmp, "enc.mp4")
+        rec, factory = self._rec_with(FakeBackendWriter(path))
+        factory.disabled_reason = "没有可用的 ffmpeg 编码器"
+        self.assertEqual(rec.encoder_error, "没有可用的 ffmpeg 编码器")
+
     def test_mismatched_frame_size_with_ffmpeg_backend(self):
         ffmpeg = _find_ffmpeg()
         if not ffmpeg:

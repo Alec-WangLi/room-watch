@@ -662,7 +662,7 @@ class Watcher:
             "events_today": self.events_today,
             "recording": self.recorder.recording,
             "video_encoder": getattr(self.recorder, "last_encoder", None),
-            "video_encoder_error": getattr(self.recorder, "last_error", None),
+            "video_encoder_error": getattr(self.recorder, "encoder_error", None),
             "dry_run": self.dry_run,
             "pending_outbox": outbox_stats.get("pending", 0),
             "last_push_success_at": outbox_stats.get("last_success_at"),

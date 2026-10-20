@@ -481,6 +481,33 @@ class WatcherPolicyTest(unittest.TestCase):
         self.assertEqual(data["video_encoder"], "h264_mf")
         self.assertIsNone(data["video_encoder_error"])
 
+    def test_status_reports_encoder_error_after_fallback(self):
+        status_path = self.root / "status.json"
+        fake = SimpleNamespace(
+            status_path=str(status_path),
+            started_at=self.now,
+            last_frame_at=self.now,
+            stale_seconds=120,
+            camera_spec=SimpleNamespace(label="cam"),
+            detector=SimpleNamespace(name="onnx"),
+            gate=SimpleNamespace(stats=lambda: {}),
+            frames=10,
+            events_today=0,
+            recorder=SimpleNamespace(recording=False, last_encoder="avc1",
+                                     last_error=None,
+                                     encoder_error="没有可用的 ffmpeg 编码器"),
+            dry_run=False,
+            outbox=SimpleNamespace(stats=lambda: {}),
+            notify_cfg={"channel": "none"},
+            _status_write_failed=False,
+            storage_forecast=None,
+        )
+        fake._outbox_stats = lambda: {}
+        Watcher.write_status(fake)
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["video_encoder"], "avc1")
+        self.assertEqual(data["video_encoder_error"], "没有可用的 ffmpeg 编码器")
+
     # ---------- 状态文件 ----------
 
     def test_status_includes_storage_forecast(self):

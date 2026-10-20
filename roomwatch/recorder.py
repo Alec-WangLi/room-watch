@@ -129,6 +129,11 @@ class Recorder:
     def current_path(self) -> Optional[str]:
         return self._path if self.recording else None
 
+    @property
+    def encoder_error(self) -> Optional[str]:
+        """最近一次为什么没用 ffmpeg（没有可用编码器/打开或写出失败）。"""
+        return getattr(self._factory, "disabled_reason", None)
+
     # ---------- 主循环侧（必须足够快）----------
 
     def observe(self, frame: np.ndarray, when: datetime, has_person: bool = True) -> None:
