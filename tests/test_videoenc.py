@@ -14,9 +14,17 @@ import sys as _sys
 
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+import io
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 
-from roomwatch.videoenc import EncoderSelector, parse_encoders
+import cv2
+import numpy as np
+
+from roomwatch.videoenc import EncoderSelector, FfmpegWriter, parse_encoders, probe_encoders
 
 
 FFMPEG_ENCODERS = """\
@@ -107,6 +115,182 @@ class TestEncoderSelector(unittest.TestCase):
         self.assertEqual(sel.choose(), "h264_mf")
         self.assertEqual(len(probe_calls), 1)
         self.assertEqual(len(validate_calls), 1)
+
+
+class FakeStdin:
+    def __init__(self):
+        self.data = b""
+        self.closed = False
+
+    def write(self, buf):
+        self.data += buf
+
+    def close(self):
+        self.closed = True
+
+
+class FakeProc:
+    """替代 subprocess.Popen：记录写入、可控退出码与超时。"""
+
+    def __init__(self, rc=0, timeout=False, stderr=b""):
+        self.stdin = FakeStdin()
+        self.stdout = None
+        self.stderr = io.BytesIO(stderr)
+        self.rc = rc
+        self.timeout = timeout
+        self.killed = False
+        self.wait_calls = 0
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self.timeout and self.wait_calls == 1:
+            raise subprocess.TimeoutExpired("ffmpeg", timeout)
+        return self.rc
+
+    def kill(self):
+        self.killed = True
+
+    def poll(self):
+        return self.rc
+
+
+def find_ffmpeg():
+    from roomwatch.paths import ffmpeg_exe
+
+    return ffmpeg_exe() or shutil.which("ffmpeg")
+
+
+def real_encoder(ffmpeg):
+    available = probe_encoders(ffmpeg)
+    for name in ("h264_mf", "libx264"):
+        if name in available:
+            return name
+    return None
+
+
+def make_frame(i, size=(128, 72)):
+    f = np.zeros((size[1], size[0], 3), np.uint8)
+    f[:] = (20 + (i * 11) % 200, 40, 90)
+    return f
+
+
+class FfmpegWriterTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "out.mp4")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _writer(self, proc, **kw):
+        calls = []
+
+        def spawn(cmd):
+            calls.append(cmd)
+            return proc
+
+        writer = FfmpegWriter(
+            "ffmpeg", "h264_mf", self.path, (640, 360), 10.0, spawn=spawn, **kw
+        )
+        return writer, calls
+
+    def test_command_contains_encoder_size_fps_path(self):
+        writer, calls = self._writer(FakeProc())
+        self.assertTrue(writer.open())
+        cmd = calls[0]
+        self.assertIn("h264_mf", cmd)
+        self.assertIn("640x360", cmd)
+        self.assertEqual(cmd[cmd.index("-r") + 1], "10.0")
+        self.assertIn(self.path, cmd)
+        self.assertIn("+faststart", cmd)
+
+    def test_write_sends_raw_frame_bytes(self):
+        proc = FakeProc()
+        writer, _ = self._writer(proc)
+        writer.open()
+        frame = make_frame(1, (640, 360))
+        writer.write(frame)
+        self.assertEqual(len(proc.stdin.data), frame.nbytes)
+        self.assertEqual(writer.written, 1)
+
+    def test_close_ok_returns_true(self):
+        proc = FakeProc(rc=0)
+        writer, _ = self._writer(proc)
+        writer.open()
+        with open(self.path, "wb") as f:
+            f.write(b"fake mp4")
+        self.assertTrue(writer.close())
+        self.assertTrue(proc.stdin.closed)
+        self.assertTrue(proc.stderr.closed, "收尾后 stderr 管道要关掉，不能每段泄漏一个句柄")
+
+    def test_close_on_nonzero_rc_deletes_file(self):
+        proc = FakeProc(rc=1, stderr=b"encoder failed\n")
+        writer, _ = self._writer(proc)
+        writer.open()
+        with open(self.path, "wb") as f:
+            f.write(b"partial")
+        self.assertFalse(writer.close())
+        self.assertFalse(os.path.exists(self.path))
+        self.assertIsNotNone(writer.error)
+
+    def test_close_timeout_kills_process(self):
+        proc = FakeProc(rc=0, timeout=True)
+        writer, _ = self._writer(proc, timeout=0.1)
+        writer.open()
+        with open(self.path, "wb") as f:
+            f.write(b"fake mp4")
+        self.assertFalse(writer.close())
+        self.assertTrue(proc.killed)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_zero_byte_file_is_failure(self):
+        proc = FakeProc(rc=0)
+        writer, _ = self._writer(proc)
+        writer.open()
+        open(self.path, "wb").close()
+        self.assertFalse(writer.close())
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_real_ffmpeg_roundtrip(self):
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            self.skipTest("本机没有 ffmpeg")
+        encoder = real_encoder(ffmpeg)
+        if not encoder:
+            self.skipTest("没有可用的 H.264 编码器")
+        writer = FfmpegWriter(ffmpeg, encoder, self.path, (128, 72), 10.0)
+        self.assertTrue(writer.open())
+        for i in range(10):
+            writer.write(make_frame(i))
+        self.assertTrue(writer.close(), writer.error)
+
+        cap = cv2.VideoCapture(self.path)
+        self.assertTrue(cap.isOpened())
+        frames = 0
+        while True:
+            ok, _ = cap.read()
+            if not ok:
+                break
+            frames += 1
+        cap.release()
+        self.assertGreater(frames, 0)
+
+    def test_single_frame_segment_is_valid(self):
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            self.skipTest("本机没有 ffmpeg")
+        encoder = real_encoder(ffmpeg)
+        if not encoder:
+            self.skipTest("没有可用的 H.264 编码器")
+        writer = FfmpegWriter(ffmpeg, encoder, self.path, (128, 72), 10.0)
+        writer.open()
+        writer.write(make_frame(0))
+        self.assertTrue(writer.close(), writer.error)
+        cap = cv2.VideoCapture(self.path)
+        self.assertTrue(cap.isOpened())
+        ok, _ = cap.read()
+        cap.release()
+        self.assertTrue(ok, "只有一帧的片段也必须能读出来")
 
 
 if __name__ == "__main__":

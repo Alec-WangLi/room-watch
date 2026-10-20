@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
 from typing import Callable, Optional
 
 # auto 只考虑硬件编码。libx264 是软件编码，没有基准证明不比 avc1 慢，
@@ -109,6 +110,150 @@ def validate_encoder(
             except OSError:
                 pass
     return ok
+
+
+def _default_spawn(cmd: list[str]):
+    kwargs = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = _CREATE_NO_WINDOW
+    return subprocess.Popen(cmd, **kwargs)
+
+
+class FfmpegWriter:
+    """把帧从 stdin 喂给 ffmpeg，写出一个标准 H.264 mp4。
+
+    ffmpeg 的 stderr 必须持续读走：管道写满后 ffmpeg 会卡住，收尾时
+    wait() 永远等不到退出。读线程只保留最后 20 行用于报错。
+    """
+
+    def __init__(
+        self,
+        ffmpeg: str,
+        encoder: str,
+        path: str,
+        size: tuple,
+        fps: float,
+        *,
+        timeout: float = 8.0,
+        spawn: Optional[Callable] = None,
+    ) -> None:
+        self.ffmpeg = ffmpeg
+        self.encoder = encoder
+        self.path = path
+        self.size = (int(size[0]), int(size[1]))
+        self.fps = float(fps)
+        self.timeout = float(timeout)
+        self._spawn = spawn or _default_spawn
+        self.proc = None
+        self.error: Optional[str] = None
+        self.written = 0
+        self._stderr_lines: list[str] = []
+        self._stderr_thread: Optional[threading.Thread] = None
+
+    @property
+    def description(self) -> str:
+        return self.encoder
+
+    def open(self) -> bool:
+        w, h = self.size
+        cmd = [
+            self.ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{w}x{h}", "-r", str(self.fps), "-i", "-",
+            "-c:v", self.encoder, "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", "-y", self.path,
+        ]
+        try:
+            self.proc = self._spawn(cmd)
+        except Exception as exc:  # noqa: BLE001 - 找不到 ffmpeg / 权限问题都在这里
+            self.error = f"启动 ffmpeg 失败: {exc}"
+            return False
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, daemon=True, name="ffmpeg-stderr",
+        )
+        self._stderr_thread.start()
+        return True
+
+    def _drain_stderr(self) -> None:
+        stderr = getattr(self.proc, "stderr", None)
+        if stderr is None:
+            return
+        try:
+            for line in iter(stderr.readline, b""):
+                if not line:
+                    break
+                text = line.decode("utf-8", "replace").rstrip()
+                if text:
+                    self._stderr_lines.append(text)
+                    del self._stderr_lines[:-20]
+        except Exception:  # noqa: BLE001 - 进程退出时管道关闭是正常现象
+            pass
+
+    def write(self, frame) -> None:
+        if self.proc is None:
+            raise RuntimeError("ffmpeg 未启动")
+        try:
+            self.proc.stdin.write(frame.tobytes())
+        except (BrokenPipeError, OSError) as exc:
+            self.error = f"写 ffmpeg 失败: {exc}"
+            raise RuntimeError(self.error) from exc
+        self.written += 1
+
+    def close(self) -> bool:
+        proc = self.proc
+        if proc is None:
+            return False
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:  # noqa: BLE001 - 进程已经死了，stdin 可能已断开
+            pass
+
+        timed_out = False
+        try:
+            rc = proc.wait(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                rc = proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                rc = -1
+
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1.0)
+        try:
+            if proc.stderr is not None:
+                proc.stderr.close()
+        except Exception:  # noqa: BLE001 - 已关闭/已被回收都无所谓
+            pass
+
+        exists = os.path.exists(self.path)
+        size = os.path.getsize(self.path) if exists else 0
+        ok = (not timed_out) and rc == 0 and exists and size > 0
+        if not ok:
+            if timed_out:
+                self.error = "ffmpeg 未在超时内退出"
+            elif rc != 0:
+                detail = " / ".join(self._stderr_lines[-3:])
+                self.error = f"ffmpeg 返回 {rc}" + (f": {detail}" if detail else "")
+            elif not exists:
+                self.error = "ffmpeg 没有写出文件"
+            else:
+                self.error = "ffmpeg 写出的是空文件"
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+        self.proc = None
+        return ok
 
 
 class EncoderSelector:
