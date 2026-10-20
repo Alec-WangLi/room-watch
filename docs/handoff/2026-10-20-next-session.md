@@ -129,7 +129,9 @@
 
 ## 9. 0.2.1 资源优化（已就绪，2026-10-21 凌晨）
 
-- `beta` 已合并 `6d1d60d`（特性提交 `76083e5`）；未推送、未打 tag、未发版。
+- `beta` 已推送并发布 `v0.2.1-beta`（tag 指向 `26aff58`，prerelease）：
+  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.2.1-beta
+  资产 `room-watch-0.2.1-setup.exe` + `.sha256`；简介取自 CHANGELOG。
 - 内容：本人在场、画面里有人且未录像时，推理降到每秒 2 次
   （`gate.owner_interval_seconds`，默认 0.5，0 = 关闭）；录像中、身份未确认、
   画面空了仍全速。背景数据：真机 0.2.0 空闲 10 分钟 5749 帧全部推理，
@@ -148,4 +150,4 @@
   一个 gallery；相机正常、`/healthz` ok、无 `update_failed.txt`。
   同场景进程 CPU 从约 128% 降到 52–55%；3 分钟 1748 帧里推理 353 次，
   `owner_throttled` 1395。
-- 待办：推送与发版需所有者明确同意；稳定观察后再把 `beta` 合回 `main`。
+- 待办：稳定观察后再把 `beta` 合回 `main`；再次发版需先升修订号。
