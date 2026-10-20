@@ -177,6 +177,15 @@ _add(Field("monitor.heartbeat_interval_seconds", "心跳间隔（秒）", "心�
 _add(Field("monitor.heartbeat_timeout_seconds", "心跳超时（秒）", "心跳", "int",
            lo=3, hi=60))
 
+# ---- 更新 ----
+_add(Field("update.channel", "更新通道", "更新", "choice", ("stable", "beta"),
+           hint="stable=只收正式发布；beta=测试版预发布也收（更新更频繁，可能不稳定）",
+           default="stable"))
+_add(Field("update.check_interval_hours", "后台检查间隔（小时）", "更新", "int",
+           lo=0, hi=720,
+           hint="0 = 关闭启动时的后台检查；手动「检查更新」不受影响",
+           default=24))
+
 # ---- 自启 ----
 # 开机自启拉起的是守护进程，所以「它多久确认一次」天然属于这一页。
 _add(Field("guardian.check_seconds", "守护检查间隔（秒）", "自启", "int", lo=15, hi=3600,
@@ -193,7 +202,7 @@ _add(Field("voice.volume_mode", "如何让提示音听得见", "声音", "choice
 
 def sections() -> list[str]:
     """界面上页签的顺序。"""
-    return ["摄像头", "推送", "相册", "身份", "录像", "心跳", "自启", "声音"]
+    return ["摄像头", "推送", "相册", "身份", "录像", "心跳", "更新", "自启", "声音"]
 
 
 # ---------------------------------------------------------------- 值处理
@@ -643,6 +652,15 @@ def apply(root: Path | str, changes: dict) -> dict:
         got = get_path(cfg, key)
         if got != value:
             errors[key] = f"复读不一致：期望 {value!r}，读回 {got!r}（检查 {LOCAL_NAME} 是否可写）"
+
+    # 改了更新通道或检查间隔后，旧的检查缓存不再代表当前设置；
+    # 删掉它，界面下次启动会立刻按新设置查一次（否则要等缓存过期）。
+    if not errors and any(key in coerced for key in (
+            "update.channel", "update.check_interval_hours")):
+        try:
+            (root / "var" / "state" / "update.json").unlink()
+        except OSError:
+            pass
 
     return {"ok": not errors, "applied": list(coerced), "errors": errors}
 

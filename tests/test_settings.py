@@ -61,8 +61,9 @@ class SpecTest(unittest.TestCase):
     def test_spec_covers_all_tabs(self) -> None:
         sections = {f.section for f in settings.SPEC.values()}
         self.assertEqual(sections, set(settings.sections()))
-        self.assertEqual(len(sections), 8)
+        self.assertEqual(len(sections), 9)
         self.assertIn("录像", sections)
+        self.assertIn("更新", sections)
 
     def test_credentials_are_flagged_secret(self) -> None:
         for key in ("notify.wecom_bot.webhook", "notify.wxpusher.app_token",
@@ -384,6 +385,37 @@ class ChannelFilterSettingTest(unittest.TestCase):
             })
             snap = settings.snapshot(root)
         self.assertFalse(snap["events_deliverable"])
+
+
+class UpdateChannelSettingTest(unittest.TestCase):
+    def test_defaults_to_stable_for_old_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            snap = settings.snapshot(root)
+        self.assertEqual(snap["values"]["update.channel"], "stable")
+        self.assertEqual(snap["values"]["update.check_interval_hours"], 24)
+
+    def test_channel_round_trips_and_clears_update_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            state = root / "var" / "state"
+            state.mkdir(parents=True)
+            cache = state / "update.json"
+            cache.write_text('{"latest": "0.1.10"}', encoding="utf-8")
+            result = settings.apply(root, {"update.channel": "beta"})
+            self.assertTrue(result["ok"], result)
+            snap = settings.snapshot(root)
+            local = yaml.safe_load((root / "config.local.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(snap["values"]["update.channel"], "beta")
+        self.assertEqual(local["update"]["channel"], "beta")
+        self.assertFalse(cache.exists(), "切换通道后旧检查缓存应被清掉")
+
+    def test_invalid_channel_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_project(Path(tmp))
+            result = settings.apply(root, {"update.channel": "nightly"})
+            self.assertFalse(result["ok"])
+            self.assertIn("update.channel", result["errors"])
 
 
 class RecordSettingsTest(unittest.TestCase):

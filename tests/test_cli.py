@@ -227,6 +227,25 @@ class AutostartHelpTest(unittest.TestCase):
         self.assertIn("回退", out)
 
 
+class UpdateChannelTest(unittest.TestCase):
+    def test_channel_flag_reaches_fetcher_and_json(self):
+        from roomwatch import updater
+
+        release = updater.Release(
+            version=updater.Version(0, 1, 19), tag="v0.1.19-beta",
+            title="", notes="", prerelease=True)
+        buf = io.StringIO()
+        with mock.patch.object(updater, "fetch_channel", return_value=release) as fetch, \
+             mock.patch.object(updater, "save_check_cache"):
+            with redirect_stdout(buf):
+                rc = cli.main(["update", "--json", "--channel", "beta"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(fetch.call_args.args[1], "beta")
+        data = json.loads(buf.getvalue().strip())
+        self.assertEqual(data["channel"], "beta")
+        self.assertEqual(data["tag"], "v0.1.19-beta")
+
+
 class ConfigTestCommandTest(unittest.TestCase):
     class FakeResponse:
         status_code = 200

@@ -421,8 +421,10 @@ def _cmd_update(argv: Sequence[str]) -> int:
     if "--help" in argv or "-h" in argv:
         print(
             "用法：rw update [--check] [--yes] [--force] [--no-restart]\n"
-            "                [--json] [--wait-exit PID] [--relaunch-gui]\n"
+            "                [--json] [--channel stable|beta]\n"
+            "                [--wait-exit PID] [--relaunch-gui]\n"
             "  --check        只检查，不下载不安装\n"
+            "  --channel      更新通道：stable=只收稳定版；beta=测试版预发布也收\n"
             "  --yes          允许跨次版本/主版本升级（版本纪律要求显式确认）\n"
             "  --force        允许降级（一般只用于回滚到旧版排障）\n"
             "  --no-restart   装完不自动把监控拉起来\n"
@@ -432,7 +434,8 @@ def _cmd_update(argv: Sequence[str]) -> int:
         )
         return 0
 
-    flags = {"--check", "--yes", "--force", "--no-restart", "--json", "--relaunch-gui"}
+    flags = {"--check", "--yes", "--force", "--no-restart", "--json",
+             "--relaunch-gui", "--channel"}
     json_mode = "--json" in argv
     check_only = "--check" in argv or json_mode
     assume_yes = "--yes" in argv
@@ -441,6 +444,7 @@ def _cmd_update(argv: Sequence[str]) -> int:
     relaunch_gui = "--relaunch-gui" in argv
 
     wait_pid = 0
+    channel_override = ""
     unknown: list[str] = []
     idx = 0
     while idx < len(argv):
@@ -449,6 +453,12 @@ def _cmd_update(argv: Sequence[str]) -> int:
             if idx + 1 >= len(argv) or not argv[idx + 1].isdigit():
                 raise UsageError("--wait-exit 后面要跟一个进程号（数字）")
             wait_pid = int(argv[idx + 1])
+            idx += 2
+            continue
+        if item == "--channel":
+            if idx + 1 >= len(argv) or argv[idx + 1] not in ("stable", "beta"):
+                raise UsageError("--channel 只能是 stable 或 beta")
+            channel_override = argv[idx + 1]
             idx += 2
             continue
         if item not in flags:
@@ -460,6 +470,8 @@ def _cmd_update(argv: Sequence[str]) -> int:
     cfg_path = paths.PROJECT_ROOT / "config.yaml"
     cfg = load_config(str(cfg_path)) if cfg_path.is_file() else {}
     opt = updater.update_config(cfg)
+    channel = channel_override or opt["channel"]
+    channel_label = "测试版" if channel == "beta" else "稳定版"
 
     current = updater.Version.parse(__version__)
     payload: dict = {
@@ -470,6 +482,8 @@ def _cmd_update(argv: Sequence[str]) -> int:
         "notes": "",
         "error": "",
         "checked_at": "",
+        "channel": channel,
+        "channel_label": channel_label,
         "check_interval_hours": opt["check_interval_hours"],
         "installed": False,
         "handed_off": False,
@@ -488,7 +502,7 @@ def _cmd_update(argv: Sequence[str]) -> int:
             # 检查结果落盘，界面下次启动按 check_interval_hours 复用，不用每次联网
             updater.save_check_cache({key: payload[key] for key in (
                 "checked_at", "current", "latest", "policy", "tag", "notes",
-                "check_interval_hours")})
+                "channel", "channel_label", "check_interval_hours")})
         if json_mode:
             print(json.dumps(payload, ensure_ascii=False))
         return code
@@ -499,8 +513,9 @@ def _cmd_update(argv: Sequence[str]) -> int:
         return done(0, policy="disabled")
 
     say(f"检查仓库  {opt['repo']}")
+    say(f"检查通道  {channel_label}")
     try:
-        release = updater.fetch_latest(opt["repo"])
+        release = updater.fetch_channel(opt["repo"], channel)
     except updater.UpdateError as exc:
         say(f"✗ {exc}")
         return done(1, error=str(exc))
@@ -515,7 +530,7 @@ def _cmd_update(argv: Sequence[str]) -> int:
              "notes": (release.notes or "").strip()}
 
     if policy == "up-to-date":
-        say("\n已是最新版本。")
+        say(f"\n已是最新版本（{channel_label}通道）。")
         return done(0, **found)
     if policy == "blocked-downgrade":
         say(f"\n远端 {latest} 比本地 {current} 旧，默认不降级。"

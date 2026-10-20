@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -37,7 +38,9 @@ from . import procutil
 
 DEFAULT_REPO = "Alec-WangLi/room-watch"
 API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
+API_RELEASES = "https://api.github.com/repos/{repo}/releases?per_page=30"
 API_RELEASE_BY_TAG = "https://api.github.com/repos/{repo}/releases/tags/{tag}"
+ATOM_FEED = "https://github.com/{repo}/releases.atom"
 LATEST_PAGE = "https://github.com/{repo}/releases/latest"
 ASSET_URL = "https://github.com/{repo}/releases/download/{tag}/{name}"
 
@@ -162,6 +165,132 @@ def _default_get(timeout: float = 10.0, **extra):
     return get
 
 
+def _release_from_api(data: dict, repo: str) -> Optional[Release]:
+    """把 GitHub API 的一个 release 对象转成 Release；tag 不合法时返回 None。"""
+    tag = str(data.get("tag_name") or "")
+    try:
+        version = Version.parse(tag)
+    except UpdateError:
+        return None
+    return Release(
+        version=version,
+        tag=tag,
+        title=str(data.get("name") or tag),
+        notes=str(data.get("body") or ""),
+        prerelease=bool(data.get("prerelease")),
+        assets=list(data.get("assets") or []),
+        published_at=str(data.get("published_at") or ""),
+        repo=repo,
+    )
+
+
+def _fetch_beta_via_atom(repo: str, *, timeout: float = 10.0,
+                         get: Optional[Callable[..., object]] = None) -> Release:
+    """API 被限流时，从 `releases.atom` 取版本列表。
+
+    网页的 atom 源不消耗 API 配额，且包含预发布（实测 v0.1.19-beta 就在里面）。
+    代价是拿不到简介和资产列表：安装包地址按固定命名约定拼，SHA256 仍会
+    从 `.sha256` 资产下载校验。
+    """
+    get = get or _default_get(timeout)
+    url = ATOM_FEED.format(repo=repo)
+    try:
+        resp = get(url, headers={"Accept": "application/atom+xml"})
+    except Exception as exc:  # noqa: BLE001
+        raise UpdateError(f"测试版通道：API 被限流，atom 源也连不上（{exc}）") from exc
+    status = getattr(resp, "status_code", 0)
+    if status != 200:
+        raise UpdateError(f"测试版通道：API 被限流，atom 源返回 HTTP {status}")
+    try:
+        root = ET.fromstring(getattr(resp, "text", "") or "")
+    except ET.ParseError as exc:
+        raise UpdateError("测试版通道：atom 源内容无法解析") from exc
+
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    candidates: list[Release] = []
+    for entry in root.findall("a:entry", ns):
+        href = ""
+        for link in entry.findall("a:link", ns):
+            href = str(link.get("href") or "")
+            if "/releases/tag/" in href:
+                break
+        if "/releases/tag/" not in href:
+            continue
+        tag = href.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            version = Version.parse(tag)
+        except UpdateError:
+            continue
+        candidates.append(Release(
+            version=version,
+            tag=tag,
+            title=str(entry.findtext("a:title", default=tag, namespaces=ns) or tag),
+            notes="",
+            prerelease=("-" in tag),
+            assets=[],
+            published_at=str(entry.findtext("a:updated", default="", namespaces=ns) or ""),
+            repo=repo,
+        ))
+    if not candidates:
+        raise UpdateError("测试版通道：atom 源里没有可识别的 release")
+    return max(candidates, key=lambda r: (r.version, 0 if not r.prerelease else -1))
+
+
+def fetch_channel(repo: str = DEFAULT_REPO, channel: str = "stable", *,
+                  timeout: float = 10.0,
+                  get: Optional[Callable[..., object]] = None) -> Release:
+    """按更新通道取版本。
+
+    - stable：走 `/releases/latest`，GitHub 自己排除预发布。
+    - beta：读 `/releases` 列表，把预发布也算进来，挑版本最高的一个；
+      同一版本同时存在稳定版与测试版时，优先稳定版。
+      beta 通道必须走 API（网页 `/releases/latest` 不返回预发布），
+      被限流时无法退回重定向，只能提示稍后再试。
+    """
+    if str(channel or "stable").strip().lower() != "beta":
+        return fetch_latest(repo, timeout=timeout, get=get)
+
+    get = get or _default_get(timeout)
+    url = API_RELEASES.format(repo=repo)
+    try:
+        resp = get(url)
+    except Exception as exc:  # noqa: BLE001 - 网络异常先尝试 atom 兜底
+        try:
+            return _fetch_beta_via_atom(repo, timeout=timeout, get=get)
+        except UpdateError as atom_exc:
+            raise UpdateError(f"连不上 GitHub：{exc}；{atom_exc}") from exc
+
+    status = getattr(resp, "status_code", 0)
+    if status in (403, 429):
+        # 匿名 API 每小时只有 60 次；atom 源不耗配额，且包含预发布。
+        return _fetch_beta_via_atom(repo, timeout=timeout, get=get)
+    if status != 200:
+        raise UpdateError(f"GitHub 返回 {status}：{(getattr(resp, 'text', '') or '')[:200]}")
+    try:
+        data = resp.json()
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise UpdateError("GitHub 返回的 releases 不是有效 JSON") from exc
+    if not isinstance(data, list):
+        raise UpdateError("GitHub 返回的 releases 格式不对")
+
+    candidates: list[Release] = []
+    for item in data:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        release = _release_from_api(item, repo)
+        if release is None:
+            continue
+        # 列表模式必须确认真的有安装包资产；不能像重定向模式那样按名字拼。
+        if not any(INSTALLER_RE.search(str(a.get("name") or ""))
+                   for a in release.assets):
+            continue
+        candidates.append(release)
+
+    if not candidates:
+        raise UpdateError("beta 通道没有可用的安装包 release")
+    return max(candidates, key=lambda r: (r.version, 0 if not r.prerelease else -1))
+
+
 def fetch_latest(repo: str = DEFAULT_REPO, *, timeout: float = 10.0,
                  get: Optional[Callable[..., object]] = None) -> Release:
     """取最新 release。
@@ -190,17 +319,9 @@ def fetch_latest(repo: str = DEFAULT_REPO, *, timeout: float = 10.0,
         except (ValueError, json.JSONDecodeError):
             data = None
         if isinstance(data, dict):
-            tag = str(data.get("tag_name") or "")
-            return Release(
-                version=Version.parse(tag),
-                tag=tag,
-                title=str(data.get("name") or tag),
-                notes=str(data.get("body") or ""),
-                prerelease=bool(data.get("prerelease")),
-                assets=list(data.get("assets") or []),
-                published_at=str(data.get("published_at") or ""),
-                repo=repo,
-            )
+            release = _release_from_api(data, repo)
+            if release is not None:
+                return release
 
     if status == 404:
         raise UpdateError(f"仓库 {repo} 还没有发布任何 release")
@@ -789,9 +910,13 @@ def available_version(data: dict, current: str) -> Optional[Version]:
 def update_config(cfg: dict) -> dict:
     """把 config.yaml 的 update 段补齐默认值。"""
     raw = cfg.get("update") if isinstance(cfg.get("update"), dict) else {}
+    channel = str(raw.get("channel") or "stable").strip().lower()
+    if channel not in ("stable", "beta"):
+        channel = "stable"
     return {
         "enabled": bool(raw.get("enabled", True)),
         "repo": str(raw.get("repo") or DEFAULT_REPO),
+        "channel": channel,
         "check_interval_hours": float(raw.get("check_interval_hours", 24)),
         "allow_minor": bool(raw.get("allow_minor", False)),
         "allow_downgrade": bool(raw.get("allow_downgrade", False)),

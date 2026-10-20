@@ -1189,13 +1189,16 @@ class RoomWatchApp:
 
         cache = {key: data.get(key) for key in (
             "checked_at", "current", "latest", "policy", "tag", "notes",
-            "check_interval_hours")}
+            "channel", "channel_label", "check_interval_hours")}
         self._apply_update_cache(cache)
 
         newer = updater.available_version(cache, __version__)
         if not newer:
             if manual:
-                self.messagebox.showinfo("已是最新", f"当前版本 {__version__} 就是最新版本。")
+                label = str(cache.get("channel_label") or "稳定版")
+                self.messagebox.showinfo(
+                    "已是最新",
+                    f"当前版本 {__version__} 就是最新版本（{label}通道）。")
             return
         if manual:
             self._ask_install(cache, newer)
@@ -1224,8 +1227,10 @@ class RoomWatchApp:
 
         notes = str(info.get("notes") or "").strip()
         tail = f"\n\n更新说明（节选）：\n{notes[:600]}" if notes else ""
+        label = str(info.get("channel_label") or "")
+        title = f"发现新版本 {newer}" + (f"（{label}）" if label else "")
         ok = self.messagebox.askyesno(
-            f"发现新版本 {newer}",
+            title,
             f"当前 {__version__} → {newer}。{tail}\n\n"
             "点「是」立即更新：界面会关闭，更新完成后自动重新打开；\n"
             "监控进程会被短暂停止（约 1 分钟）。")
@@ -1239,8 +1244,11 @@ class RoomWatchApp:
         界面进程自己占着 `room-watch.exe`，安装器换不掉正在运行的可执行文件，
         所以必须先把 PID 交给子进程、自己退出（`--wait-exit` + `--relaunch-gui`）。
         """
-        args = [self.python, "-m", "roomwatch", "update", "--yes",
-                "--wait-exit", str(os.getpid()), "--relaunch-gui"]
+        args = [self.python, "-m", "roomwatch", "update", "--yes"]
+        channel = str(self._update_info.get("channel") or "")
+        if channel in ("stable", "beta"):
+            args += ["--channel", channel]
+        args += ["--wait-exit", str(os.getpid()), "--relaunch-gui"]
         flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
         try:
             subprocess.Popen(args, cwd=str(self.project), creationflags=flags, close_fds=True)

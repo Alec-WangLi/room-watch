@@ -184,6 +184,98 @@ class FetchTest(unittest.TestCase):
         self.assertIn("release", str(ctx.exception))
 
 
+class FetchChannelTest(unittest.TestCase):
+    def _releases(self, payload):
+        return lambda url, **kw: FakeResponse(payload=payload)
+
+    def test_beta_channel_includes_prereleases(self) -> None:
+        data = [
+            release_payload("v0.1.18", assets=[installer_asset("0.1.18")]),
+            release_payload("v0.1.19-beta", prerelease=True,
+                            assets=[installer_asset("0.1.19")]),
+        ]
+        rel = updater.fetch_channel("r", "beta", get=self._releases(data))
+        self.assertEqual(rel.tag, "v0.1.19-beta")
+        self.assertTrue(rel.prerelease)
+
+    def test_beta_prefers_stable_when_same_version_exists(self) -> None:
+        data = [
+            release_payload("v0.1.19-beta", prerelease=True,
+                            assets=[installer_asset("0.1.19")]),
+            release_payload("v0.1.19", assets=[installer_asset("0.1.19")]),
+        ]
+        rel = updater.fetch_channel("r", "beta", get=self._releases(data))
+        self.assertEqual(rel.tag, "v0.1.19")
+        self.assertFalse(rel.prerelease)
+
+    def test_beta_ignores_drafts_and_missing_installers(self) -> None:
+        draft = release_payload("v0.1.21-beta", prerelease=True,
+                                assets=[installer_asset("0.1.21")])
+        draft["draft"] = True
+        data = [
+            release_payload("v0.1.18", assets=[installer_asset("0.1.18")]),
+            draft,
+            release_payload("v0.1.20-beta", prerelease=True, assets=[]),
+        ]
+        rel = updater.fetch_channel("r", "beta", get=self._releases(data))
+        self.assertEqual(rel.tag, "v0.1.18")
+
+    def test_beta_rate_limit_falls_back_to_atom(self) -> None:
+        atom = """<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><link href="https://github.com/r/releases/tag/v0.1.19-beta"/>
+            <updated>2026-10-20T00:00:00Z</updated></entry>
+          <entry><link href="https://github.com/r/releases/tag/v0.1.10"/>
+            <updated>2026-10-19T00:00:00Z</updated></entry>
+        </feed>"""
+        calls = []
+
+        def get(url, **kw):
+            calls.append(url)
+            if "api.github.com" in url:
+                return FakeResponse(status=403, text="rate limit")
+            return FakeResponse(text=atom)
+
+        rel = updater.fetch_channel("r", "beta", get=get)
+        self.assertEqual(rel.tag, "v0.1.19-beta")
+        self.assertTrue(any("releases.atom" in url for url in calls))
+
+    def test_beta_rate_limit_and_atom_failure_is_reported(self) -> None:
+        def get(url, **kw):
+            if "api.github.com" in url:
+                return FakeResponse(status=429)
+            return FakeResponse(status=502)
+
+        with self.assertRaises(updater.UpdateError) as ctx:
+            updater.fetch_channel("r", "beta", get=get)
+        self.assertIn("atom", str(ctx.exception))
+
+    def test_atom_prefers_stable_same_version(self) -> None:
+        atom = """<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><link href="https://github.com/r/releases/tag/v0.1.19-beta"/></entry>
+          <entry><link href="https://github.com/r/releases/tag/v0.1.19"/></entry>
+        </feed>"""
+
+        def get(url, **kw):
+            if "api.github.com" in url:
+                return FakeResponse(status=403)
+            return FakeResponse(text=atom)
+
+        rel = updater.fetch_channel("r", "beta", get=get)
+        self.assertEqual(rel.tag, "v0.1.19")
+        self.assertFalse(rel.prerelease)
+
+    def test_stable_channel_still_uses_latest_endpoint(self) -> None:
+        urls = []
+
+        def get(url, **kw):
+            urls.append(url)
+            return FakeResponse(payload=release_payload("v0.1.10"))
+
+        rel = updater.fetch_channel("r", "stable", get=get)
+        self.assertEqual(rel.tag, "v0.1.10")
+        self.assertIn("/releases/latest", urls[0])
+
+
 class AssetTest(unittest.TestCase):
     def test_picks_installer(self) -> None:
         rel = updater.Release(
@@ -283,6 +375,17 @@ class ConfigTest(unittest.TestCase):
     def test_garbage_section_is_ignored(self) -> None:
         opt = updater.update_config({"update": "not-a-dict"})
         self.assertTrue(opt["enabled"])
+
+    def test_channel_defaults_to_stable(self) -> None:
+        self.assertEqual(updater.update_config({})["channel"], "stable")
+
+    def test_channel_accepts_beta(self) -> None:
+        opt = updater.update_config({"update": {"channel": "Beta"}})
+        self.assertEqual(opt["channel"], "beta")
+
+    def test_unknown_channel_falls_back_to_stable(self) -> None:
+        opt = updater.update_config({"update": {"channel": "nightly"}})
+        self.assertEqual(opt["channel"], "stable")
 
 
 class StopWatcherTest(unittest.TestCase):

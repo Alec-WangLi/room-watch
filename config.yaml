@@ -331,6 +331,12 @@ update:
   enabled: true
   repo: "Alec-WangLi/room-watch"
 
+  # 更新通道：
+  #   stable 只收正式发布（/releases/latest，稳定优先）
+  #   beta   测试版预发布也收；同一版本同时有稳定版时优先稳定版
+  # 在界面「设置 → 更新」里可随时切换。
+  channel: stable
+
   # 预留：监控进程启动时后台自检的间隔。0 = 不在后台自检。
   check_interval_hours: 24
 
