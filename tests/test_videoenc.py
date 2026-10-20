@@ -24,7 +24,13 @@ import unittest
 import cv2
 import numpy as np
 
-from roomwatch.videoenc import EncoderSelector, FfmpegWriter, parse_encoders, probe_encoders
+from roomwatch.videoenc import (
+    EncoderSelector,
+    FfmpegWriter,
+    WriterFactory,
+    parse_encoders,
+    probe_encoders,
+)
 
 
 FFMPEG_ENCODERS = """\
@@ -291,6 +297,90 @@ class FfmpegWriterTest(unittest.TestCase):
         ok, _ = cap.read()
         cap.release()
         self.assertTrue(ok, "只有一帧的片段也必须能读出来")
+
+
+class FakeWriter:
+    created = 0
+    open_result = True
+
+    def __init__(self, *args, **kwargs):
+        type(self).created += 1
+        self.args = args
+        self.path = args[2] if len(args) > 2 else "x.mp4"
+        self.description = "fake"
+        self.error = "boom"
+        self.opened = False
+
+    def open(self):
+        self.opened = True
+        return type(self).open_result
+
+    def write(self, frame):
+        pass
+
+    def close(self):
+        return True
+
+
+class FakeCv2Writer(FakeWriter):
+    def __init__(self, path, size, fps, codecs=None):
+        super().__init__(path, size, fps)
+        self.description = "avc1"
+
+
+class FakeFfmpegWriter(FakeWriter):
+    def __init__(self, ffmpeg, encoder, path, size, fps, **_kw):
+        super().__init__(ffmpeg, encoder, path, size, fps)
+        self.description = "h264_mf"
+
+
+class FakeSelector:
+    def __init__(self, choice):
+        self.choice = choice
+
+    def choose(self):
+        return self.choice
+
+
+class TestWriterFactory(unittest.TestCase):
+    def _factory(self, choice, **kw):
+        cfg = {"encoder": "auto", "codec": "avc1", "audio": {"ffmpeg": "ffmpeg"}}
+        cfg.update(kw)
+        return WriterFactory(
+            cfg,
+            selector=FakeSelector(choice),
+            cv2_factory=FakeCv2Writer,
+            ffmpeg_factory=FakeFfmpegWriter,
+        )
+
+    def test_no_ffmpeg_encoder_uses_cv2(self):
+        factory = self._factory(None)
+        self.assertIsInstance(factory.open("a.mp4", (640, 360), 10.0), FakeCv2Writer)
+
+    def test_ffmpeg_writer_is_used_when_available(self):
+        FakeFfmpegWriter.created = 0
+        FakeFfmpegWriter.open_result = True
+        factory = self._factory("h264_mf")
+        writer = factory.open("a.mp4", (640, 360), 10.0)
+        self.assertIsInstance(writer, FakeFfmpegWriter)
+        self.assertEqual(FakeFfmpegWriter.created, 1)
+
+    def test_open_failure_falls_back_to_cv2(self):
+        FakeFfmpegWriter.open_result = False
+        factory = self._factory("h264_mf")
+        writer = factory.open("a.mp4", (640, 360), 10.0)
+        self.assertIsInstance(writer, FakeCv2Writer)
+        self.assertTrue(factory.disabled_reason)
+
+    def test_circuit_breaker_after_two_failures(self):
+        FakeFfmpegWriter.created = 0
+        FakeFfmpegWriter.open_result = False
+        factory = self._factory("h264_mf")
+        for _ in range(3):
+            factory.open("a.mp4", (640, 360), 10.0)
+        self.assertEqual(FakeFfmpegWriter.created, 2,
+                         "连续两次失败后不该再启动 ffmpeg")
+        self.assertIn("连续", factory.disabled_reason or "")
 
 
 if __name__ == "__main__":

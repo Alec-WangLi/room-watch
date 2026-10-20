@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 
 from roomwatch.recorder import PreRollBuffer, Recorder, video_path_for
+from roomwatch.videoenc import WriterFactory
 
 SIZE = (640, 360)  # 测试用小尺寸，跑得快；真实环境是 1280x720
 FPS = 10.0
@@ -115,7 +116,8 @@ class TestRecorderWritesPlayableFile(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _rec(self, **kw) -> Recorder:
-        cfg = {"enabled": True, "pre_roll_seconds": 1.0, "queue_size": 200}
+        cfg = {"enabled": True, "pre_roll_seconds": 1.0, "queue_size": 200,
+               "encoder": "cv2"}
         cfg.update(kw)
         return Recorder(cfg, fps=FPS)
 
@@ -222,6 +224,141 @@ class TestRecorderWritesPlayableFile(unittest.TestCase):
         rec.stop()
         # 10fps 的每帧预算是 100ms；observe 只能占零头
         self.assertLess(worst, 50.0, f"observe() 最慢 {worst:.1f}ms，会拖垮主循环")
+
+
+class FakeBackendWriter:
+    """测试用后端：可控制写失败与 close 结果。"""
+
+    def __init__(self, path, *, fail_write=False, close_ok=True):
+        self.path = path
+        self.description = "h264_mf"
+        self.error = None
+        self.fail_write = fail_write
+        self.close_ok = close_ok
+
+    def open(self):
+        with open(self.path, "wb") as f:
+            f.write(b"header")
+        return True
+
+    def write(self, frame):
+        if self.fail_write:
+            raise OSError("disk full")
+        with open(self.path, "ab") as f:
+            f.write(b"frame")
+
+    def close(self):
+        return self.close_ok
+
+
+class FakeBackendFactory:
+    def __init__(self, writer):
+        self.writer = writer
+        self.failures = 0
+        self.disabled_reason = None
+
+    def open(self, path, size, fps):
+        return self.writer
+
+    def note_segment_failed(self, reason=""):
+        self.failures += 1
+        self.disabled_reason = reason
+
+
+class FakeSelector:
+    def __init__(self, choice):
+        self.choice = choice
+
+    def choose(self):
+        return self.choice
+
+
+class TestRecorderBackendFailure(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _rec_with(self, writer, **kw):
+        cfg = {"enabled": True, "pre_roll_seconds": 0, "queue_size": 50}
+        cfg.update(kw)
+        factory = FakeBackendFactory(writer)
+        rec = Recorder(cfg, fps=FPS, factory=factory)
+        rec.prime_size(SIZE)
+        return rec, factory
+
+    def test_close_failure_returns_none_and_deletes_file(self):
+        path = os.path.join(self.tmp, "bad.mp4")
+        rec, factory = self._rec_with(
+            FakeBackendWriter(path, close_ok=False)
+        )
+        self.assertEqual(rec.start(path, T0), path)
+        rec.observe(synthetic_frame(0), T0)
+        self.assertIsNone(rec.stop("测试"))
+        self.assertFalse(os.path.exists(path), "失败的片段不能留在相册里")
+        self.assertIsNotNone(rec.last_error)
+        self.assertEqual(factory.failures, 1)
+
+    def test_write_error_discards_segment_even_if_close_ok(self):
+        """磁盘满时 write 抛异常；即使 close 说成功，这一段也不能算数。"""
+        path = os.path.join(self.tmp, "full.mp4")
+        rec, factory = self._rec_with(
+            FakeBackendWriter(path, fail_write=True, close_ok=True)
+        )
+        rec.start(path, T0)
+        rec.observe(synthetic_frame(0), T0)
+        self.assertIsNone(rec.stop("测试"))
+        self.assertFalse(os.path.exists(path))
+        self.assertIsNotNone(rec.last_error)
+        self.assertEqual(factory.failures, 1)
+
+    def test_last_encoder_is_reported(self):
+        path = os.path.join(self.tmp, "enc.mp4")
+        rec, _ = self._rec_with(FakeBackendWriter(path))
+        rec.start(path, T0)
+        self.assertEqual(rec.last_encoder, "h264_mf")
+        rec.stop()
+        self.assertEqual(rec.last_encoder, "h264_mf", "收尾后也要保留，供状态展示")
+
+    def test_mismatched_frame_size_with_ffmpeg_backend(self):
+        ffmpeg = _find_ffmpeg()
+        if not ffmpeg:
+            self.skipTest("本机没有 ffmpeg")
+        encoder = _real_encoder(ffmpeg)
+        if not encoder:
+            self.skipTest("没有可用的 H.264 编码器")
+        path = os.path.join(self.tmp, "size.mp4")
+        cfg = {
+            "enabled": True, "encoder": "ffmpeg", "pre_roll_seconds": 0,
+            "queue_size": 50, "audio": {"ffmpeg": ffmpeg},
+        }
+        factory = WriterFactory(cfg, selector=FakeSelector(encoder))
+        rec = Recorder(cfg, fps=FPS, factory=factory)
+        rec.prime_size(SIZE)
+        self.assertIsNotNone(rec.start(path, T0))
+        rec.observe(synthetic_frame(1, size=(1280, 720)), T0)
+        rec.stop()
+        ok, frames, size = read_back(path)
+        self.assertTrue(ok)
+        self.assertGreater(frames, 0)
+        self.assertEqual(size, SIZE)
+
+
+def _find_ffmpeg():
+    from roomwatch.paths import ffmpeg_exe
+
+    return ffmpeg_exe() or shutil.which("ffmpeg")
+
+
+def _real_encoder(ffmpeg):
+    from roomwatch.videoenc import probe_encoders
+
+    available = probe_encoders(ffmpeg)
+    for name in ("h264_mf", "libx264"):
+        if name in available:
+            return name
+    return None
 
 
 class TestPreRollCost(unittest.TestCase):

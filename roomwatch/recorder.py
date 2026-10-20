@@ -31,32 +31,9 @@ from typing import Deque, Optional
 import cv2
 import numpy as np
 
+from .videoenc import WriterFactory
+
 log = logging.getLogger("room-watch")
-
-# 依次尝试。avc1 = H.264，浏览器 <video> 能直接播，是相册页唯一有意义的选项。
-# mp4v 兜底能写出来，但网页基本放不了，只在 H.264 不可用时保个「至少有文件」。
-CODEC_CHAIN = [
-    ("avc1", "H.264（浏览器可直接播放）"),
-    ("mp4v", "MPEG-4 Part 2（兜底，浏览器通常放不了）"),
-    ("MJPG", "Motion JPEG（兜底，体积大）"),
-]
-
-
-def _open_writer(path: str, fourcc: str, fps: float, size: tuple):
-    """开一个 VideoWriter。失败返回 None，不抛异常。
-
-    本机实际观察：OpenCV 报 'H264 not supported' 后会自动 fallback 到 avc1，
-    同时 stderr 会刷一串 libopenh264 加载失败——那是 FFmpeg 后端在抱怨，
-    Media Foundation 后端会接手并成功，那些红字可以忽略。
-    """
-    try:
-        w = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, size, True)
-        if w.isOpened():
-            return w
-        w.release()
-    except Exception as e:  # noqa: BLE001 - 编码器报错形式多样，一律当失败处理
-        log.debug("编码器 %s 打开异常: %s", fourcc, e)
-    return None
 
 
 class PreRollBuffer:
@@ -111,13 +88,11 @@ class Recorder:
         rec.stop(reason)                     # 策略说该停时
     """
 
-    def __init__(self, cfg: dict, fps: float):
+    def __init__(self, cfg: dict, fps: float, *, factory=None):
         cfg = cfg or {}
         self.enabled = bool(cfg.get("enabled", True))
         self.fps = max(1.0, float(fps))
-        self.codec_preference = [
-            c.strip() for c in str(cfg.get("codec", "avc1")).split(",") if c.strip()
-        ]
+        self._factory = factory or WriterFactory(cfg)
         self.queue_size = max(1, int(cfg.get("queue_size", 120)))
         self.join_timeout = float(cfg.get("join_timeout_seconds", 8.0))
         self.draw_boxes = bool(cfg.get("draw_boxes", False))
@@ -136,6 +111,9 @@ class Recorder:
         self.written = 0
         self.dropped = 0
         self.last_error: Optional[str] = None
+        # 本段实际使用的编码器；收尾后保留，供状态文件与诊断用。
+        self.last_encoder: Optional[str] = None
+        self._write_failed = False
         self.segments = 0
         # 本段实际倒进去的预录帧数。音频合并要靠它算「该补多少毫秒静音」——
         # 必须用实际值，因为刚启动时环形缓冲还没攒满，会短于配置值。
@@ -192,16 +170,18 @@ class Recorder:
             return None
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        writer, used_codec, real_path = self._try_open(path, size)
+        writer = self._factory.open(path, size, self.fps)
         if writer is None:
             self.last_error = "所有候选编码器都打不开"
-            log.error("录像启动失败：%s（试过 %s）", self.last_error, self.codec_preference)
+            log.error("录像启动失败：%s", self.last_error)
             return None
 
         self._writer = writer
         self._size = size
-        self._path = real_path
+        self._path = writer.path
         self._started_at = when
+        self.last_encoder = writer.description
+        self._write_failed = False
         self._queue = queue.Queue(maxsize=self.queue_size)
         self.written = 0
         self.dropped = 0
@@ -219,8 +199,8 @@ class Recorder:
         self._thread.start()
         self.segments += 1
 
-        log.info("开始录像: %s（%s，预录 %d 帧）", real_path, used_codec, len(pre))
-        return real_path
+        log.info("开始录像: %s（%s，预录 %d 帧）", writer.path, writer.description, len(pre))
+        return writer.path
 
     def stop(self, reason: str = "") -> Optional[str]:
         """收尾。排空队列→释放 writer，全程在写线程完成。"""
@@ -228,13 +208,17 @@ class Recorder:
             return self._path
 
         path = self._path
+        writer = self._writer
         self._queue.put(None)  # 哨兵，通知线程收尾
         self._thread.join(timeout=self.join_timeout)
 
-        if self._thread.is_alive():
+        timed_out = self._thread.is_alive()
+        if timed_out:
             self.last_error = "写线程未在超时内退出，文件可能不完整"
             log.error("%s: %s", self.last_error, path)
+            ok = False
         else:
+            ok = bool(writer and writer.close())
             secs = (datetime.now() - self._started_at).total_seconds() if self._started_at else 0
             extra = f"，原因：{reason}" if reason else ""
             log.info(
@@ -246,12 +230,26 @@ class Recorder:
                 extra,
             )
 
+        failed = timed_out or self._write_failed or not ok
+        if failed:
+            if not self.last_error:
+                self.last_error = (writer.error if writer is not None else None) or "录像写出失败"
+            if self._factory is not None:
+                self._factory.note_segment_failed(self.last_error or "")
+            log.error("录像片段作废: %s（%s）", path, self.last_error)
+            try:
+                if path:
+                    os.remove(path)
+            except OSError:
+                pass
+
         self._thread = None
         self._queue = None
         self._writer = None
         self._started_at = None
         self._path = None
-        return path
+        self._write_failed = False
+        return None if failed else path
 
     def shutdown(self) -> None:
         """进程退出前调用：确保最后一段录像被正确收尾。"""
@@ -280,42 +278,20 @@ class Recorder:
             return cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
         return frame
 
-    def _try_open(self, path: str, size: tuple):
-        """按偏好依次试编码器。返回 (writer, codec说明, 真实路径)。"""
-        root, ext = os.path.splitext(path)
-        # 用户偏好里可能写了没测过的编码器，先试它，再按内置顺序兜底
-        tried = []
-        for name in self.codec_preference + [c for c, _ in CODEC_CHAIN]:
-            if name in tried:
-                continue
-            tried.append(name)
-            target = path if ext.lower() in (".mp4", ".avi") else root + ".mp4"
-            w = _open_writer(target, name, self.fps, size)
-            if w is not None:
-                desc = dict(CODEC_CHAIN).get(name, name)
-                return w, desc, target
-        return None, None, None
-
     def _write_loop(self) -> None:
-        """后台线程：唯一的 writer 使用者。"""
-        try:
-            while True:
-                frame = self._queue.get()
-                if frame is None:
-                    break
-                try:
-                    self._writer.write(frame)
-                    self.written += 1
-                except Exception as e:  # noqa: BLE001
-                    self.last_error = f"写帧失败: {e}"
-                    log.error("录像写帧失败: %s", e)
-                    break
-        finally:
+        """后台线程：唯一的 writer 使用者。收尾与释放由 stop() 负责。"""
+        while True:
+            frame = self._queue.get()
+            if frame is None:
+                break
             try:
-                if self._writer is not None:
-                    self._writer.release()
+                self._writer.write(frame)
+                self.written += 1
             except Exception as e:  # noqa: BLE001
-                log.error("释放录像 writer 失败: %s", e)
+                self.last_error = f"写帧失败: {e}"
+                self._write_failed = True
+                log.error("录像写帧失败: %s", e)
+                break
 
 
 def video_path_for(snapshot_path: str) -> str:

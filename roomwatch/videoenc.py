@@ -19,6 +19,9 @@ import tempfile
 import threading
 from typing import Callable, Optional
 
+import cv2
+import numpy as np
+
 # auto 只考虑硬件编码。libx264 是软件编码，没有基准证明不比 avc1 慢，
 # 需要时由用户显式配置 record.ffmpeg_encoder: libx264。
 AUTO_CANDIDATES = ("h264_mf", "h264_nvenc")
@@ -306,3 +309,127 @@ class EncoderSelector:
             except Exception:  # noqa: BLE001 - 单个候选失败不影响后面的候选
                 continue
         return None
+
+
+# 依次尝试。avc1 = H.264，浏览器 <video> 能直接播，是相册页唯一有意义的选项。
+# mp4v 兜底能写出来，但网页基本放不了，只在 H.264 不可用时保个「至少有文件」。
+CODEC_CHAIN = [
+    ("avc1", "H.264（浏览器可直接播放）"),
+    ("mp4v", "MPEG-4 Part 2（兜底，浏览器通常放不了）"),
+    ("MJPG", "Motion JPEG（兜底，体积大）"),
+]
+
+
+def _open_cv2_writer(path: str, fourcc: str, fps: float, size: tuple):
+    """开一个 cv2.VideoWriter。失败返回 None，不抛异常。"""
+    try:
+        w = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, size, True)
+        if w.isOpened():
+            return w
+        w.release()
+    except Exception:  # noqa: BLE001 - 编码器报错形式多样，一律当失败处理
+        pass
+    return None
+
+
+class Cv2Writer:
+    """现有 OpenCV 写出路径，保持 avc1 → mp4v → MJPG 的兜底顺序。"""
+
+    def __init__(self, path: str, size: tuple, fps: float, codecs: Optional[list] = None):
+        self._original_path = path
+        self.path = path
+        self.size = (int(size[0]), int(size[1]))
+        self.fps = float(fps)
+        self.requested = [c for c in (codecs or ["avc1"]) if c]
+        self.description = ""
+        self.error: Optional[str] = None
+        self._writer = None
+
+    def open(self) -> bool:
+        root, ext = os.path.splitext(self._original_path)
+        target = self._original_path if ext.lower() in (".mp4", ".avi") else root + ".mp4"
+        tried = []
+        for name in self.requested + [c for c, _ in CODEC_CHAIN]:
+            if name in tried:
+                continue
+            tried.append(name)
+            writer = _open_cv2_writer(target, name, self.fps, self.size)
+            if writer is not None:
+                self._writer = writer
+                self.description = name
+                self.path = target
+                return True
+        return False
+
+    def write(self, frame) -> None:
+        if self._writer is None:
+            raise RuntimeError("cv2 writer 未打开")
+        self._writer.write(frame)
+
+    def close(self) -> bool:
+        if self._writer is None:
+            return False
+        try:
+            self._writer.release()
+        except Exception:  # noqa: BLE001 - 释放失败也按失败处理，文件可能不完整
+            pass
+        self._writer = None
+        exists = os.path.exists(self.path)
+        size = os.path.getsize(self.path) if exists else 0
+        if not exists or size <= 0:
+            self.error = "cv2 写出的是空文件"
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+            return False
+        return True
+
+
+class WriterFactory:
+    """按配置挑一条写出路径；ffmpeg 失败就回退 cv2，连续失败后熔断。"""
+
+    def __init__(
+        self,
+        cfg: dict,
+        *,
+        selector: Optional[EncoderSelector] = None,
+        cv2_factory: Callable = Cv2Writer,
+        ffmpeg_factory: Callable = FfmpegWriter,
+    ) -> None:
+        cfg = cfg or {}
+        self.mode = str(cfg.get("encoder", "auto")).strip().lower()
+        self.codec_preference = [
+            c.strip() for c in str(cfg.get("codec", "avc1")).split(",") if c.strip()
+        ]
+        audio = cfg.get("audio") or {}
+        self.ffmpeg = str(audio.get("ffmpeg") or "ffmpeg")
+        self._selector = selector or EncoderSelector(cfg)
+        self._cv2_factory = cv2_factory
+        self._ffmpeg_factory = ffmpeg_factory
+        self._failures = 0
+        self._ffmpeg_off = False
+        self.disabled_reason: Optional[str] = None
+
+    def open(self, path: str, size: tuple, fps: float):
+        if self.mode != "cv2" and not self._ffmpeg_off:
+            try:
+                encoder = self._selector.choose()
+            except Exception:  # noqa: BLE001 - 选择器故障按「没有 ffmpeg」处理
+                encoder = None
+            if encoder:
+                writer = self._ffmpeg_factory(self.ffmpeg, encoder, path, size, fps)
+                if writer.open():
+                    return writer
+                self.note_segment_failed(writer.error or "ffmpeg 打开失败")
+
+        writer = self._cv2_factory(path, size, fps, self.codec_preference)
+        return writer if writer.open() else None
+
+    def note_segment_failed(self, reason: str = "") -> None:
+        """一段录像失败后记账；连续两次就本进程内不再尝试 ffmpeg。"""
+        self._failures += 1
+        self.disabled_reason = reason or "ffmpeg 失败"
+        if self._failures >= 2:
+            self._ffmpeg_off = True
+            self.disabled_reason = "ffmpeg 连续失败"
