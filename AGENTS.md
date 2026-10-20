@@ -735,10 +735,12 @@ room-watch-<版本>\
   企业微信 webhook。
 - **测试**：`beta` 与合并后的 `main` 全量 `rw test` 均通过；GUI 0.2.0
   `--selftest` 通过；便携包 `rw doctor` 全部通过。
-- **本机安装**：仍是 0.1.24（所有者要求自己更新，自动更新在安装前已停止）；
-  GUI 已显示「有新版本 0.2.0」。自动更新链路实测：检查到 0.2.0（跨次版本
-  需确认）、真实下载到 89%（约 128MB）；GitHub 边缘节点速度随机（首连
-  5–12 KB/s，重连后 629 KB/s），若界面更新卡在低速可取消重试。
+- **本机安装**：0.2.0 已由所有者自行完成安装并验证：`VERSION`、`rw version`、
+  卸载项与 `rw doctor` 均为 0.2.0；更新日志最后一条 `installer rc=0`，无
+  `update_failed.txt`；watcher/guardian/gallery 正常，`/healthz` 返回 ok。
+- **自动更新实测**：GUI 显示「有新版本 0.2.0」，`rw update --check` 返回
+  `confirm-minor`；下载阶段实测 GitHub 边缘速度随机（首连 5–12 KB/s，
+  重连 629 KB/s），若界面更新卡在低速可取消重试。
 - **待所有者操作**：① 在 GUI 点「有新版本 0.2.0」或运行
   `dist\room-watch-0.2.0-setup.exe` 完成安装；② 企业微信后台删除旧机器人
   重建，更新 `config.local.yaml`；③ CI 工作流粘贴（token 缺 workflow scope）。

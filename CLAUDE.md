@@ -20,7 +20,7 @@
   默认 `python` 可能没有 cv2，以 `rw doctor` 为准。
 
 当前状态速览：`main` 与 `beta` 均为 0.2.0；已发 `v0.2.0` 稳定版。
-本机仍是 0.1.24，所有者要求自己完成这次更新；更新入口见
+本机已安装 0.2.0 并完成真机验证；GUI 按需打开。详见
 `docs/handoff/2026-10-20-next-session.md`。
 发版通道：稳定版从 `main` 走 plain Release，测试版从 `beta` 走 prerelease
 （`scripts/release.py --channel stable|beta`）；发版需所有者明确同意。

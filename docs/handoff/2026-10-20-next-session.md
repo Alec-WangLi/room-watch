@@ -113,10 +113,12 @@
   `room-watch.exe --selftest` 通过（九页两档尺寸）；便携包 `rw doctor` 全过；
   安装包 143.1MB。
 - **自动更新实测（0.1.24 → 0.2.0）**：GUI 显示「有新版本 0.2.0」；
-  `rw update --check` 返回 `confirm-minor`；真实下载到 89%（128MB）后，
-  所有者要求自己更新，已在交接安装器前停止，**未安装**。
+  `rw update --check` 返回 `confirm-minor`；所有者自行完成下载与安装，
+  `update.log` 最后一条 `installer rc=0`，无 `update_failed.txt`。
+- **安装后验证**：`VERSION`/`rw version`/卸载项/`rw doctor` 均为 0.2.0；
+  watcher、guardian、gallery 各一个，摄像头画面正常，`/healthz` 返回
+  `{"ok": true}`；本人模板与存储数据保留。
 - **网络注意**：GitHub Release 边缘速度随机。首连只有 5–12 KB/s（143MB
   要数小时），重开连接后达到 629 KB/s（约 4 分钟下完）。GUI 更新若长时间
   停在低速，取消后重试即可；不要改 updater 的重试逻辑。
-- **待办**：所有者自己完成本机 0.2.0 安装；企微 key 轮换；CI 启用；
-  干净机器验证；托盘；M6。
+- **待办**：企微 key 轮换；CI 启用；干净机器验证；托盘；M6。
