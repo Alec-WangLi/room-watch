@@ -71,11 +71,12 @@ Filename: "{app}\room-watch.exe"; \
   Flags: postinstall nowait skipifsilent; \
   Check: IsFirstRun
 ; 升级时如果原来监控是在跑的，装完自动恢复；升级不该让用户以为监控还在跑，
-; 实际却停在暂停状态。
+; 实际却停在暂停状态。**不能 skipifsilent**：界面触发的自动更新就是静默安装，
+; 跳过这条会让更新后监控一直停着（0.1.23 真机验证发现）。
 Filename: "{app}\runtime\python\python.exe"; \
   Parameters: "-m roomwatch start --config ""{app}\config.yaml"""; \
   WorkingDir: "{app}"; \
-  Flags: runhidden nowait postinstall skipifsilent; \
+  Flags: runhidden nowait postinstall; \
   Check: ShouldResume
 
 [UninstallRun]
