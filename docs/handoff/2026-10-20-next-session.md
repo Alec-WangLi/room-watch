@@ -6,9 +6,11 @@
 ## 1. 当前状态
 
 - `main` = `b63f8a2`，稳定版 0.1.12，未动。
-- `beta` = 0.1.21（`v0.1.21-beta`）。
-- 本轮分支 `feat/0.1.22-ui-fixes`：0.1.22，已本地打包、安装、真机自检，
-  **未推送、未打 tag**（等所有者确认）。
+- `beta` = `4b801d7`（0.1.22），已推送。
+- 本轮分支 `feat/0.1.22-ui-fixes` 已合回 `beta`。
+- 已发布 `v0.1.22-beta`（prerelease，tag 指向 `4b801d7`）：
+  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.1.22-beta
+  资产 `room-watch-0.1.22-setup.exe` + `.sha256`；简介取自 CHANGELOG。
 - 本机安装：`%LocalAppData%\Programs\room-watch`，`VERSION` 与卸载项均为
   0.1.22；更新通道 beta；监控、guardian、gallery 正常运行。
 - 安装包：`dist\room-watch-0.1.22-setup.exe`（143.1 MB）、
@@ -41,11 +43,10 @@
 
 ## 4. 下一步
 
-1. 所有者确认后：`feat/0.1.22-ui-fixes` → `beta`，推送；默认打 tag +
-   发 beta 预发布（`scripts/release.py --channel beta`）。
-2. 稳定后再把 `beta` 合 `main`，从 `main` 发 stable。
-3. 未做：托盘（pystray + 真机）、M6 平台抽象、干净机器安装验证。
-4. 若自动更新再次失败：先看 `var/logs/update.log` 的
+1. 观察 0.1.22 真机运行与后续自动更新；稳定后再把 `beta` 合 `main`，
+   从 `main` 发 stable（同版本号不要重复发，先升修订号）。
+2. 未做：托盘（pystray + 真机）、M6 平台抽象、干净机器安装验证。
+3. 若自动更新再次失败：先看 `var/logs/update.log` 的
    `installer rc=` 行，再看 `var/state/update_failed.txt`。
 
 ## 5. 环境与命令

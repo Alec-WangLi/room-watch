@@ -711,19 +711,21 @@ room-watch-<版本>\
 
 ## J. 当前状态（2026-10-20 晚）
 
-- **分支**：`main` = `b63f8a2`（稳定版 0.1.12）；`beta` = 0.1.21
-  （发布 tag `v0.1.21-beta` 指向 `af23c84`）；本轮工作在 `feat/0.1.22-ui-fixes`
-  （0.1.22，已本地打包、安装、真机自检，未推送）。
+- **分支**：`main` = `b63f8a2`（稳定版 0.1.12）；`beta` = `4b801d7`（0.1.22，
+  已发 `v0.1.22-beta` 预发布）；本轮功能分支 `feat/0.1.22-ui-fixes` 已合回 beta。
 - **本机安装**：已用 `dist\room-watch-0.1.22-setup.exe` 覆盖安装，`VERSION` 与
   卸载项均显示 0.1.22；配置、本人模板与抓拍/录像数据保留。
 - **已完成（0.1.22）**：更新通道代次与保存后重查、底栏/设置页版面修复、
   保存提示保留、构建自检扩成九个设置页 × 两档尺寸；真机发现并修复
   guardian 与 `guard --once` 双起 watcher、安装器失败不回显两个问题。
-- **真机验证**：安装后 `rw start` 只有一个 watcher（PID 21212）与一个 guardian，
-  gallery 正常；`room-watch.exe --selftest` 通过；更新检查返回「测试版通道」；
-  保存提示保留；九页两档尺寸无裁切（详见 `ui-check/` 与 `var/logs/gui-selftest.log`）。
+- **真机验证**：安装后 `rw start` 只有一个 watcher 与一个 guardian，gallery 正常；
+  `room-watch.exe --selftest` 通过；更新检查返回「测试版通道」；保存提示保留；
+  九页两档尺寸无裁切（详见 `ui-check/` 与 `var/logs/gui-selftest.log`）。
+- **已发布**：`v0.1.22-beta`（prerelease，tag 指向 `4b801d7`）：
+  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.1.22-beta
+  资产 `room-watch-0.1.22-setup.exe` + `.sha256`；简介取自 CHANGELOG。
 - **未做**：托盘（需 pystray + 真机）、M6 平台抽象、干净机器安装验证。
-- **下一步**：所有者确认后把 `feat/0.1.22-ui-fixes` 合回 `beta` 并推送；
-  推送远程默认打 tag + 发 Release（beta 预发布）。稳定后再合 `main`、发 stable。
+- **下一步**：观察 0.1.22 真机运行与后续自动更新；稳定后升修订号合 `main`，
+  从 `main` 发 stable。发版仍需所有者明确同意。
 - **详细交接**：`docs/handoff/2026-10-19-session.md`（第 18 节为 0.1.21）、
   `docs/handoff/2026-10-20-next-session.md`（下一轮入口）；新会话入口 `CLAUDE.md`。
