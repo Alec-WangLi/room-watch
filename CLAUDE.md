@@ -19,9 +19,8 @@
   `C:\Users\Alec\.workbuddy\binaries\python\envs\default\Scripts\python.exe`；
   默认 `python` 可能没有 cv2，以 `rw doctor` 为准。
 
-当前状态速览：`main` = 0.1.12（M0–M1），`beta` = 0.1.17（M2 + M3，
-已发预发布 `v0.1.17-beta`）。0.1.18（M5 产品化 + 事件过滤 + 稳定性）在
-`feat/0.1.18-productization`；0.1.19 真机反馈修补（设置按钮/声音重试/时间戳命名）
-在 `fix/0.1.19-ui-voice-naming`，均待推送与真机验收。
+当前状态速览：`main` = 0.1.12（M0–M1），`beta` = 0.1.19（含 v0.1.19-beta
+预发布）。当前开发分支 `feat/0.1.20-update-channel`：自动更新可选稳定版/测试版
+通道（0.1.20，待推送与真机验收）。
 发版通道：稳定版从 `main` 走 plain Release，测试版从 `beta` 走 prerelease
 （`scripts/release.py --channel stable|beta`）；发版需所有者明确同意。

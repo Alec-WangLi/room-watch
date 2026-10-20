@@ -361,11 +361,22 @@ rw test --fast   # 跳过最慢的集成测试（约 55 秒）
 界面启动时也会按 `update.check_interval_hours`（默认 24 小时）在后台静默查一次，
 结果缓存在 `var/state/update.json`；**只提示，不自动安装**。
 
+**更新通道**在「设置 → 更新」里选：
+
+- `stable`（默认）：只收 GitHub 正式 Release，行为最稳。
+- `beta`：连测试版预发布一起收，尝鲜用；同一版本同时有稳定版时优先稳定版。
+  切换后旧检查缓存会被清掉，下次检查立即按新通道执行。
+
+```bash
+rw update --channel beta   # 临时按测试版通道检查/更新
+```
+
 命令行等价写法：
 
 ```bash
 rw update            # 检查并在允许时直接安装
 rw update --check    # 只看有没有新版，不下载
+rw update --channel stable|beta  # 选择更新通道（也可写在 config.local.yaml）
 rw update --yes      # 允许跨次版本（0.1.4 → 0.2.0）
 rw update --force    # 允许降级（回滚排障用）
 rw update --json     # 机器可读（一行 JSON，隐含 --check，界面用）

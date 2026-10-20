@@ -158,6 +158,11 @@ git push origin main --tags
 `rw update`（或 `rw update --check`）：
 
 1. 先请求 `api.github.com/repos/<repo>/releases/latest`；
+   - 客户端默认走 `stable` 通道（即上面这条）。
+   - 设置 → 更新里切到 `beta` 后，改为请求 `/releases?per_page=30`，
+     把预发布也纳入比较；同一版本同时存在稳定版与测试版时优先稳定版。
+     API 被限流时退回 `releases.atom`（不耗配额、包含预发布），
+     安装包地址按固定命名约定拼，SHA256 仍从 `.sha256` 资产校验。
 2. 遇到 403/429（匿名 API 60 次/小时被打满）**自动退回**网页重定向
    `github.com/<repo>/releases/latest`，从 302 的 `Location` 里取 tag，不耗配额；
 3. 版本比对后按纪律处置：
