@@ -78,6 +78,10 @@ from .speaker import Speaker
 
 log = logging.getLogger("room-watch")
 
+# 人进来后最多重试找脸多久。够他走到镜头前转个身，又不会在长期停留时
+# 每秒跑一次人脸检测。
+VOICE_RETRY_SECONDS = 30.0
+
 # 采集源解析（USB / RTSP / 文件）已搬到 camera.py。
 # 主循环只面对 cap 对象，不再关心背后是哪个后端。
 
@@ -371,6 +375,9 @@ class Watcher:
         self.frames = 0
         self.last_spoke_at = None
         self.spoke_this_event = False
+        # 有人进来但一开始没正脸时，最多重试找脸多久（秒）。
+        self.voice_retry_started_at = None
+        self.last_voice_check_at = None
         self.empty_streak = 0
         # 连续这么久没检测到人，才算「这一波人走了」，语音重新武装。
         # 否则人一直站在原地，每 90 秒就会被自己的监控播报一次。
@@ -553,7 +560,12 @@ class Watcher:
         return img
 
     def save_snapshot(self, frame, dets: list, when: datetime) -> str:
-        path = snapshot_path(self.snap_dir, when)
+        # 录像开始于 ACTION_START，抓拍发生在 ACTION_FIRE，两者天然差几秒。
+        # 用录像的文件名做抓拍名，照片和录像才配成一对；没有录像时回退到时间戳。
+        if self.current_video:
+            path = os.path.splitext(self.current_video)[0] + ".jpg"
+        else:
+            path = snapshot_path(self.snap_dir, when)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         img = self.annotate(frame, dets, when) if self.draw_boxes else frame
         ok = cv2.imwrite(path, img, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
@@ -700,11 +712,14 @@ class Watcher:
             # 退出路径上写文件失败不能反过来把进程搞挂
             pass
 
-    def maybe_speak(self, frame, dets: list, now: datetime) -> None:
+    def maybe_speak(
+        self, frame, dets: list, now: datetime, *, force_check: bool = False
+    ) -> None:
         """有人进入时，对现场的人播报语音提示。
 
         只在「确认有人」之后调用。require_face 为真时会先找脸，
         找到才开口——对着背影说话没有意义，也容易误伤路过的人。
+        force_check=True 用于事件期间的定时重试：不再受每隔 N 帧的限制。
         """
         if not self.speaker.enabled or self.spoke_this_event:
             return
@@ -712,7 +727,7 @@ class Watcher:
         face_found = False
         if self.require_face:
             # 人脸检测不必每帧都跑，隔几帧一次，省 CPU
-            if self.frames % self.face_every_n != 0:
+            if not force_check and self.frames % self.face_every_n != 0:
                 return
             faces = self.face_finder.find(frame, dets)
             face_found = len(faces) > 0
@@ -730,6 +745,27 @@ class Watcher:
         self.last_spoke_at = now
         self.spoke_this_event = True
         log.info("语音提示已触发（检测到人脸: %s）", "是" if face_found else "否")
+
+    def retry_voice(self, frame, dets: list, now: datetime) -> None:
+        """人已经在画面里但还没出声时，定时重试找脸。
+
+        真实场景：人推门进来时背对镜头，走两步才转身。只在触发那几帧
+        找脸会错过正脸；这里在事件开始后的 30 秒内每秒重试一次，
+        看到脸就播报。仍然遵守冷却、本人静默与 require_face 规则。
+        """
+        if not dets or self.spoke_this_event:
+            return
+        if self.is_owner_event() or self.last_identity_label == LABEL_OWNER:
+            return
+        if self.voice_retry_started_at is None:
+            self.voice_retry_started_at = now
+        elif (now - self.voice_retry_started_at).total_seconds() > VOICE_RETRY_SECONDS:
+            return
+        if (self.last_voice_check_at is not None
+                and (now - self.last_voice_check_at).total_seconds() < 1.0):
+            return
+        self.last_voice_check_at = now
+        self.maybe_speak(frame, dets, now, force_check=True)
 
     # ---------- 录像 ----------
 
@@ -818,7 +854,8 @@ class Watcher:
         if not self.notify_allowed():
             return
         when = self.last_event_at
-        stamp = when.strftime("%H:%M:%S") if when else os.path.basename(video_path)[:6]
+        stamp = (when.strftime("%H:%M:%S") if when
+                 else os.path.splitext(os.path.basename(video_path))[0])
         mb = os.path.getsize(video_path) / 1048576
         event_id = when.isoformat() if when else datetime.now().isoformat()
         items = build_items(
@@ -1134,6 +1171,8 @@ class Watcher:
                     self.empty_streak += 1
                     if self.empty_streak >= self.empty_reset_frames:
                         self.spoke_this_event = False
+                        self.voice_retry_started_at = None
+                        self.last_voice_check_at = None
                         self.empty_streak = 0
                         # 人都走了：解除「本人已确认」。不重置的话，
                         # 你自己进来一次之后，接下来所有人都会被当成你——这是最危险的失效。
@@ -1196,6 +1235,7 @@ class Watcher:
                     if not self.is_owner_event():
                         self.start_recording(dets, now)
 
+                self.retry_voice(frame, dets, now)
                 self.pump_recording(frame, dets, now)
                 self.enforce_storage(now)
                 self.maybe_heartbeat(now)

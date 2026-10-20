@@ -17,9 +17,10 @@ import json
 import tempfile
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -48,6 +49,26 @@ class FakeRecorder:
         self.stopped.append(reason)
         self.recording = False
         return None
+
+
+class FakeSpeaker:
+    enabled = True
+
+    def __init__(self):
+        self.said = 0
+
+    def say(self):
+        self.said += 1
+
+
+class FakeFaces:
+    def __init__(self, faces):
+        self.faces = faces
+        self.calls = 0
+
+    def find(self, frame, dets):
+        self.calls += 1
+        return self.faces
 
 
 class WatcherPolicyTest(unittest.TestCase):
@@ -166,6 +187,69 @@ class WatcherPolicyTest(unittest.TestCase):
             self.assertEqual(w.outbox.pending_count(), 1)
         finally:
             w.outbox.close()
+
+    # ---------- 声音重试与文件名 ----------
+
+    def _voice_watcher(self, faces):
+        w = Watcher.__new__(Watcher)
+        w.speaker = FakeSpeaker()
+        w.face_finder = FakeFaces(faces)
+        w.spoke_this_event = False
+        w.require_face = True
+        w.face_every_n = 3
+        w.frames = 1
+        w.voice_cooldown = 60.0
+        w.last_spoke_at = None
+        w.volume_mode = "off"
+        w.last_identity_label = "other"
+        w.voice_retry_started_at = None
+        w.last_voice_check_at = None
+        w.is_owner_event = lambda: False
+        return w
+
+    def test_retry_voice_speaks_when_face_appears_later(self):
+        """人先背对镜头、后面转过脸：重试要找得到这张脸并出声。"""
+        w = self._voice_watcher([object()])
+        Watcher.retry_voice(w, object(), [object()], self.now)
+        self.assertEqual(w.speaker.said, 1)
+        self.assertTrue(w.spoke_this_event)
+        self.assertEqual(w.face_finder.calls, 1)
+
+    def test_retry_voice_waits_one_second_between_checks(self):
+        w = self._voice_watcher([])
+        Watcher.retry_voice(w, object(), [object()], self.now)
+        self.assertEqual(w.face_finder.calls, 1)
+        Watcher.retry_voice(w, object(), [object()], self.now + timedelta(seconds=0.5))
+        self.assertEqual(w.face_finder.calls, 1)
+        Watcher.retry_voice(w, object(), [object()], self.now + timedelta(seconds=1.1))
+        self.assertEqual(w.face_finder.calls, 2)
+
+    def test_retry_voice_gives_up_after_window(self):
+        w = self._voice_watcher([object()])
+        w.voice_retry_started_at = self.now - timedelta(seconds=31)
+        Watcher.retry_voice(w, object(), [object()], self.now)
+        self.assertEqual(w.face_finder.calls, 0)
+        self.assertEqual(w.speaker.said, 0)
+
+    def test_retry_voice_respects_owner(self):
+        w = self._voice_watcher([object()])
+        w.is_owner_event = lambda: True
+        Watcher.retry_voice(w, object(), [object()], self.now)
+        self.assertEqual(w.face_finder.calls, 0)
+        self.assertEqual(w.speaker.said, 0)
+
+    def test_snapshot_uses_video_stem_so_photo_and_video_pair(self):
+        w = Watcher.__new__(Watcher)
+        w.snap_dir = str(self.root / "captures")
+        w.draw_boxes = False
+        w.jpeg_quality = 90
+        day = self.root / "captures" / "2026-10-20"
+        day.mkdir(parents=True)
+        w.current_video = str(day / "2026-10-20_094523.mp4")
+        frame = np.zeros((8, 8, 3), np.uint8)
+        with mock.patch("roomwatch.watcher.cv2.imwrite", return_value=True):
+            path = Watcher.save_snapshot(w, frame, [], self.now)
+        self.assertEqual(Path(path), day / "2026-10-20_094523.jpg")
 
     # ---------- 状态文件 ----------
 

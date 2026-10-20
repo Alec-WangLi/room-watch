@@ -127,6 +127,28 @@ class TestRenderWithVideo(GalleryFixture):
         self.assertEqual(len(days[0][1]), 2)
 
 
+class TestTimestampNames(unittest.TestCase):
+    def test_stem_time_label_handles_old_and_new_names(self):
+        self.assertEqual(gallery.stem_time_label("094523"), "09:45:23")
+        self.assertEqual(gallery.stem_time_label("2026-10-20_094523"), "09:45:23")
+        self.assertEqual(gallery.stem_time_label("other"), "other")
+
+    def test_full_timestamp_photo_and_video_pair_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            captures = os.path.join(tmp, "captures")
+            day = os.path.join(captures, "2026-10-20")
+            os.makedirs(day)
+            with open(os.path.join(day, "2026-10-20_094523.jpg"), "wb") as f:
+                f.write(b"\xff\xd8\xff\xe0fake-jpeg")
+            make_video(os.path.join(day, "2026-10-20_094523.mp4"))
+            days = gallery.collect(captures)
+        self.assertEqual(len(days), 1)
+        img, label, vid = days[0][1][0]
+        self.assertEqual(label, "09:45:23")
+        self.assertTrue(img.endswith("2026-10-20_094523.jpg"))
+        self.assertTrue(vid.endswith("2026-10-20_094523.mp4"))
+
+
 class TestRangeRequests(GalleryFixture):
     """真的起一个服务打 HTTP——Range 对了才拖得动进度条。"""
 

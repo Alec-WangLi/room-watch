@@ -296,7 +296,10 @@ class TestStatusAfterHardKill(unittest.TestCase):
 class TestArchive(unittest.TestCase):
     def test_snapshot_path_layout(self):
         p = snapshot_path("captures", datetime(2026, 10, 16, 14, 23, 5))
-        self.assertEqual(os.path.normpath(p), os.path.normpath("captures/2026-10-16/142305.jpg"))
+        self.assertEqual(
+            os.path.normpath(p),
+            os.path.normpath("captures/2026-10-16/2026-10-16_142305.jpg"),
+        )
 
     def test_prune_removes_expired_days(self):
         base = tempfile.mkdtemp()

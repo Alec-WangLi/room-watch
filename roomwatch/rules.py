@@ -325,9 +325,13 @@ def is_stale(last_frame_at: Optional[datetime], now: datetime, tolerance_seconds
 
 
 def snapshot_path(base_dir: str, when: datetime) -> str:
-    """按 日期目录/时分秒.jpg 归档。"""
+    """按 日期目录/完整时间戳.jpg 归档。
+
+    文件名带完整日期：相册里一眼能看出是哪天几点，按名字排序也天然是
+    时间顺序。日期目录保留，方便按天清理。
+    """
     day = when.strftime("%Y-%m-%d")
-    name = when.strftime("%H%M%S") + ".jpg"
+    name = when.strftime("%Y-%m-%d_%H%M%S") + ".jpg"
     return os.path.join(base_dir, day, name)
 
 

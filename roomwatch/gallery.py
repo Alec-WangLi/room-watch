@@ -158,6 +158,23 @@ VIDEO_ONLY_HTML = (
 )
 
 
+_STEM_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}_(\d{2})(\d{2})(\d{2})$")
+
+
+def stem_time_label(stem: str) -> str:
+    """文件名 stem → 相册上显示的时间。
+
+    兼容两代命名：老文件 094523，新文件 2026-10-20_094523。
+    日期由所在日期目录表达，所以这里只显示时分秒。
+    """
+    if len(stem) == 6 and stem.isdigit():
+        return f"{stem[0:2]}:{stem[2:4]}:{stem[4:6]}"
+    match = _STEM_TIME.match(stem)
+    if match:
+        return ":".join(match.groups())
+    return stem
+
+
 def collect(captures_dir: str):
     """返回 [(日期, [(图片, 时间, 录像)])]，按日期倒序。
 
@@ -191,11 +208,7 @@ def collect(captures_dir: str):
             slot = pairs[stem]
             if not slot["img"] and not slot["video"]:
                 continue
-            label = (
-                f"{stem[0:2]}:{stem[2:4]}:{stem[4:6]}"
-                if len(stem) >= 6 and stem.isdigit()
-                else stem
-            )
+            label = stem_time_label(stem)
             items.append((slot["img"], label, slot["video"]))
         if items:
             days.append((entry, items))
