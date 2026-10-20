@@ -36,6 +36,10 @@
 
 ### 修复
 
+- **录像推送丢队列**（真机 12 小时挂机发现）：录像合完音轨后的回调运行在
+  `audio-merge` 线程，复用了主线程的 SQLite 连接，触发「SQLite objects created
+  in a thread can only be used in that same thread」，video 项没有入队——
+  文字/图片照常送达，只有录像静默丢失。现在异步入队改用本线程独立连接并加锁。
 - **配置错误分类**：`detector.imgsz: abc` 一类笔误现在按配置错误（退出码 2）
   退出，不再落进「未处理异常」并触发崩溃统计。
 - **卡死重启**：心跳停摆但进程仍活着时，先走 `stop.request` 优雅停止，

@@ -15,6 +15,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from roomwatch.outbox import OutboxStore
 from roomwatch.rules import OWNER_KEEP, OWNER_MUTE, OWNER_SKIP
 from roomwatch.watcher import Watcher
 
@@ -134,6 +136,36 @@ class WatcherPolicyTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             Watcher({"detector": {"imgsz": "abc"}})
         self.assertEqual(ctx.exception.code, health.EXIT_CONFIG)
+
+    # ---------- 跨线程入队 ----------
+
+    def test_enqueue_from_merge_thread_uses_its_own_connection(self):
+        """录像合完音轨后的回调在 audio-merge 线程里入队，不能复用主线程连接。"""
+        w = Watcher.__new__(Watcher)
+        w.outbox_path = str(self.root / "outbox.db")
+        w.outbox = OutboxStore(w.outbox_path)
+        w._outbox_thread = threading.get_ident()
+        w._outbox_lock = threading.Lock()
+        seen = {}
+
+        def work():
+            seen["n"] = Watcher.enqueue_notification(w, [{
+                "channel": "wecom_bot",
+                "kind": "video",
+                "severity": "event",
+                "payload": {"video_path": "x.mp4"},
+                "event_id": "e1",
+                "dedupe_key": "e1:wecom_bot:video",
+            }])
+
+        try:
+            worker = threading.Thread(target=work)
+            worker.start()
+            worker.join(timeout=10)
+            self.assertEqual(seen.get("n"), 1)
+            self.assertEqual(w.outbox.pending_count(), 1)
+        finally:
+            w.outbox.close()
 
     # ---------- 状态文件 ----------
 

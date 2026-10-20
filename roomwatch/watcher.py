@@ -307,6 +307,11 @@ class Watcher:
             media_dir = Path(resolve(str(media_dir)))
         self.outbox_media = str(media_dir)
         self.outbox = OutboxStore(self.outbox_path)
+        # outbox 连接属于创建它的线程。录像合并回调在 audio-merge 线程里
+        # 调 push_video，若直接复用主线程的连接，sqlite3 会拒绝（跨线程使用）。
+        # 记下主线程，异步入队时临时开一条本线程的连接。
+        self._outbox_thread = threading.get_ident()
+        self._outbox_lock = threading.Lock()
         self.dispatcher = ChannelDispatcher(self.notify_cfg, self.outbox_media)
         max_age_days = float(outbox_cfg.get("max_age_days", 7))
         max_total_bytes = int(float(outbox_cfg.get("max_total_mb", 2048)) * 1024 * 1024)
@@ -444,11 +449,30 @@ class Watcher:
         return allow_record(self.owner_policy, self.user_is_active())
 
     def enqueue_notification(self, items: list[dict]) -> int:
-        """把一批通知写进 outbox。数据库故障只降级为「本次没入队」，不拖垮监控。"""
+        """把一批通知写进 outbox。数据库故障只降级为「本次没入队」，不拖垮监控。
+
+        可能被主循环调用，也可能被 audio-merge 线程的完成回调调用
+        （视频合完音轨后再入队）。SQLite 连接不能跨线程共享，所以后者
+        临时开一条属于自己的连接；锁把两条路径的写入串起来。
+        """
         if not items:
             return 0
+        lock = getattr(self, "_outbox_lock", None)
+        owner = getattr(self, "_outbox_thread", None)
         try:
-            return self.outbox.enqueue_many(items)
+            if owner is None or threading.get_ident() == owner:
+                if lock is None:
+                    return self.outbox.enqueue_many(items)
+                with lock:
+                    return self.outbox.enqueue_many(items)
+            store = OutboxStore(self.outbox_path)
+            try:
+                if lock is None:
+                    return store.enqueue_many(items)
+                with lock:
+                    return store.enqueue_many(items)
+            finally:
+                store.close()
         except Exception as exc:  # noqa: BLE001 - 通知层故障不能影响采集
             log.warning("写入通知队列失败: %s", exc)
             return 0
