@@ -549,6 +549,17 @@ room-watch-<版本>\
 - gallery 用 `gallery.pid` + 命令行（必须同时含 `roomwatch` 与 `gallery`）判活，
   PID 复用不会误杀；挂了由 guardian 拉起并写历史。
 
+### F.25 Agent 的 Bash 工具和真实会话不是同一个注册表
+
+- Claude 桌面端的 Bash 工具跑在隔离命名空间：**文件写入是真实的，HKCU 注册表
+  写入不落用户会话**。
+- 2026-10-20 实测：从 Bash 跑 0.1.22 安装器后，真实安装目录 `VERSION` 已是
+  0.1.22，但用户 PowerShell、卸载工具和真实终端里的 `reg query` 仍是 0.1.20。
+  同一个路径、同一个用户、同一个会话，Bash 里读到的却是 0.1.22。
+- **安装器、更新器、卸载项验证必须通过终端面板（真实用户会话）执行**；
+  Bash 里的 `dangerouslyDisableSandbox` 不改变注册表命名空间。
+- 文件、进程、摄像头仍可在 Bash 里验证；注册表和“已安装版本”要在真实会话复核。
+
 ---
 
 ## G. Git、隐私与钩子

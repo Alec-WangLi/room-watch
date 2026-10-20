@@ -13,6 +13,9 @@
   资产 `room-watch-0.1.22-setup.exe` + `.sha256`；简介取自 CHANGELOG。
 - 本机安装：`%LocalAppData%\Programs\room-watch`，`VERSION` 与卸载项均为
   0.1.22；更新通道 beta；监控、guardian、gallery 正常运行。
+  **注意**：0.1.22 安装器最后是从终端面板（真实用户会话）重跑了一遍，
+  因为 Agent 的 Bash 工具写注册表落在隔离命名空间（见第 5 节）；真实注册表
+  已用用户 PowerShell 的 `reg query` 和 `Get-Package` 复核为 0.1.22。
 - 安装包：`dist\room-watch-0.1.22-setup.exe`（143.1 MB）、
   `dist\room-watch-0.1.22.zip`（177.1 MB）。
 
@@ -58,6 +61,10 @@
   （Inno：`%LocalAppData%\Programs\Inno Setup 6\ISCC.exe`）。
 - **Git Bash 里不要用 `/VERYSILENT` 直接跑安装包**（会被路径转换吃掉）；
   用 PowerShell `Start-Process -ArgumentList` 传参。
+- **Agent 的 Bash 工具在隔离注册表命名空间**：文件写入共享，HKCU 写入不落
+  用户会话。安装器/更新器必须从**终端面板**（真实会话）跑；装完在真实
+  PowerShell 里用 `reg query` 或 `Get-Package` 复核卸载项版本。
+  `dangerouslyDisableSandbox` 不改变这一点。
 - 发版：`scripts/release.py --channel beta|stable`；简介自动取 CHANGELOG。
 - 凭据只用 `git credential fill` 或 `GH_TOKEN`，不要打印。
 
