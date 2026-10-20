@@ -294,7 +294,7 @@ room-watch-<版本>\
 
 | 文件 | 用例数 | 命令 | 需要什么 |
 |---|---:|---|---|
-| `test_logic.py` | 56 | `python tests/test_logic.py` | 纯标准库 |
+| `test_logic.py` | 80 | `python tests/test_logic.py` | 纯标准库 |
 | `test_loudness.py` | 32 | `python tests/test_loudness.py` | numpy |
 | `test_recorder.py` | 19 | `python tests/test_recorder.py` | cv2，真写视频（约 3 秒） |
 | `test_gallery.py` | 18 | `python tests/test_gallery.py` | cv2，真起 HTTP（约 17 秒，占 8765） |
@@ -305,7 +305,7 @@ room-watch-<版本>\
 | `test_config.py` | 14 | `python tests/test_config.py` | 临时配置文件 |
 | `test_setup_push.py` | 10 | `python tests/test_setup_push.py` | 纯逻辑，不联网 |
 | `test_notifier.py` | 10 | `python tests/test_notifier.py` | 纯逻辑，HTTP 全 mock |
-| `test_integration.py` | 6 | `python tests/test_integration.py` | 假摄像头 + 假检测器（约 55 秒） |
+| `test_integration.py` | 8 | `python tests/test_integration.py` | 假摄像头 + 假检测器（约 55 秒） |
 | `test_cli.py` | 18 | `python tests/test_cli.py` | 纯逻辑，不启进程 |
 | `test_paths.py` | 12 | `python tests/test_paths.py` | 纯逻辑 |
 | `test_gui_state.py` | 15 | `python tests/test_gui_state.py` | 临时状态库，不建窗口 |
@@ -348,6 +348,12 @@ room-watch-<版本>\
 - **现象**（若写错）：人进屋后站着不动，帧差归零 → 不推理 → 20 秒后录像被判「人走了」收尾。
 - **正解**：三道保险缺一不可——`busy`（录像中/刚检测到人）时无条件推理；
   空闲时每 `gate.force_every_seconds` 至少推理一次；门控只决定跑不跑模型，不改检测语义。
+- **0.2.1 唯一例外**：身份已确认是本人、画面里一直有人且没在录像时，
+  `rules.OwnerInferenceThrottle` 会把推理降到每秒 2 次
+  （`gate.owner_interval_seconds`，0 = 关闭）。录像中、身份未确认、
+  画面空了都必须立刻回到全速；降频期间沿用上一次检测框，
+  不能让规则层误判「人走了」。`test_logic.py::TestOwnerInferenceThrottle`
+  与 `test_integration.py` 钉住这些边界。
 - **改动 gate.py 后必须跑** `tests/test_gate.py`，里面直接钉了这四条行为。
 
 ### F.3 运行时不许把 torch 拉回来
@@ -747,6 +753,9 @@ room-watch-<版本>\
   （PID 40228，`/healthz` ok）。通知类设置保存后需重启 watcher+guardian，
   界面会提示「需要重启」；热更新只覆盖语音。
 - **待所有者操作**：CI 工作流粘贴（token 缺 workflow scope）。
+- **0.2.1 开发中**（`feat/0.2.1-owner-throttle`，从 `beta` 切出，未合并）：
+  本人在场且未录像时推理降到每秒 2 次（`gate.owner_interval_seconds`）；
+  全量 `rw test` 通过，尚未打包与真机复测。
 - **未做**：干净机器安装验证、托盘（pystray + 真机）、M6 平台抽象。
 - **详细交接**：`docs/handoff/2026-10-20-next-session.md`（第 8 节为 0.2.0）；
   新会话入口 `CLAUDE.md`。

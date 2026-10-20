@@ -28,6 +28,7 @@ gate:
   min_changed_ratio: 0.004  # 变化像素占比达到 0.4% 才唤醒
   force_every_seconds: 3.0  # 再静也至少每 3 秒推理一次（站着不动的人靠这个发现）
   idle_grace_seconds: 4.0   # 刚检测到人后的 4 秒内全速推理
+  owner_interval_seconds: 0.5  # 本人在场且没录像时，最多每 0.5 秒推理一次；0 = 不降频
 
 detector:
   engine: auto      # auto = 有 ONNX 就用 ONNX，否则退回 torch

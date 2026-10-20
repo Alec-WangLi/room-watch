@@ -126,3 +126,18 @@
   要数小时），重开连接后达到 629 KB/s（约 4 分钟下完）。GUI 更新若长时间
   停在低速，取消后重试即可；不要改 updater 的重试逻辑。
 - **待办**：CI 启用；干净机器验证；托盘；M6。
+
+## 9. 0.2.1 资源优化（进行中，2026-10-20 深夜）
+
+- 分支 `feat/0.2.1-owner-throttle`（从 `beta` 切出），未合并、未打包、未发版。
+- 内容：本人在场、画面里有人且未录像时，推理降到每秒 2 次
+  （`gate.owner_interval_seconds`，默认 0.5，0 = 关闭）；录像中、身份未确认、
+  画面空了仍全速。背景数据：真机 0.2.0 空闲 10 分钟 5749 帧全部推理，
+  进程约 1.3 核，原因是门控的 busy 被本人每一帧续期。
+- 实现：`rules.OwnerInferenceThrottle` + watcher 主循环；降频期间沿用
+  上一次检测框，规则层不会误判「人走了」；状态里 `gated.owner_throttled`
+  可直接观察被跳过的帧数。
+- 测试：`test_logic.py::TestOwnerInferenceThrottle`（6 项）+
+  `test_integration.py::test_owner_present_throttles_inference`；
+  全量 `rw test` 通过（2026-10-20 实测）。
+- 待办：打包后装到真机对比 CPU；确认无回归再合回 `beta`。

@@ -35,6 +35,7 @@ from .rules import (
     STORAGE_OVER,
     STORAGE_WARNING,
     Detection,
+    OwnerInferenceThrottle,
     RecordPolicy,
     TriggerState,
     allow_notify,
@@ -251,7 +252,15 @@ class Watcher:
         self.detector_cfg = det
         self.model_name = det.get("model", "yolov8n.pt")
         # 静止门控：空房间不推理。事件期间自动旁路，见 gate.py 的说明。
-        self.gate = MotionGate(cfg.get("gate") or {})
+        gate_cfg = cfg.get("gate") or {}
+        self.gate = MotionGate(gate_cfg)
+        # 本人在场且没在录像时降频推理，见 rules.OwnerInferenceThrottle。
+        self.owner_throttle = OwnerInferenceThrottle(
+            float(gate_cfg.get("owner_interval_seconds", 0.5))
+        )
+        self.owner_inference_throttled = 0
+        self._last_dets: list = []
+        self._last_infer_mono = 0.0
         self.last_detection_at = None
         self.detect_errors = 0
         self.det_conf = float(det.get("conf", 0.5))
@@ -438,6 +447,7 @@ class Watcher:
             )
             return False
         self.gate.reset()  # 重连后画面尺寸可能变了，丢掉旧参考帧
+        self._last_dets = []  # 旧检测框的坐标已经不可信
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         log.info(
@@ -638,7 +648,8 @@ class Watcher:
             "camera_ok": camera_ok,
             "camera_source": self.camera_spec.label,
             "engine": getattr(self.detector, "name", None),
-            "gated": self.gate.stats(),
+            "gated": {**self.gate.stats(),
+                      "owner_throttled": getattr(self, "owner_inference_throttled", 0)},
             "frames": self.frames,
             "events_today": self.events_today,
             "recording": self.recorder.recording,
@@ -1329,11 +1340,25 @@ class Watcher:
                     self.last_detection_at is not None
                     and (mono - self.last_detection_at) < self.gate.idle_grace
                 )
-                if self.gate.should_infer(frame, mono, busy):
+                throttled = self.owner_throttle.should_throttle(
+                    mono,
+                    self._last_infer_mono,
+                    owner_present=self.owner_tracker.owner_present,
+                    person_present=bool(self._last_dets),
+                    recording=self.recorder.recording,
+                )
+                if throttled:
+                    # 沿用上一次检测框，别让规则层以为「人突然没了」。
+                    self.owner_inference_throttled += 1
+                    dets = self._last_dets
+                elif self.gate.should_infer(frame, mono, busy):
                     dets = self.detect(frame)
                     self.last_inference_at = now
+                    self._last_infer_mono = mono
+                    self._last_dets = dets
                 else:
                     dets = []
+                    self._last_dets = []
                 if dets:
                     self.last_detection_at = mono
                 h, w = frame.shape[:2]
