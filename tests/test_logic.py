@@ -29,6 +29,7 @@ from roomwatch.rules import (
     STORAGE_OVER,
     STORAGE_UNLIMITED,
     STORAGE_WARNING,
+    OwnerInferenceThrottle,
     RecordPolicy,
     allow_notify,
     allow_record,
@@ -600,6 +601,44 @@ class TestOwnerPolicy(unittest.TestCase):
         for policy in (OWNER_KEEP, OWNER_MUTE, OWNER_SKIP):
             self.assertTrue(allow_record(policy, False))
             self.assertTrue(allow_notify(policy, False))
+
+
+class TestOwnerInferenceThrottle(unittest.TestCase):
+    """本人在场且没在录像时，推理降到每秒一两次；不确定就回到全速。"""
+
+    def make(self, interval: float = 0.5) -> OwnerInferenceThrottle:
+        return OwnerInferenceThrottle(interval_seconds=interval)
+
+    def test_owner_present_within_interval_is_throttled(self):
+        self.assertTrue(self.make().should_throttle(
+            10.0, 9.8, owner_present=True, person_present=True, recording=False,
+        ))
+
+    def test_interval_elapsed_runs_inference(self):
+        self.assertFalse(self.make().should_throttle(
+            10.0, 9.5, owner_present=True, person_present=True, recording=False,
+        ))
+
+    def test_recording_never_throttles(self):
+        """录像中每帧都要推理，不能为了省 CPU 丢事件证据。"""
+        self.assertFalse(self.make().should_throttle(
+            10.0, 9.9, owner_present=True, person_present=True, recording=True,
+        ))
+
+    def test_unknown_identity_never_throttles(self):
+        self.assertFalse(self.make().should_throttle(
+            10.0, 9.9, owner_present=False, person_present=True, recording=False,
+        ))
+
+    def test_no_person_never_throttles(self):
+        self.assertFalse(self.make().should_throttle(
+            10.0, 9.9, owner_present=True, person_present=False, recording=False,
+        ))
+
+    def test_zero_interval_disables_throttle(self):
+        self.assertFalse(self.make(0).should_throttle(
+            10.0, 10.0, owner_present=True, person_present=True, recording=False,
+        ))
 
 
 class TestStorageSummary(unittest.TestCase):

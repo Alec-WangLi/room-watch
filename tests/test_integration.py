@@ -35,6 +35,7 @@ import cv2
 import numpy as np
 
 from roomwatch import watcher
+from roomwatch.identity import LABEL_OWNER
 from roomwatch.rules import Detection
 
 SIZE = (320, 180)
@@ -102,8 +103,10 @@ class ScriptedModel:
 
     def __init__(self, cam: ScriptedCamera):
         self.cam = cam
+        self.calls = 0
 
     def detect(self, frame, **_kw):
+        self.calls += 1
         if not self.cam.current:
             return []
         return [Detection(x1=60.0, y1=20.0, x2=260.0, y2=170.0, conf=0.93)]
@@ -166,13 +169,15 @@ class FullRunTest(unittest.TestCase):
             "record": record,
         }
 
-    def _run(self, plan, **record_over):
+    def _run(self, plan, identify=None, **record_over):
         cfg = self._config(**record_over)
         w = watcher.Watcher(cfg, dry_run=True)
         cam = ScriptedCamera(plan)
 
         w.open_camera = lambda: (setattr(w, "cap", cam), True)[1]
         w.load_model = lambda: setattr(w, "detector", ScriptedModel(cam))
+        if identify is not None:
+            w.identify = lambda frame, dets: identify
         try:
             w.run()
         except KeyboardInterrupt:
@@ -272,6 +277,18 @@ class FullRunTest(unittest.TestCase):
 
         self.assertGreaterEqual(w.record_policy.total_recorded, 3.0)
         self.assertFalse(w.recorder.recording)
+
+    def test_owner_present_throttles_inference(self):
+        """本人一直在画面里：确认身份后推理降频，不再每帧跑 YOLO。"""
+        plan = [False] * 5 + [True] * 90
+        w, _cfg = self._run(plan, identify=LABEL_OWNER)
+
+        self.assertTrue(w.owner_tracker.owner_present, "测试前提：本人状态应当已确认")
+        self.assertGreater(w.owner_inference_throttled, 0, "应当有被降频跳过的帧")
+        self.assertLess(
+            w.detector.calls, 60,
+            f"95 帧里推理了 {w.detector.calls} 次，降频没有生效",
+        )
 
     def test_health_and_exit_record_are_written(self):
         w, cfg = self._run([False] * 5 + [True] * 5)

@@ -434,6 +434,33 @@ def allow_notify(policy: str, user_active: bool) -> bool:
     return policy == OWNER_KEEP or not user_active
 
 
+class OwnerInferenceThrottle:
+    """本人在场、又没在录像时，把推理降到每秒一两次。
+
+    MotionGate 的 busy 规则是「刚检测到人就全速」，但人（通常就是本人）
+    一直坐在画面里，每帧检测都会把 busy 续期，门控永远轮不到生效，
+    YOLO 于是每帧都跑。这里只在身份已确认是本人、画面里确实有人、
+    且没有在录像时降频；其余情况一律全速，宁可多算不可漏报。
+    """
+
+    def __init__(self, interval_seconds: float = 0.5) -> None:
+        self.interval = max(0.0, float(interval_seconds))
+
+    def should_throttle(
+        self,
+        now: float,
+        last_infer_at: float,
+        *,
+        owner_present: bool,
+        person_present: bool,
+        recording: bool,
+    ) -> bool:
+        """now / last_infer_at 用单调时钟秒（time.monotonic）。"""
+        if self.interval <= 0 or recording or not owner_present or not person_present:
+            return False
+        return (now - last_infer_at) < self.interval
+
+
 def storage_forecast(
     files: Iterable[Tuple[float, str, int]],
     now: Optional[datetime] = None,
