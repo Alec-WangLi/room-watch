@@ -19,9 +19,9 @@
   `C:\Users\Alec\.workbuddy\binaries\python\envs\default\Scripts\python.exe`；
   默认 `python` 可能没有 cv2，以 `rw doctor` 为准。
 
-当前状态速览：`main` = 0.1.12（M0–M1），`beta` = 0.1.20（已发
-`v0.1.20-beta`）。当前开发分支 `fix/0.1.21-settings-voice`：语音等身份结论、
-更新/自启/声音设置热更新、主界面显示运行时长、企业微信 Webhook 明文显示
-（0.1.21，待推送与真机验收）。
+当前状态速览：`main` = 0.1.12（M0–M1），`beta` = 0.1.21（已发
+`v0.1.21-beta`）；本机正从 0.1.20 升级到 0.1.21。下一轮先修两个设置界面
+UX 问题（保存提示被刷新覆盖、检查更新与保存的竞态），详见
+`docs/handoff/2026-10-20-next-session.md`。
 发版通道：稳定版从 `main` 走 plain Release，测试版从 `beta` 走 prerelease
 （`scripts/release.py --channel stable|beta`）；发版需所有者明确同意。
