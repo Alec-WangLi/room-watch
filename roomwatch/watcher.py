@@ -1047,15 +1047,15 @@ class Watcher:
         items = build_items(
             getattr(self, "notify_cfg", {}) or {},
             event_id=f"video-failed:{snapshot}",
-            text="录像中断，已回退",
+            text="录像中断，本段已作废",
             severity="critical",
         )
         if not items:
             self._video_failure_notified = True  # 没配渠道也算处理过，避免反复尝试
             return
         try:
-            self.enqueue_notification(items)
-            self._video_failure_notified = True
+            if self.enqueue_notification(items) > 0:
+                self._video_failure_notified = True
         except Exception as exc:  # noqa: BLE001 - 通知失败不影响录像收尾
             log.warning("录像失败通知入队失败: %s", exc)
 
@@ -1097,6 +1097,11 @@ class Watcher:
 
         # 先更新「最后一次看见人」，再判定停止，避免把最后一帧当成离开
         self.record_policy.note(now, bool(dets))
+
+        # 写线程已经死了（磁盘满/ffmpeg 被杀）：立刻收尾，别等到策略超时。
+        if self.recorder.recording and getattr(self.recorder, "failed", False):
+            self.stop_recording("录像写出失败", now)
+            return
 
         if self.recorder.recording:
             self.recorder.observe(self.decorate_video_frame(frame, dets, now), now, bool(dets))

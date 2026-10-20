@@ -13,6 +13,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from roomwatch import bench as B
@@ -45,6 +46,17 @@ class SummarizeSamplesTest(unittest.TestCase):
         summary = B.summarize_samples([{}, {"cpu_pct": None}])
         self.assertEqual(summary["count"], 2)
         self.assertAlmostEqual(summary["cpu_mean"], 0.0)
+
+    def test_age_and_errors_mark_stale(self):
+        samples = [
+            {"cpu_pct": 1.0, "rss_mb": 2.0, "_age_seconds": 10.0,
+             "consecutive_errors": 2},
+            {"cpu_pct": 1.0, "rss_mb": 2.0, "_age_seconds": 0.0,
+             "consecutive_errors": 0},
+        ]
+        summary = B.summarize_samples(samples)
+        self.assertEqual(summary["stale_samples"], 1)
+        self.assertEqual(summary["errors_peak"], 2)
 
 
 class SampleHealthTest(unittest.TestCase):
@@ -80,6 +92,18 @@ class SampleHealthTest(unittest.TestCase):
             sleep=lambda _s: None,
         )
         self.assertEqual(samples, [])
+
+    def test_sample_annotates_snapshot_age(self):
+        times = iter([0.0, 0.0, 1.1])
+        old = (datetime.now() - timedelta(seconds=10)).isoformat()
+        samples = B.sample_health(
+            "ignored", 1.0, 0.5,
+            reader=lambda _path: {"updated_at": old},
+            clock=lambda: next(times),
+            sleep=lambda _s: None,
+        )
+        self.assertEqual(len(samples), 1)
+        self.assertGreater(samples[0]["_age_seconds"], 5)
 
 
 class ReadJsonTest(unittest.TestCase):

@@ -123,6 +123,10 @@ class TestEncoderSelector(unittest.TestCase):
         self.assertEqual(len(probe_calls), 1)
         self.assertEqual(len(validate_calls), 1)
 
+    def test_exclude_skips_failed_candidate(self):
+        sel, _, _ = self._selector()
+        self.assertEqual(sel.choose(exclude={"h264_mf"}), "h264_nvenc")
+
 
 class FakeStdin:
     def __init__(self):
@@ -219,7 +223,8 @@ class FfmpegWriterTest(unittest.TestCase):
             return proc
 
         writer = FfmpegWriter(
-            "ffmpeg", "h264_mf", self.path, (640, 360), 10.0, spawn=spawn, **kw
+            "ffmpeg", "h264_mf", self.path, (640, 360), 10.0, spawn=spawn,
+            probe=lambda _path: True, **kw
         )
         return writer, calls
 
@@ -246,6 +251,7 @@ class FfmpegWriterTest(unittest.TestCase):
         proc = FakeProc(rc=0)
         writer, _ = self._writer(proc)
         writer.open()
+        writer.write(make_frame(0, (640, 360)))
         with open(self.path, "wb") as f:
             f.write(b"fake mp4")
         self.assertTrue(writer.close())
@@ -279,6 +285,31 @@ class FfmpegWriterTest(unittest.TestCase):
         open(self.path, "wb").close()
         self.assertFalse(writer.close())
         self.assertFalse(os.path.exists(self.path))
+
+    def test_zero_frames_is_failure_even_with_small_file(self):
+        """rc=0 但一帧都没写：ffmpeg 会留下几百字节的文件头，这不是录像。"""
+        proc = FakeProc(rc=0)
+        writer, _ = self._writer(proc)
+        writer.open()
+        with open(self.path, "wb") as f:
+            f.write(b"x" * 261)
+        self.assertFalse(writer.close())
+        self.assertFalse(os.path.exists(self.path))
+        self.assertIn("任何帧", writer.error or "")
+
+    def test_unplayable_file_is_failure(self):
+        proc = FakeProc(rc=0)
+        writer = FfmpegWriter(
+            "ffmpeg", "h264_mf", self.path, (640, 360), 10.0,
+            spawn=lambda _cmd: proc, probe=lambda _path: False,
+        )
+        writer.open()
+        writer.write(make_frame(0, (640, 360)))
+        with open(self.path, "wb") as f:
+            f.write(b"x" * 100)
+        self.assertFalse(writer.close())
+        self.assertFalse(os.path.exists(self.path))
+        self.assertIn("无法播放", writer.error or "")
 
     def test_real_ffmpeg_roundtrip(self):
         ffmpeg = find_ffmpeg()
@@ -354,18 +385,35 @@ class FakeCv2Writer(FakeWriter):
 class FakeFfmpegWriter(FakeWriter):
     def __init__(self, ffmpeg, encoder, path, size, fps, **_kw):
         super().__init__(ffmpeg, encoder, path, size, fps)
-        self.description = "h264_mf"
+        self.description = encoder
 
 
 class FakeSelector:
     def __init__(self, choice):
         self.choice = choice
 
-    def choose(self):
+    def choose(self, exclude=()):
         return self.choice
 
 
+class ScriptedSelector:
+    def __init__(self, names):
+        self.names = list(names)
+        self.calls = []
+
+    def choose(self, exclude=()):
+        self.calls.append(tuple(sorted(exclude)))
+        for name in self.names:
+            if name not in exclude:
+                return name
+        return None
+
+
 class TestWriterFactory(unittest.TestCase):
+    def setUp(self):
+        FakeFfmpegWriter.created = 0
+        FakeFfmpegWriter.open_result = True
+
     def _factory(self, choice, **kw):
         cfg = {"encoder": "auto", "codec": "avc1", "audio": {"ffmpeg": "ffmpeg"}}
         cfg.update(kw)
@@ -381,6 +429,9 @@ class TestWriterFactory(unittest.TestCase):
         self.assertIsInstance(factory.open("a.mp4", (640, 360), 10.0), FakeCv2Writer)
         self.assertIn("ffmpeg", factory.disabled_reason or "",
                       "回退 cv2 时要说明为什么没用 ffmpeg")
+        factory.note_segment_ok()
+        self.assertIn("ffmpeg", factory.disabled_reason or "",
+                      "成功录了 cv2 也不能把「没有 ffmpeg」的原因抹掉")
 
     def test_ffmpeg_writer_is_used_when_available(self):
         FakeFfmpegWriter.created = 0
@@ -406,6 +457,39 @@ class TestWriterFactory(unittest.TestCase):
         self.assertEqual(FakeFfmpegWriter.created, 2,
                          "连续两次失败后不该再启动 ffmpeg")
         self.assertIn("连续", factory.disabled_reason or "")
+
+    def test_failed_segment_rejects_encoder_for_next_segment(self):
+        selector = ScriptedSelector(["h264_mf", "h264_nvenc"])
+        cfg = {"encoder": "auto", "codec": "avc1", "audio": {"ffmpeg": "ffmpeg"}}
+        factory = WriterFactory(
+            cfg, selector=selector,
+            cv2_factory=FakeCv2Writer, ffmpeg_factory=FakeFfmpegWriter,
+        )
+        FakeFfmpegWriter.open_result = False
+        first = factory.open("a.mp4", (640, 360), 10.0)
+        self.assertIsInstance(first, FakeCv2Writer)
+        FakeFfmpegWriter.open_result = True
+        second = factory.open("b.mp4", (640, 360), 10.0)
+        self.assertIsInstance(second, FakeFfmpegWriter)
+        self.assertEqual(second.description, "h264_nvenc",
+                         "下一段要跳过刚失败的 h264_mf")
+        self.assertEqual(selector.calls[-1], ("h264_mf",))
+
+    def test_breaker_resets_after_success(self):
+        selector = ScriptedSelector(["h264_mf", "h264_nvenc"])
+        cfg = {"encoder": "auto", "codec": "avc1", "audio": {"ffmpeg": "ffmpeg"}}
+        factory = WriterFactory(
+            cfg, selector=selector,
+            cv2_factory=FakeCv2Writer, ffmpeg_factory=FakeFfmpegWriter,
+        )
+        FakeFfmpegWriter.open_result = False
+        factory.open("a.mp4", (640, 360), 10.0)  # h264_mf 失败
+        FakeFfmpegWriter.open_result = True
+        self.assertIsInstance(factory.open("b.mp4", (640, 360), 10.0),
+                              FakeFfmpegWriter)  # h264_nvenc 成功
+        factory.note_segment_ok()
+        self.assertFalse(factory._ffmpeg_off)
+        self.assertEqual(factory._failures, 0)
 
 
 if __name__ == "__main__":

@@ -28,15 +28,15 @@
 - **状态文件**：新增 `video_encoder` 与 `video_encoder_error`。
 - **基准工具**：新增 `rw bench`（采样运行中监控的 CPU/RSS）；
   `bench-detect` 支持 `--engine`、输出 p50/p95；`bench-encode` 增加 libx264 行。
-- **M4 决策**：ONNX Runtime 每帧 CPU 时间约 -40%、p95 延迟约 -45%，
+- **M4 决策**：ONNX Runtime 每帧 CPU 时间约 -31%、p95 延迟约 -45%，
   检测结果一致；本轮不捆绑（约 +50MB 依赖），默认仍 cv2.dnn，
   `detector.engine=onnxruntime` 作为可选路径保留。
 
 ### 实测
 
 - 编码（720p@10fps，120 帧）：avc1 125.4 MB/分钟 → h264_mf 51.9 MB/分钟（-59%）。
-- 推理（同帧、2 线程）：cv2.dnn 86.6ms/帧、p95 106.2ms、CPU 158.4ms/帧；
-  onnxruntime 47.9ms/帧、p95 58.9ms、CPU 95.2ms/帧。
+- 推理（同帧、2 线程）：cv2.dnn 85.7ms/帧、p95 106.3ms、CPU 161.2ms/帧；
+  onnxruntime 56.0ms/帧、p95 58.0ms、CPU 111.7ms/帧。
 - 详见 `docs/bench-2026-10-21-m3-m4.md`。本机安装 0.2.2 后用文件源复放一张
   真实 720p 抓拍：同一段画面 h264_mf 2.1–3.3 MB/分钟，avc1 27.0–29.8 MB/分钟
   （约 -89–92%）；nvenc、libx264、ffmpeg 缺失回退三条路径与音轨合并均验证通过。

@@ -128,5 +128,23 @@ class EngineSettingTest(unittest.TestCase):
             B.engine_setting("nope")
 
 
+class ConsistencyTest(unittest.TestCase):
+    def test_marks_baseline_and_compares_other_engines(self):
+        base = [Detection(x1=10, y1=10, x2=110, y2=110, conf=0.90)]
+        same = [Detection(x1=10, y1=10, x2=110, y2=110, conf=0.91)]
+        diff = [Detection(x1=30, y1=30, x2=130, y2=130, conf=0.90)]
+        results = [{"engine": "onnx"}, {"engine": "onnxruntime"}, {"engine": "x"}]
+        B.mark_consistency(results, [base, same, diff])
+        self.assertTrue(results[0]["consistent"])
+        self.assertTrue(results[1]["consistent"])
+        self.assertFalse(results[2]["consistent"])
+
+    def test_missing_detections_are_unknown(self):
+        results = [{"engine": "onnx"}, {"engine": "onnxruntime"}]
+        B.mark_consistency(results, [None, None])
+        self.assertIsNone(results[0]["consistent"])
+        self.assertIsNone(results[1]["consistent"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -50,6 +50,7 @@ def summarize(
         "cpu_ms_per_frame": round(cpu_ms, 1),
         "cpu_cores": round(cores, 2),
         "detections": int(detections),
+        "consistent": None,
         "error": error,
     }
 
@@ -98,6 +99,19 @@ def detections_match(a: list, b: list, *, conf_tol: float = 0.02,
             return False
         remaining.pop(best)
     return True
+
+
+def mark_consistency(results: list[dict], detections: list) -> list[dict]:
+    """把各引擎的检测结果与第一个（基线）对比，写进 consistent 字段。"""
+    base = detections[0] if detections else None
+    for i, result in enumerate(results):
+        if base is None or i >= len(detections) or detections[i] is None:
+            result["consistent"] = None
+        elif i == 0:
+            result["consistent"] = True
+        else:
+            result["consistent"] = detections_match(base, detections[i])
+    return results
 
 
 def engine_setting(name: str) -> Optional[str]:
@@ -214,14 +228,19 @@ def run_all(
         if frame is None:
             return [summarize(frames=frames, seconds=0, ok=False,
                               error=f"读不了图片：{source}")]
+    if frame is None:
+        # 所有引擎必须用同一帧，否则一致性对比没有意义。
+        frame = make_frame(size)
 
     results: list[dict] = []
+    engine_dets: list = []
     for name in engines:
         try:
             setting = engine_setting(name)
         except ValueError as exc:
             results.append(summarize(frames=frames, seconds=0, engine=name,
                                      ok=False, error=str(exc)))
+            engine_dets.append(None)
             continue
         detector_cfg = dict(det_cfg)
         if setting:
@@ -231,10 +250,17 @@ def run_all(
             results.append(bench_detector(
                 detector, frames=frames, size=size, warmup=warmup, frame=frame,
             ))
+            try:
+                engine_dets.append(detector.detect(frame))
+            except Exception:  # noqa: BLE001 - 计时成功但取框失败，一致性记未知
+                engine_dets.append(None)
         except Exception as exc:  # noqa: BLE001
             results.append(summarize(frames=frames, seconds=0, engine=name,
                                      ok=False,
                                      error=f"检测器初始化失败：{exc}"))
+            engine_dets.append(None)
+
+    mark_consistency(results, engine_dets)
 
     if compare:
         base = str(PROJECT_ROOT)
@@ -314,5 +340,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               f"{item['cpu_cores']:>7.2f}{item['detections']:>8}")
         if not item["ok"] and item["error"]:
             print(f"    ! {item['error']}")
+    if len(results) > 1:
+        for item in results[1:]:
+            if item.get("consistent") is not None:
+                print(f"  一致性：{item['engine']} 与 {results[0]['engine']} → "
+                      f"{item['consistent']}")
     print("结论只用于评估；运行时引擎由 detector.engine 决定，本工具不改它。")
     return 0 if any(item["ok"] for item in results) else 1

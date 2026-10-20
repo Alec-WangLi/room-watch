@@ -20,6 +20,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -187,6 +188,21 @@ class TestRecorderWritesPlayableFile(unittest.TestCase):
         ok, frames, size = read_back(path)
         self.assertTrue(ok)
         self.assertEqual(size, SIZE)
+        self.assertEqual(frames, 2, "换尺寸只该缩放，不该多出/丢掉帧")
+
+    def test_prime_size_does_not_change_active_writer(self):
+        """录像中途 prime_size 变化只影响下一段，不能改当前这一段。"""
+        rec = self._rec(pre_roll_seconds=0)
+        rec.prime_size(SIZE)
+        path = os.path.join(self.tmp, "freeze.mp4")
+        rec.start(path, T0)
+        rec.prime_size((1280, 720))  # 摄像头中途重开
+        rec.observe(synthetic_frame(3), T0)
+        rec.stop()
+        ok, frames, size = read_back(path)
+        self.assertTrue(ok)
+        self.assertEqual(frames, 1)
+        self.assertEqual(size, SIZE)
 
     def test_video_path_pairs_with_snapshot(self):
         self.assertEqual(
@@ -264,6 +280,35 @@ class FakeBackendFactory:
         self.failures += 1
         self.disabled_reason = reason
 
+    def note_segment_ok(self):
+        self.failures = 0
+        self.disabled_reason = None
+
+
+class BlockingWriter(FakeBackendWriter):
+    """write() 卡住，用来制造 stop() 的 join 超时。"""
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.aborted = False
+
+    def write(self, frame):
+        self.entered.set()
+        self.release.wait(5)
+
+    def close(self):
+        return False
+
+    def abort(self):
+        self.aborted = True
+        self.release.set()
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
 
 class FakeSelector:
     def __init__(self, choice):
@@ -313,6 +358,34 @@ class TestRecorderBackendFailure(unittest.TestCase):
         self.assertIsNotNone(rec.last_error)
         self.assertEqual(factory.failures, 1)
 
+    def test_write_thread_death_keeps_segment_active_for_cleanup(self):
+        """线程死了但片段没收尾：recording 必须仍为真，否则清理与通知全被跳过。"""
+        path = os.path.join(self.tmp, "dead.mp4")
+        rec, factory = self._rec_with(FakeBackendWriter(path, fail_write=True))
+        rec.start(path, T0)
+        rec.observe(synthetic_frame(0), T0)
+        deadline = time.time() + 2
+        while time.time() < deadline and not rec.failed:
+            time.sleep(0.01)
+        self.assertTrue(rec.failed, "写线程应当已经因异常退出")
+        self.assertTrue(rec.recording, "片段尚未收尾，recording 不能变成 False")
+        self.assertIsNone(rec.stop("测试"))
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(factory.failures, 1)
+
+    def test_stop_timeout_aborts_writer(self):
+        """写线程卡住时，stop 必须在超时后强制结束 writer，而不是把它留在后台。"""
+        path = os.path.join(self.tmp, "hang.mp4")
+        writer = BlockingWriter(path)
+        rec, factory = self._rec_with(writer, join_timeout_seconds=0.2)
+        rec.start(path, T0)
+        rec.observe(synthetic_frame(0), T0)
+        self.assertTrue(writer.entered.wait(2), "写入应当已经卡住")
+        self.assertIsNone(rec.stop("测试"))
+        self.assertTrue(writer.aborted, "超时后必须 abort，不能留着 ffmpeg 进程")
+        self.assertFalse(rec.recording)
+        self.assertEqual(factory.failures, 1)
+
     def test_last_encoder_is_reported(self):
         path = os.path.join(self.tmp, "enc.mp4")
         rec, _ = self._rec_with(FakeBackendWriter(path))
@@ -349,6 +422,7 @@ class TestRecorderBackendFailure(unittest.TestCase):
         self.assertTrue(ok)
         self.assertGreater(frames, 0)
         self.assertEqual(size, SIZE)
+        self.assertEqual(frames, 1, "一帧画面只能写出一帧，不能被 ffmpeg 拆成多块")
 
 
 def _find_ffmpeg():

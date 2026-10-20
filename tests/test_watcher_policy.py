@@ -33,6 +33,7 @@ class FakeRecorder:
     def __init__(self, recording: bool = False):
         self.enabled = True
         self.recording = recording
+        self.failed = False
         self.started = []
         self.observed = 0
         self.stopped = []
@@ -174,6 +175,18 @@ class WatcherPolicyTest(unittest.TestCase):
         Watcher.pump_recording(w, frame, [], self.now)
         self.assertEqual(w.recorder.stopped, [])
         self.assertEqual(w.recorder.observed, 1)
+
+    def test_pump_stops_failed_segment_immediately(self):
+        """写线程死了不能等策略超时：下一帧就要收尾、删坏文件并通知。"""
+        w = self._watcher(recording=True)
+        w.recorder.failed = True
+        w.record_policy = SimpleNamespace(
+            note=lambda now, has_person: None,
+            check=lambda now: "",
+        )
+        w.stop_recording = mock.Mock()
+        Watcher.pump_recording(w, np.zeros((16, 16, 3), np.uint8), [], self.now)
+        w.stop_recording.assert_called_once()
 
     # ---------- 配置错误分类 ----------
 

@@ -5,7 +5,7 @@
 `ffmpeg -encoders` 里列出 h264_nvenc，只说明编码器编译进了 ffmpeg，
 不代表这台机器能用：驱动被拒、Windows N 版缺 Media Foundation、
 RDP 会话里硬件编码不可用都会让进程当场失败。所以选择分两步：
-先按名字排除明显不存在的候选，再真的编 3 帧 64×64 验证一次，
+先按名字排除明显不存在的候选，再真的编 3 帧 256×144 验证一次，
 第一个成功的才写进缓存。
 
 本模块只负责「用什么编码」；什么时候开录、队列、预录仍由 recorder.py 管。
@@ -118,6 +118,23 @@ def validate_encoder(
     return ok
 
 
+def _probe_playable(path: str) -> bool:
+    """能不能真的读出一帧。0 帧或只有文件头的小文件会在这里被拦下。"""
+    try:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return False
+        ok, frame = cap.read()
+        return bool(ok and frame is not None and frame.size > 0)
+    except Exception:  # noqa: BLE001 - 解码器异常一律当作不可播
+        return False
+    finally:
+        try:
+            cap.release()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _default_spawn(cmd: list[str]):
     kwargs = {
         "stdin": subprocess.PIPE,
@@ -146,6 +163,7 @@ class FfmpegWriter:
         *,
         timeout: float = 8.0,
         spawn: Optional[Callable] = None,
+        probe: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.ffmpeg = ffmpeg
         self.encoder = encoder
@@ -154,6 +172,7 @@ class FfmpegWriter:
         self.fps = float(fps)
         self.timeout = float(timeout)
         self._spawn = spawn or _default_spawn
+        self._probe = probe or _probe_playable
         self.proc = None
         self.error: Optional[str] = None
         self.written = 0
@@ -243,7 +262,10 @@ class FfmpegWriter:
 
         exists = os.path.exists(self.path)
         size = os.path.getsize(self.path) if exists else 0
-        ok = (not timed_out) and rc == 0 and exists and size > 0
+        playable = False
+        if (not timed_out) and rc == 0 and exists and size > 0 and self.written > 0:
+            playable = bool(self._probe(self.path))
+        ok = (not timed_out) and rc == 0 and exists and size > 0 and self.written > 0 and playable
         if not ok:
             if timed_out:
                 self.error = "ffmpeg 未在超时内退出"
@@ -252,6 +274,10 @@ class FfmpegWriter:
                 self.error = f"ffmpeg 返回 {rc}" + (f": {detail}" if detail else "")
             elif not exists:
                 self.error = "ffmpeg 没有写出文件"
+            elif self.written <= 0:
+                self.error = "ffmpeg 没有写出任何帧"
+            elif not playable:
+                self.error = "ffmpeg 写出的文件无法播放"
             else:
                 self.error = "ffmpeg 写出的是空文件"
             try:
@@ -260,6 +286,34 @@ class FfmpegWriter:
                 pass
         self.proc = None
         return ok
+
+    def abort(self) -> None:
+        """停止路径用：不等待队列，直接结束进程并删掉半成品。"""
+        proc = self.proc
+        if proc is not None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if proc.stderr is not None:
+                    proc.stderr.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.proc = None
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
 
 
 class EncoderSelector:
@@ -280,21 +334,26 @@ class EncoderSelector:
         self.ffmpeg = str(audio.get("ffmpeg") or "ffmpeg")
         self._probe = probe
         self._validate = validate
-        self._done = False
-        self._chosen: Optional[str] = None
+        self._available: Optional[set[str]] = None
+        self._validated: dict[str, bool] = {}
 
-    def choose(self) -> Optional[str]:
-        """返回可用的 ffmpeg 编码器名；None = 用 cv2。只探测一次。"""
-        if self._done:
-            return self._chosen
-        self._done = True
+    def _probe_available(self) -> set[str]:
+        if self._available is None:
+            try:
+                self._available = set(self._probe(self.ffmpeg))
+            except Exception:  # noqa: BLE001 - ffmpeg 不存在/超时都回退 cv2
+                self._available = set()
+        return self._available
+
+    def choose(self, exclude=()) -> Optional[str]:
+        """返回可用的 ffmpeg 编码器名；None = 用 cv2。
+
+        exclude 里的名字会被跳过：一段录像用某个编码器失败后，
+        下一段换下一个候选，而不是反复撞同一个。
+        """
         if self.mode == "cv2":
             return None
-        try:
-            available = self._probe(self.ffmpeg)
-        except Exception:  # noqa: BLE001 - ffmpeg 不存在/超时都回退 cv2
-            return None
-
+        available = self._probe_available()
         candidates: list[str] = []
         if self.requested not in ("", "auto"):
             candidates.append(self.requested)
@@ -303,14 +362,15 @@ class EncoderSelector:
                 candidates.append(name)
 
         for name in candidates:
-            if name not in available:
+            if name in exclude or name not in available:
                 continue
-            try:
-                if self._validate(self.ffmpeg, name):
-                    self._chosen = name
-                    return name
-            except Exception:  # noqa: BLE001 - 单个候选失败不影响后面的候选
-                continue
+            if name not in self._validated:
+                try:
+                    self._validated[name] = bool(self._validate(self.ffmpeg, name))
+                except Exception:  # noqa: BLE001 - 单个候选失败不影响后面的候选
+                    self._validated[name] = False
+            if self._validated[name]:
+                return name
         return None
 
 
@@ -386,7 +446,26 @@ class Cv2Writer:
             except OSError:
                 pass
             return False
+        if not _probe_playable(self.path):
+            self.error = "cv2 写出的文件无法播放"
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+            return False
         return True
+
+    def abort(self) -> None:
+        if self._writer is not None:
+            try:
+                self._writer.release()
+            except Exception:  # noqa: BLE001
+                pass
+            self._writer = None
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
 
 
 class WriterFactory:
@@ -412,29 +491,46 @@ class WriterFactory:
         self._ffmpeg_factory = ffmpeg_factory
         self._failures = 0
         self._ffmpeg_off = False
+        self._rejected: set[str] = set()
+        self._last_encoder: Optional[str] = None
+        self._last_used_ffmpeg = False
         self.disabled_reason: Optional[str] = None
 
     def open(self, path: str, size: tuple, fps: float):
         if self.mode != "cv2" and not self._ffmpeg_off:
             try:
-                encoder = self._selector.choose()
+                encoder = self._selector.choose(exclude=self._rejected)
             except Exception:  # noqa: BLE001 - 选择器故障按「没有 ffmpeg」处理
                 encoder = None
             if encoder:
+                self._last_encoder = encoder
                 writer = self._ffmpeg_factory(self.ffmpeg, encoder, path, size, fps)
                 if writer.open():
+                    self._last_used_ffmpeg = True
                     return writer
                 self.note_segment_failed(writer.error or "ffmpeg 打开失败")
             else:
                 self.disabled_reason = "没有可用的 ffmpeg 编码器"
 
+        self._last_used_ffmpeg = False
         writer = self._cv2_factory(path, size, fps, self.codec_preference)
         return writer if writer.open() else None
 
     def note_segment_failed(self, reason: str = "") -> None:
-        """一段录像失败后记账；连续两次就本进程内不再尝试 ffmpeg。"""
+        """一段录像失败后记账；下一段跳过这个编码器，连续两次后熔断。"""
+        if self._last_encoder:
+            self._rejected.add(self._last_encoder)
         self._failures += 1
         self.disabled_reason = reason or "ffmpeg 失败"
         if self._failures >= 2:
             self._ffmpeg_off = True
             self.disabled_reason = "ffmpeg 连续失败"
+
+    def note_segment_ok(self) -> None:
+        """成功一段就把「连续失败」计数清零，避免偶发失败累积成熔断。
+
+        只有这一段真的用了 ffmpeg 才清掉回退原因；cv2 成功不代表 ffmpeg 可用。
+        """
+        self._failures = 0
+        if self._last_used_ffmpeg and not self._ffmpeg_off:
+            self.disabled_reason = None

@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence, Tuple
 
-# 产品实际会尝试的 cv2 编码器，顺序与 recorder.CODEC_CHAIN 一致。
+# 产品实际会尝试的 cv2 编码器，顺序与 videoenc.CODEC_CHAIN 一致。
 CV2_CODECS = ("avc1", "mp4v", "MJPG")
 # 只评估常见的硬件 H.264 编码器；libx264 是软件基线，由 ffmpeg_candidates 追加。
 FFMPEG_HW_CODECS = ("h264_nvenc", "h264_qsv", "h264_amf", "h264_mf")

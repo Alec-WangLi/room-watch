@@ -105,6 +105,10 @@ class Recorder:
         self._thread: Optional[threading.Thread] = None
         self._writer = None
         self._size: Optional[tuple] = None
+        # 本段固定写出的尺寸；首帧确定后不再随摄像头变化。
+        self._writer_size: Optional[tuple] = None
+        self._active = False          # 片段是否尚未收尾（与线程是否活着解耦）
+        self._generation = 0         # 防止上一段的残留线程碰下一段的状态
         self._path: Optional[str] = None
         self._started_at: Optional[datetime] = None
 
@@ -123,7 +127,19 @@ class Recorder:
 
     @property
     def recording(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        """是否有尚未收尾的片段。
+
+        注意不能只看写线程活没活：线程因写失败退出后，片段仍然需要
+        一次 stop() 来删坏文件、清事件库和通知，所以这里用显式状态。
+        """
+        return self._active
+
+    @property
+    def failed(self) -> bool:
+        """写线程已经退出、但片段还没收尾。watcher 看到就立刻 stop。"""
+        return self._active and (
+            self._thread is None or not self._thread.is_alive()
+        )
 
     @property
     def current_path(self) -> Optional[str]:
@@ -144,7 +160,9 @@ class Recorder:
             return
 
         if self.recording:
-            self._enqueue(frame)
+            if self._thread is not None and self._thread.is_alive():
+                self._enqueue(self._fit(frame))
+            # 线程已死：不再入队，等 stop() 收尾（删坏文件、通知）
         else:
             self.pre_roll.push(frame, when)
 
@@ -183,10 +201,15 @@ class Recorder:
 
         self._writer = writer
         self._size = size
+        self._writer_size = size
         self._path = writer.path
         self._started_at = when
         self.last_encoder = writer.description
+        self.last_error = None
         self._write_failed = False
+        self._active = True
+        self._generation += 1
+        generation = self._generation
         self._queue = queue.Queue(maxsize=self.queue_size)
         self.written = 0
         self.dropped = 0
@@ -200,7 +223,11 @@ class Recorder:
                 continue
             self._queue.put_nowait(self._fit(frame))
 
-        self._thread = threading.Thread(target=self._write_loop, daemon=True, name="video-writer")
+        self._thread = threading.Thread(
+            target=self._write_loop,
+            args=(self._queue, writer, generation, self._path),
+            daemon=True, name="video-writer",
+        )
         self._thread.start()
         self.segments += 1
 
@@ -208,34 +235,46 @@ class Recorder:
         return writer.path
 
     def stop(self, reason: str = "") -> Optional[str]:
-        """收尾。排空队列→释放 writer，全程在写线程完成。"""
-        if not self.recording:
+        """收尾。排空队列→释放 writer；线程已死也会清掉坏片段。"""
+        if not self._active:
             return self._path
 
         path = self._path
         writer = self._writer
-        self._queue.put(None)  # 哨兵，通知线程收尾
-        self._thread.join(timeout=self.join_timeout)
+        thread = self._thread
+        q = self._queue
+        timed_out = False
+        was_alive = thread is not None and thread.is_alive()
+        if was_alive:
+            q.put(None)  # 哨兵，通知线程收尾
+            thread.join(timeout=self.join_timeout)
+            timed_out = thread.is_alive()
 
-        timed_out = self._thread.is_alive()
         if timed_out:
             self.last_error = "写线程未在超时内退出，文件可能不完整"
             log.error("%s: %s", self.last_error, path)
             ok = False
+            try:
+                if writer is not None:
+                    writer.abort()
+            except Exception:  # noqa: BLE001 - 收尾路径上不再抛
+                pass
         else:
             ok = bool(writer and writer.close())
-            secs = (datetime.now() - self._started_at).total_seconds() if self._started_at else 0
-            extra = f"，原因：{reason}" if reason else ""
-            log.info(
-                "录像结束: %s（%.0f 秒 / %d 帧%s%s）",
-                path,
-                secs,
-                self.written,
-                f"，丢帧 {self.dropped}" if self.dropped else "",
-                extra,
-            )
+            if thread is not None:
+                secs = (datetime.now() - self._started_at).total_seconds() if self._started_at else 0
+                extra = f"，原因：{reason}" if reason else ""
+                log.info(
+                    "录像结束: %s（%.0f 秒 / %d 帧%s%s）",
+                    path,
+                    secs,
+                    self.written,
+                    f"，丢帧 {self.dropped}" if self.dropped else "",
+                    extra,
+                )
 
-        failed = timed_out or self._write_failed or not ok
+        failed = (timed_out or (thread is not None and not was_alive)
+                  or self._write_failed or not ok)
         if failed:
             if not self.last_error:
                 self.last_error = (writer.error if writer is not None else None) or "录像写出失败"
@@ -247,10 +286,14 @@ class Recorder:
                     os.remove(path)
             except OSError:
                 pass
+        elif self._factory is not None and hasattr(self._factory, "note_segment_ok"):
+            self._factory.note_segment_ok()
 
         self._thread = None
         self._queue = None
         self._writer = None
+        self._writer_size = None
+        self._active = False
         self._started_at = None
         self._path = None
         self._write_failed = False
@@ -270,32 +313,48 @@ class Recorder:
         return None
 
     def prime_size(self, size: tuple) -> None:
-        """把当前画面尺寸告诉录像器——摄像头给多大就录多大。"""
+        """摄像头当前画面尺寸；只影响下一段录像，不改正在写的那一段。"""
         self._size = size
 
     def _fit(self, frame: np.ndarray) -> np.ndarray:
-        """统一尺寸。摄像头中途被重开时分辨率可能变，VideoWriter 不接受中途换尺寸。"""
-        if self._size is None:
+        """统一到本段固定的写出尺寸。摄像头中途重开时也必须遵守。"""
+        target = self._writer_size or self._size
+        if target is None:
             self._size = (frame.shape[1], frame.shape[0])
+            self._writer_size = self._size
             return frame
-        w, h = self._size
+        w, h = target
         if frame.shape[1] != w or frame.shape[0] != h:
             return cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
         return frame
 
-    def _write_loop(self) -> None:
-        """后台线程：唯一的 writer 使用者。收尾与释放由 stop() 负责。"""
+    def _write_loop(self, q, writer, generation: int, path: str) -> None:
+        """后台线程：唯一使用这一段 writer 的地方。
+
+        queue / writer / path 都用参数传进来，而不是每轮读 self：
+        上一段的线程即使卡在 write() 里，也不可能抢到下一段的队列或 writer。
+        """
         while True:
-            frame = self._queue.get()
+            frame = q.get()
             if frame is None:
                 break
             try:
-                self._writer.write(frame)
-                self.written += 1
+                writer.write(frame)
+                if generation == self._generation:
+                    self.written += 1
             except Exception as e:  # noqa: BLE001
-                self.last_error = f"写帧失败: {e}"
-                self._write_failed = True
+                if generation == self._generation:
+                    self.last_error = f"写帧失败: {e}"
+                    self._write_failed = True
                 log.error("录像写帧失败: %s", e)
+                try:
+                    writer.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
                 break
 
 
