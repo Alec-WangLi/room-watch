@@ -741,9 +741,12 @@ room-watch-<版本>\
 - **自动更新实测**：GUI 显示「有新版本 0.2.0」，`rw update --check` 返回
   `confirm-minor`；下载阶段实测 GitHub 边缘速度随机（首连 5–12 KB/s，
   重连 629 KB/s），若界面更新卡在低速可取消重试。
-- **待所有者操作**：① 在 GUI 点「有新版本 0.2.0」或运行
-  `dist\room-watch-0.2.0-setup.exe` 完成安装；② 企业微信后台删除旧机器人
-  重建，更新 `config.local.yaml`；③ CI 工作流粘贴（token 缺 workflow scope）。
+- **通知配置收尾**：所有者已在企微后台重建机器人并填入新 webhook；
+  watcher/guardian 已重启加载新配置（watcher PID 41292，23:19 启动），
+  `rw config --test` 返回「wecom_bot：测试消息已发出」；gallery 已恢复
+  （PID 40228，`/healthz` ok）。通知类设置保存后需重启 watcher+guardian，
+  界面会提示「需要重启」；热更新只覆盖语音。
+- **待所有者操作**：CI 工作流粘贴（token 缺 workflow scope）。
 - **未做**：干净机器安装验证、托盘（pystray + 真机）、M6 平台抽象。
 - **详细交接**：`docs/handoff/2026-10-20-next-session.md`（第 8 节为 0.2.0）；
   新会话入口 `CLAUDE.md`。

@@ -106,9 +106,13 @@
   本机 `dist\room-watch-0.2.0-setup.exe` 与上传资产同源。
 - **内容**：0.1.13–0.1.24 的稳定化改动合入 `main`；测试代码不再带真实
   企业微信 webhook。
-- **安全检查**：`tests/test_settings.py` 里的真实企业微信 webhook 已换成假值
-  （0.1.24 及以前仍在仓库里）。真实地址还在本机 `config.local.yaml` 与
-  git 历史中；**所有者仍须在企微后台删除旧机器人重建**，再把新 key 填回。
+- **企微机器人已轮换（2026-10-20 23:2x）**：所有者在企微后台重建机器人，
+  新 webhook 已写入 `config.local.yaml`（非旧 key）；`rw config --test`
+  返回「wecom_bot：测试消息已发出」。通知类设置保存后需重启 watcher+guardian
+  （热更新只覆盖语音），本次已重启（watcher PID 41292，23:19 启动）；
+  gallery 已恢复（PID 40228，`/healthz` ok）。
+- **测试夹具清理**：`tests/test_settings.py` 的真实 webhook 已换成假值；
+  旧 key 仍在 git 历史中，但机器人已作废，暴露不再有效。
 - **测试与构建**：`beta` 与合并后的 `main` 全量 `rw test` 通过；
   `room-watch.exe --selftest` 通过（九页两档尺寸）；便携包 `rw doctor` 全过；
   安装包 143.1MB。
@@ -121,4 +125,4 @@
 - **网络注意**：GitHub Release 边缘速度随机。首连只有 5–12 KB/s（143MB
   要数小时），重开连接后达到 629 KB/s（约 4 分钟下完）。GUI 更新若长时间
   停在低速，取消后重试即可；不要改 updater 的重试逻辑。
-- **待办**：企微 key 轮换；CI 启用；干净机器验证；托盘；M6。
+- **待办**：CI 启用；干净机器验证；托盘；M6。
