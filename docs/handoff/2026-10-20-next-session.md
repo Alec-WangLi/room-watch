@@ -154,7 +154,9 @@
 
 ## 10. 0.2.2 M3 编码器 + M4 基准（开发中，2026-10-21）
 
-- 已合入 `beta`（合并提交 `276b95b`）；未推送、未发版。
+- 已推送并发布 `v0.2.2-beta`（tag 指向 `abacbd3`，prerelease）：
+  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.2.2-beta
+  资产 `room-watch-0.2.2-setup.exe` + `.sha256`；简介取自 CHANGELOG。
 - M3：录像后端抽象为 `videoenc.py`（编码器探测/真编验证/cv2/ffmpeg）；
   `record.encoder: auto` = `h264_mf` → `h264_nvenc` → cv2，libx264 仅显式。
   ffmpeg 中途失败会删坏片段、清空事件库 `video`、发 critical（每进程一次）。
