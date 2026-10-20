@@ -180,6 +180,14 @@ class EventStore:
         self.conn.commit()
         return int(cur.rowcount)
 
+    def clear_video_by_snapshot(self, snapshot: str) -> int:
+        """把某次事件的录像路径置空。录像写出失败、片段被删时用。"""
+        cur = self.conn.execute(
+            "UPDATE events SET video=NULL WHERE snapshot=?", (str(snapshot),)
+        )
+        self.conn.commit()
+        return int(cur.rowcount)
+
 
 class Watcher:
     def __init__(self, cfg: dict, dry_run: bool = False,
@@ -653,6 +661,8 @@ class Watcher:
             "frames": self.frames,
             "events_today": self.events_today,
             "recording": self.recorder.recording,
+            "video_encoder": getattr(self.recorder, "last_encoder", None),
+            "video_encoder_error": getattr(self.recorder, "last_error", None),
             "dry_run": self.dry_run,
             "pending_outbox": outbox_stats.get("pending", 0),
             "last_push_success_at": outbox_stats.get("last_success_at"),
@@ -999,6 +1009,23 @@ class Watcher:
                 log.info("识别为本人，本段录像已丢弃: %s", video)
             return
 
+        if video is None:
+            # 后端写出失败：坏文件已经被 recorder 删掉，这里负责收尾与告知。
+            if wav:
+                try:
+                    os.remove(wav)
+                except OSError:
+                    pass
+            snapshot = getattr(self, "event_snapshot", "") or ""
+            if snapshot and getattr(self, "store", None) is not None:
+                try:
+                    self.store.clear_video_by_snapshot(snapshot)
+                except Exception as exc:  # noqa: BLE001 - 数据库故障不能拖垮主循环
+                    log.warning("清空事件视频字段失败: %s", exc)
+            reason_text = getattr(self.recorder, "last_error", None) or "录像写出失败"
+            self._notify_video_failure(snapshot, reason_text)
+            return
+
         if video and wav:
             # 视频开头是预录画面（当时还没开始录音），音轨要补等长静音才对得上
             # 合并完成后才推视频——合并前的 mp4 还没有音轨。
@@ -1011,6 +1038,26 @@ class Watcher:
         elif video:
             event_id = self.last_event_at.isoformat() if self.last_event_at else ""
             self.push_video(video, event_id=event_id)
+
+    def _notify_video_failure(self, snapshot: str, reason: str) -> None:
+        """录像写出失败：写日志，并在本进程内提醒一次。"""
+        logutil.event(log, "video_backend_failed", snapshot=snapshot, reason=reason)
+        if getattr(self, "dry_run", False) or getattr(self, "_video_failure_notified", False):
+            return
+        items = build_items(
+            getattr(self, "notify_cfg", {}) or {},
+            event_id=f"video-failed:{snapshot}",
+            text="录像中断，已回退",
+            severity="critical",
+        )
+        if not items:
+            self._video_failure_notified = True  # 没配渠道也算处理过，避免反复尝试
+            return
+        try:
+            self.enqueue_notification(items)
+            self._video_failure_notified = True
+        except Exception as exc:  # noqa: BLE001 - 通知失败不影响录像收尾
+            log.warning("录像失败通知入队失败: %s", exc)
 
     def push_video(self, video_path: str, event_id: str | None = None) -> None:
         """把一段收尾好的录像写进 outbox 的视频慢道。"""

@@ -466,6 +466,18 @@ class TestEventStoreMigration(unittest.TestCase):
         self.assertIsNone(old[1], "迁移前的老行 video 应为空")
         self.assertIsNone(old[2], "迁移前的老行 identity 应为空")
 
+    def test_clear_video_by_snapshot(self):
+        from roomwatch.watcher import EventStore
+
+        store = EventStore(os.path.join(self.tmp, "events.db"))
+        store.add(datetime(2026, 10, 21, 9, 0, 0), "a.jpg", 0.9, True, video="a.mp4")
+        store.add(datetime(2026, 10, 21, 9, 1, 0), "b.jpg", 0.8, True, video="b.mp4")
+        removed = store.clear_video_by_snapshot("a.jpg")
+        self.assertEqual(removed, 1)
+        rows = dict(store.conn.execute("SELECT snapshot, video FROM events").fetchall())
+        self.assertIsNone(rows["a.jpg"])
+        self.assertEqual(rows["b.jpg"], "b.mp4", "别的事件不能被误改")
+
     def test_fresh_db_has_video_column(self):
         from roomwatch.watcher import EventStore
 
