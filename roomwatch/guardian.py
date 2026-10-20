@@ -55,6 +55,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -232,6 +233,22 @@ def decide_gallery(pid: Optional[int], alive, *, cmdline=None) -> str:
     return ACT_OK
 
 
+def gallery_http_ok(port: int, *, timeout: float = 3.0) -> bool:
+    """探测相册的 /healthz。
+
+    PID 活着不代表 HTTP 还能响应：线程死锁、事件循环卡住时，进程和端口都在，
+    但手机相册打不开。guardian 只查 PID 会漏掉这种情况。
+    """
+    try:
+        # 不走系统代理：代理会把 127.0.0.1 的请求转出去，健康检查必然失败。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{int(port)}/healthz", timeout=timeout) as resp:
+            code = getattr(resp, "status", None) or resp.getcode()
+            return 200 <= int(code) < 300
+    except Exception:  # noqa: BLE001 - 任何网络异常都按不健康处理
+        return False
+
+
 def crash_window_count(timestamps: list[str], now: datetime, window_minutes: float) -> int:
     """统计窗口内的重启次数；坏时间与未来时间都跳过。"""
     window = float(window_minutes) * 60.0
@@ -355,7 +372,14 @@ class Guard:
         )
         self.root = Path(self.desired_state_path).parents[2]
         self.gallery_pid_path = _abs(g.get("gallery_pid", "var/state/gallery.pid"))
+        self.gallery_state_path = Path(self.gallery_pid_path).with_name("gallery.json")
         self.gallery_log = _abs(g.get("gallery_log", "var/logs/gallery.log"))
+        gallery_cfg = cfg.get("gallery") or {}
+        # 没显式配置端口就不探测（源码/测试里的最小配置没有 gallery 段）；
+        # 正式 config.yaml 一定有 gallery.port。
+        self.gallery_port = int(gallery_cfg.get("port", 0) or 0)
+        self.gallery_health_timeout = float(g.get("gallery_health_timeout_seconds", 3))
+        self.gallery_health_failures = max(1, int(g.get("gallery_health_failures", 2)))
         self.owner_lock_path = _abs(
             g.get("owner_lock", "var/state/guardian.owner.lock")
         )
@@ -684,10 +708,82 @@ class Guard:
             return None
         return max(0.0, now.timestamp() - mtime)
 
+    def _gallery_probe_port(self) -> int:
+        """优先用 gallery.json 里的实际端口（8765 被占用时会自动换端口）。"""
+        data = health.read_json(self.gallery_state_path) or {}
+        try:
+            state_pid = int(data.get("pid") or 0)
+            port = int(data.get("port") or 0)
+        except (TypeError, ValueError):
+            state_pid, port = 0, 0
+        if port and state_pid == self._gallery_pid():
+            return port
+        return self.gallery_port
+
+    def _gallery_http_alive(self) -> bool:
+        port = self._gallery_probe_port()
+        if port <= 0:
+            return True
+        return gallery_http_ok(port, timeout=self.gallery_health_timeout)
+
+    def _notify_gallery_stall(self, now: datetime) -> None:
+        last = self.state.get("last_gallery_alert_at")
+        if last:
+            try:
+                elapsed = (now - datetime.fromisoformat(str(last))).total_seconds()
+                if elapsed < self.crash_window_minutes * 60:
+                    return
+            except (TypeError, ValueError):
+                pass
+        self._notify("room-watch：相册进程在但 HTTP 无响应，已自动重启")
+        self.state["last_gallery_alert_at"] = now.isoformat(timespec="seconds")
+
     def _check_gallery(self, now: datetime) -> str:
         pid = self._gallery_pid()
         action = decide_gallery(pid, pid_alive, cmdline=_psutil_cmdline)
         if action == ACT_OK:
+            # 进程还在不代表服务还在：HTTP 线程卡死时手机相册打不开，
+            # 但 PID 和端口都正常，只查 PID 会一直把它当成健康的。
+            if not self._gallery_http_alive():
+                fails = int(self.state.get("gallery_http_failures", 0)) + 1
+                self.state["gallery_http_failures"] = fails
+                self.state["last_action"] = f"gallery_http_fail({fails})"
+                self._save_state()
+                if fails < self.gallery_health_failures:
+                    log.warning("相册进程在，但 HTTP 无响应（%s/%s）",
+                                fails, self.gallery_health_failures)
+                    return ACT_WAIT
+                log.warning("相册 HTTP 连续 %s 次无响应，重启相册", fails)
+                self._notify_gallery_stall(now)
+                self.state["gallery_http_failures"] = 0
+                self.state["gallery_failures"] = int(
+                    self.state.get("gallery_failures", 0)
+                ) + 1
+                self.state["last_gallery_restart_at"] = now.isoformat(timespec="seconds")
+                try:
+                    control.stop_gallery(self.root,
+                                         pid_file=Path(self.gallery_pid_path))
+                except Exception as exc:  # noqa: BLE001 - 停不掉也要继续尝试拉起
+                    log.warning("停止无响应相册失败：%s", exc)
+                new_pid = self._start_gallery()
+                if new_pid:
+                    self.state["last_gallery_spawn_at"] = now.isoformat(timespec="seconds")
+                    self.state["last_gallery_spawn_pid"] = int(new_pid)
+                append_history(self.history_path, {
+                    "at": now.isoformat(timespec="seconds"),
+                    "service": "gallery",
+                    "action": "restart_stalled",
+                    "exit_code": None,
+                    "exit_reason": "http-timeout",
+                    "new_pid": new_pid,
+                    "failures": self.state["gallery_failures"],
+                })
+                self._save_state()
+                return ACT_RESTART_STALLED
+            if int(self.state.get("gallery_http_failures", 0)):
+                self.state["gallery_http_failures"] = 0
+                self.state["last_action"] = "gallery_ok"
+                self._save_state()
             # 只有「下一次检查时还活着」才算恢复。拉起成功（Popen 返回 PID）
             # 不代表监听成功——端口 bind 失败会立刻退出。
             if int(self.state.get("gallery_failures", 0)):

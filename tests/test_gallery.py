@@ -149,6 +149,43 @@ class TestTimestampNames(unittest.TestCase):
         self.assertTrue(vid.endswith("2026-10-20_094523.mp4"))
 
 
+class TestHealthz(GalleryFixture):
+    """guardian 的健康探测：/healthz 不需要登录，其它路径仍要。"""
+
+    def setUp(self):
+        super().setUp()
+        gallery.Handler.captures_dir = os.path.abspath(self.captures)
+        gallery.Handler.status_file = os.path.abspath(os.path.join(self.base, "status.json"))
+        self._old_token = getattr(gallery.Handler, "auth_token", "")
+        gallery.Handler.auth_token = "a-long-enough-token"
+        self.server = gallery.GalleryServer(("127.0.0.1", 0), gallery.Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        gallery.Handler.auth_token = self._old_token
+        super().tearDown()
+
+    def _request(self, path):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, b""
+
+    def test_healthz_needs_no_auth(self):
+        status, body = self._request("/healthz")
+        self.assertEqual(status, 200)
+        self.assertIn(b'"ok"', body)
+
+    def test_status_still_requires_auth(self):
+        status, _body = self._request("/status")
+        self.assertEqual(status, 401)
+
+
 class TestRangeRequests(GalleryFixture):
     """真的起一个服务打 HTTP——Range 对了才拖得动进度条。"""
 

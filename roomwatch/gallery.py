@@ -304,6 +304,17 @@ class Handler(SimpleHTTPRequestHandler):
         return False
 
     def do_GET(self):
+        # 健康探测不校验登录：guardian 只想知道 HTTP 线程还活着，
+        # 这里不返回画面、路径或配置，只有一行 ok。
+        if self.path == "/healthz":
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return
         if not self._auth_ok():
             return
         if self.path in ("/", "/index.html"):

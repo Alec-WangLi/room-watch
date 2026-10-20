@@ -496,6 +496,102 @@ class GuardStateRefreshTest(unittest.TestCase):
             start.assert_not_called()
 
 
+class GalleryHealthTest(unittest.TestCase):
+    """相册进程活着但 HTTP 卡死时，guardian 要能发现并重启。"""
+
+    def test_http_ok_against_real_server(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - 标准库命名
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(G.gallery_http_ok(server.server_address[1], timeout=2.0))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_closed_port_is_not_ok(self):
+        import socket
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        self.assertFalse(G.gallery_http_ok(port, timeout=0.3))
+
+    def _cfg(self, root):
+        return {"guardian": {
+                    "desired_state": str(root / "var/state/desired_state.json"),
+                    "state": str(root / "var/state/guardian_state.json"),
+                    "lock": str(root / "var/state/guardian.lock"),
+                    "history": str(root / "var/state/h.jsonl"),
+                    "gallery_pid": str(root / "var/state/gallery.pid"),
+                    "gallery_log": str(root / "var/logs/gallery.log"),
+                    "supervise_gallery": True},
+                "gallery": {"port": 8765, "host": "127.0.0.1"},
+                "health": {"path": str(root / "var/state/health.json"),
+                           "exit_record": str(root / "var/state/last_exit.json")},
+                "storage": {"status": str(root / "var/state/status.json")},
+                "__config_path__": str(root / "config.yaml")}
+
+    def _guard(self, root):
+        state = root / "var" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "gallery.pid").write_text(str(LIVE_PID), encoding="utf-8")
+        g = G.Guard(self._cfg(root), dry_run=True)
+        g._notify = lambda *args, **kwargs: None
+        return g
+
+    def test_two_http_failures_restart_gallery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            g = self._guard(root)
+            now = datetime.now()
+            with mock.patch.object(G, "decide_gallery", return_value=G.ACT_OK), \
+                 mock.patch.object(G, "gallery_http_ok", return_value=False), \
+                 mock.patch("roomwatch.guardian.control.stop_gallery",
+                            return_value={"method": "forced"}) as stop, \
+                 mock.patch.object(g, "_start_gallery", return_value=4242) as start:
+                self.assertEqual(g._check_gallery(now), G.ACT_WAIT)
+                self.assertEqual(g._check_gallery(now), G.ACT_RESTART_STALLED)
+        stop.assert_called_once()
+        start.assert_called_once()
+        self.assertEqual(g.state.get("gallery_http_failures"), 0)
+
+    def test_http_ok_clears_failure_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            g = self._guard(root)
+            g.state["gallery_http_failures"] = 1
+            with mock.patch.object(G, "decide_gallery", return_value=G.ACT_OK), \
+                 mock.patch.object(G, "gallery_http_ok", return_value=True):
+                self.assertEqual(g._check_gallery(datetime.now()), G.ACT_OK)
+        self.assertEqual(g.state.get("gallery_http_failures"), 0)
+
+    def test_uses_actual_port_from_gallery_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            g = self._guard(root)
+            (root / "var" / "state" / "gallery.json").write_text(
+                json.dumps({"pid": LIVE_PID, "port": 9999}), encoding="utf-8")
+            with mock.patch.object(G, "decide_gallery", return_value=G.ACT_OK), \
+                 mock.patch.object(G, "gallery_http_ok", return_value=True) as probe:
+                g._check_gallery(datetime.now())
+        probe.assert_called_once_with(9999, timeout=3.0)
+
+
 class GuardSupervisionTest(unittest.TestCase):
     def _cfg(self, root, **guardian):
         base = {
