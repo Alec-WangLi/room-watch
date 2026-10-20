@@ -83,10 +83,14 @@
   `tasklist /FI ... | find ...` 等更新器 PID，在无控制台的分离 cmd 里
   `find` 一直等管道 EOF，安装器永远不启动。已改为 tasklist 先写临时文件
   再 `find`，读不到也立刻放行。
-- 0.1.24 已构建并在真实会话安装；用本地安装包走真实交接脚本复验：
-  `installer rc=0`、监控自动恢复（新 watcher PID）、界面自动重开 0.1.24、
-  无 `update_failed.txt`；真实注册表/`Get-Package`/`rw doctor` 一致。
-- **待办**：所有者批准后合 `beta`、推、发 `v0.1.24-beta`。0.1.22/0.1.23
-  已装用户需手动安装一次 0.1.24；之后的自更新使用修复后的交接脚本。
+- 0.1.24 已合 `beta`、推送并发 `v0.1.24-beta`（tag `d852c2c`）：
+  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.1.24-beta
+  资产 `room-watch-0.1.24-setup.exe` + `.sha256`；简介取 CHANGELOG。
+- 真机复验：用本地安装包走真实交接脚本，`installer rc=0`、监控自动恢复
+  （新 watcher PID）、界面自动重开 0.1.24、无 `update_failed.txt`；
+  真实注册表/`Get-Package`/`rw doctor` 一致；更新检查返回
+  「0.1.24 / 测试版 / 已是最新」。
+- **0.1.22/0.1.23 已装用户需手动安装一次 0.1.24**；之后的自更新使用修复后的
+  交接脚本。0.1.23 的 Release 按所有者要求保留。
 - 慢速网络下载没有完整跑完（3 分钟约 8MB）；检查/下载逻辑已实际触发，
   交接/安装/恢复用本地安装包验证。

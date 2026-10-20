@@ -19,9 +19,9 @@
   `C:\Users\Alec\.workbuddy\binaries\python\envs\default\Scripts\python.exe`；
   默认 `python` 可能没有 cv2，以 `rw doctor` 为准。
 
-当前状态速览：`main` = 0.1.12（M0–M1），`beta` = 0.1.23（已发
-`v0.1.23-beta`）；0.1.24 修复更新交接脚本卡死，已在真实会话验证，
-等所有者批准后发 beta。0.1.22/0.1.23 用户需手动安装一次 0.1.24。
-详见 `docs/handoff/2026-10-20-next-session.md`。
+当前状态速览：`main` = 0.1.12（M0–M1），`beta` = 0.1.24（已发
+`v0.1.24-beta` 预发布）；本机已安装 0.1.24 并完成真机交接验证。
+0.1.22/0.1.23 用户需手动安装一次 0.1.24。详见
+`docs/handoff/2026-10-20-next-session.md`。
 发版通道：稳定版从 `main` 走 plain Release，测试版从 `beta` 走 prerelease
 （`scripts/release.py --channel stable|beta`）；发版需所有者明确同意。
