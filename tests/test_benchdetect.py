@@ -14,6 +14,7 @@ import json
 import unittest
 
 from roomwatch import benchdetect as B
+from roomwatch.rules import Detection
 
 
 class SummarizeTest(unittest.TestCase):
@@ -77,6 +78,54 @@ class EngineAvailabilityTest(unittest.TestCase):
         available = B.available_engines()
         self.assertIn("cv2", available)
         self.assertIsInstance(available, list)
+
+
+class PercentileTest(unittest.TestCase):
+    def test_p50_p95_use_linear_interpolation(self):
+        values = list(range(1, 101))
+        self.assertAlmostEqual(B.percentile(values, 50), 50.5, places=2)
+        self.assertAlmostEqual(B.percentile(values, 95), 95.05, places=2)
+
+    def test_empty_and_single_value(self):
+        self.assertEqual(B.percentile([], 95), 0.0)
+        self.assertAlmostEqual(B.percentile([7.2], 95), 7.2)
+
+
+class DetectionMatchTest(unittest.TestCase):
+    def _det(self, x1, y1, x2, y2, conf):
+        return Detection(x1=x1, y1=y1, x2=x2, y2=y2, conf=conf)
+
+    def test_identical_detections_match(self):
+        a = [self._det(10, 10, 110, 110, 0.9)]
+        self.assertTrue(B.detections_match(a, list(a)))
+
+    def test_conf_drift_within_tolerance(self):
+        a = [self._det(10, 10, 110, 110, 0.90)]
+        b = [self._det(10, 10, 110, 110, 0.91)]
+        self.assertTrue(B.detections_match(a, b))
+
+    def test_missing_box_is_rejected(self):
+        a = [self._det(10, 10, 110, 110, 0.9)]
+        b = a + [self._det(200, 200, 300, 300, 0.8)]
+        self.assertFalse(B.detections_match(a, b))
+
+    def test_low_iou_is_rejected(self):
+        a = [self._det(10, 10, 110, 110, 0.9)]
+        b = [self._det(30, 30, 130, 130, 0.9)]
+        self.assertFalse(B.detections_match(a, b))
+
+
+class EngineSettingTest(unittest.TestCase):
+    def test_cv2_maps_to_existing_onnx_engine(self):
+        self.assertEqual(B.engine_setting("cv2"), "onnx")
+        self.assertEqual(B.engine_setting("onnxruntime"), "onnxruntime")
+
+    def test_auto_keeps_detector_default(self):
+        self.assertIsNone(B.engine_setting("auto"))
+
+    def test_unknown_engine_raises(self):
+        with self.assertRaises(ValueError):
+            B.engine_setting("nope")
 
 
 if __name__ == "__main__":

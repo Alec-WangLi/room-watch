@@ -201,6 +201,68 @@ class OnnxDetector:
         ]
 
 
+class OnnxRuntimeDetector:
+    """ONNX Runtime 推理后端（可选，不默认捆绑）。
+
+    只在基准证明有明显收益时才考虑切换；未安装 onnxruntime 时构造会明确报错，
+    模块导入本身不受影响（惰性 import）。
+    """
+
+    name = "onnxruntime"
+
+    def __init__(
+        self,
+        model_path: str,
+        imgsz: int = 640,
+        conf: float = 0.55,
+        iou: float = 0.45,
+        threads: int = 2,
+    ) -> None:
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError("onnxruntime 未安装") from exc
+
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f"找不到 ONNX 模型 {model_path}。"
+                "请先执行 python -m roomwatch.onnx_detector --export yolov8n.pt"
+            )
+        self.model_path = model_path
+        self.imgsz = int(imgsz)
+        self.conf = float(conf)
+        self.iou = float(iou)
+        self.threads = max(1, int(threads))
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = self.threads
+        options.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(
+            model_path, sess_options=options, providers=["CPUExecutionProvider"]
+        )
+        self.input_name = self.session.get_inputs()[0].name
+
+    def detect(self, frame: np.ndarray) -> list[Detection]:
+        canvas, scale, dx, dy = letterbox(frame, self.imgsz)
+        blob = cv2.dnn.blobFromImage(
+            canvas, 1.0 / 255.0, (self.imgsz, self.imgsz), swapRB=True, crop=False
+        )
+        out = self.session.run(None, {self.input_name: blob})[0]
+        h, w = frame.shape[:2]
+        boxes, scores = decode(out, self.conf, scale, (dx, dy), (h, w))
+        keep = nms(boxes, scores, self.iou)
+        return [
+            Detection(
+                x1=float(boxes[i][0]),
+                y1=float(boxes[i][1]),
+                x2=float(boxes[i][2]),
+                y2=float(boxes[i][3]),
+                conf=float(scores[i]),
+            )
+            for i in keep
+        ]
+
+
 class TorchDetector:
     """兜底实现：没有 ONNX 文件时仍能跑，但会把 torch 拖回来。"""
 
@@ -250,6 +312,8 @@ def build_detector(cfg: dict, base_dir: Optional[str] = None):
 
     if engine == "torch":
         return TorchDetector(pt_path, imgsz, conf, iou, threads)
+    if engine == "onnxruntime":
+        return OnnxRuntimeDetector(onnx_path, imgsz, conf, iou, threads)
     if engine == "onnx":
         return OnnxDetector(onnx_path, imgsz, conf, iou, threads)
 
