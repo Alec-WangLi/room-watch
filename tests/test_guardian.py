@@ -448,6 +448,54 @@ class GuardRecoveryTest(unittest.TestCase):
             self.assertTrue(any("自检" in s for s in sent))
 
 
+class GuardStateRefreshTest(unittest.TestCase):
+    """`rw start` 会同时跑常驻 guardian 和 `guard --once`。
+
+    两个进程各自构造 Guard；`--once` 若沿用构造时的旧状态，就看不到常驻
+    guardian 刚拉起的 watcher，会再拉起一个（真机 0.1.22 升级时实测两个 watcher
+    抢同一个摄像头）。拿到检查锁后必须重新读状态。
+    """
+
+    def _cfg(self, root):
+        return {"guardian": {
+                    "desired_state": str(root / "var/state/desired_state.json"),
+                    "state": str(root / "var/state/guardian_state.json"),
+                    "lock": str(root / "var/state/guardian.lock"),
+                    "history": str(root / "var/state/h.jsonl"),
+                    "gallery_pid": str(root / "var/state/gallery.pid"),
+                    "gallery_log": str(root / "var/logs/gallery.log"),
+                    "supervise_gallery": False},
+                "health": {"path": str(root / "var/state/health.json"),
+                           "exit_record": str(root / "var/state/last_exit.json")},
+                "storage": {"status": str(root / "var/state/status.json")},
+                "__config_path__": str(root / "config.yaml")}
+
+    def test_once_sees_spawn_recorded_by_resident_guardian(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "var" / "state"
+            state.mkdir(parents=True)
+            (state / "status.json").write_text(json.dumps({
+                "pid": DEAD_PID,
+                "last_frame_at": (datetime.now() - timedelta(minutes=5))
+                .isoformat(timespec="seconds"),
+            }), encoding="utf-8")
+
+            resident = G.Guard(self._cfg(root), dry_run=True)
+            once = G.Guard(self._cfg(root), dry_run=True)   # 先构造，拿到的是旧状态
+            resident._notify = lambda *args, **kwargs: None
+            once._notify = lambda *args, **kwargs: None
+
+            with mock.patch.object(resident, "_start_watcher", return_value=LIVE_PID):
+                self.assertEqual(resident.check_once(), G.ACT_RESTART_GONE)
+
+            # 拿到检查锁后的刷新动作；没有这一步，once 会再次拉起 watcher。
+            once._reload_state()
+            with mock.patch.object(once, "_start_watcher", return_value=4242) as start:
+                self.assertEqual(once.check_once(), G.ACT_WAIT)
+            start.assert_not_called()
+
+
 class GuardSupervisionTest(unittest.TestCase):
     def _cfg(self, root, **guardian):
         base = {

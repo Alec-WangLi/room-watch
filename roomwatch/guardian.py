@@ -442,6 +442,17 @@ class Guard:
             pass
         return base
 
+    def _reload_state(self) -> None:
+        """拿到检查锁后重新读状态。
+
+        常驻 guardian 和 `guard --once` 是两个进程；后者在拿到锁之前就构造了
+        Guard，内存里的 last_spawn_pid 还是旧的，会把刚拉起的 watcher 当成
+        「进程已不存在」再拉一个。原地更新字典，保证 HeartbeatSender 的引用不失效。
+        """
+        fresh = self._load_state()
+        self.state.clear()
+        self.state.update(fresh)
+
     def _save_state(self) -> None:
         self.state["last_check_at"] = datetime.now().isoformat(timespec="seconds")
         try:
@@ -1066,6 +1077,7 @@ class Guard:
                     with FileLock(self.lock_path) as got:
                         if got:
                             checked = True
+                            self._reload_state()
                             action = self.check_once()
                         else:
                             log.debug("另一个守护实例正在检查，跳过本轮")
@@ -1168,6 +1180,7 @@ def main(argv: list[str] | None = None) -> None:
             if not got:
                 log.info("另一个守护实例正在检查，本轮跳过")
                 return
+            guard._reload_state()
             action = guard.check_once()
         log.info("单次检查完成：%s", action)
         try:
