@@ -74,3 +74,19 @@
 - 版本只动第三位；先写失败测试；不擅自打 tag / 发 Release。
 - 所有者说「推送到远程」默认等于打 tag + 发 Release；通道要判断正确。
 - 不要杀正在运行的 watcher/gallery；界面窗口可以关。
+
+## 7. 0.1.23（进行中）
+
+- 分支 `feat/0.1.23-stability`；VERSION 0.1.23，全量测试通过。
+- **相册假活**：gallery 新增 `GET /healthz`（无需登录，只返回 ok）；
+  guardian 每轮探测，连续 2 次失败就 `stop_gallery` + 重启 + 推送通知；
+  实际端口优先读 `var/state/gallery.json`，兼容 8765 被占用后换端口。
+- **安装版本检查**：`rw doctor` 新增「安装版本」；安装版的
+  `VERSION` 必须等于卸载项 `DisplayVersion`，不一致提示重跑安装包；
+  便携版/源码运行跳过。
+- **已真机验证**：真实会话安装 0.1.23，真实注册表/`Get-Package` 0.1.23，
+  `rw doctor` 显示一致，`room-watch.exe --selftest` ok 0.1.23，
+  `/healthz` 返回 true，单 watcher + gallery 正常。
+- **待办**：所有者批准 → 合 `beta`、推送、发 `v0.1.23-beta`；然后用本机
+  已装的 0.1.22 走界面「检查更新 → 安装」，验证整条自动更新链路
+  （这是本轮第 2 项）。24 小时 soak 按所有者意见降级，不再单独安排。

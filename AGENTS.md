@@ -735,6 +735,12 @@ room-watch-<版本>\
 - **已发布**：`v0.1.22-beta`（prerelease，tag 指向 `4b801d7`）：
   https://github.com/Alec-WangLi/room-watch/releases/tag/v0.1.22-beta
   资产 `room-watch-0.1.22-setup.exe` + `.sha256`；简介取自 CHANGELOG。
+- **0.1.23（进行中，分支 `feat/0.1.23-stability`）**：gallery 新增
+  `/healthz`，guardian 连续 2 次探测失败就重启相册并通知（实际端口读
+  `gallery.json`）；`rw doctor` 新增安装版 VERSION / 卸载项 DisplayVersion
+  一致性检查。已构建并在真实会话安装 0.1.23，真实注册表、`Get-Package`、
+  `rw doctor`、界面自检、`/healthz` 均通过。待所有者批准后合回 `beta`、
+  发 `v0.1.23-beta`，再用已装的 0.1.22 走界面自动更新验证整条链路。
 - **未做**：托盘（需 pystray + 真机）、M6 平台抽象、干净机器安装验证。
 - **下一步**：观察 0.1.22 真机运行与后续自动更新；稳定后升修订号合 `main`，
   从 `main` 发 stable。发版仍需所有者明确同意。

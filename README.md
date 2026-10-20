@@ -332,8 +332,9 @@ rw test --fast   # 跳过最慢的集成测试（约 55 秒）
 
 - **本人在场时默认仍录像**：`record.owner_at_computer` 默认 `mute`（照录不推送）。
   想连录像一起停就显式改成 `skip`；容量上限与存储预测会兜底。
-- **相册只按 PID + 命令行判活**：进程还在但 HTTP 卡死时，guardian 不会发现；
-  这时看 `var/logs/gallery.log` 或手动重启相册。
+- **相册按 PID + `/healthz` 判活**：进程在但 HTTP 连续两次无响应（默认检查间隔
+  60 秒）时，guardian 会重启相册并推送通知；实际端口从 `var/state/gallery.json`
+  读取，8765 被占用后自动换端口也能探测到。
 - **暂停后需要显式启动**：`rw stop` / 界面「停止监控」会写 `paused`，
   之后必须 `rw start` / 界面「启动监控」才会恢复；guardian 不会自动拉起。
 
