@@ -60,4 +60,8 @@ if (-not (Test-Path "dist\room-watch.exe")) {
 
 Write-Host "运行自检 ..." -ForegroundColor Cyan
 & "dist\room-watch.exe" --selftest
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[失败] 界面自检未通过（退出码 $LASTEXITCODE），不继续打包" -ForegroundColor Red
+    exit 1
+}
 Write-Host "完成：$root\dist\room-watch.exe" -ForegroundColor Green

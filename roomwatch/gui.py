@@ -322,6 +322,33 @@ def _update_check(python: str, project: Path, timeout: float = 180.0):
     )
 
 
+class CheckGeneration:
+    """检查结果的代次。
+
+    保存更新设置、或重新发起检查时代次 +1；旧代次的结果（可能来自保存前的
+    配置）一律丢弃，否则会拿旧通道的结果去弹「已是最新 / 有新版本」。
+    """
+
+    def __init__(self) -> None:
+        self.value = 0
+
+    def next(self) -> int:
+        self.value += 1
+        return self.value
+
+    def invalidate(self) -> None:
+        self.value += 1
+
+    def accepts(self, gen: int) -> bool:
+        return gen == self.value
+
+
+def up_to_date_text(current: str, channel_label: str) -> str:
+    """「已是最新」的文案。通道未知时不要擅自说成稳定版。"""
+    suffix = f"（{channel_label}通道）" if channel_label else ""
+    return f"当前版本 {current} 就是最新版本{suffix}。"
+
+
 def guard_command(python: str, root: Path, config_path: str, *, once: bool = False) -> list[str]:
     """启动守护进程；`once=True` 时立即触发一轮检查。"""
     log = Path(root) / "var" / "logs" / "guardian.log"
@@ -434,7 +461,8 @@ def _relaunch_with_tk(argv: Sequence[str]) -> int:
 class RoomWatchApp:
     """主窗口。所有耗时动作都起子进程/后台线程，界面线程只负责画。"""
 
-    def __init__(self, project: Path, tk_module, ttk_module, messagebox, font_module) -> None:
+    def __init__(self, project: Path, tk_module, ttk_module, messagebox, font_module,
+                 *, selftest: bool = False) -> None:
         self.project = Path(project)
         self.config = self.project / "config.yaml"
         self.python = paths.find_python()
@@ -459,13 +487,18 @@ class RoomWatchApp:
         self._update_badge = ""
         self._checking = False
         self._check_manual = False
-        self._check_queue: "queue.Queue[dict]" = queue.Queue()
+        self._pending_manual = False
+        self._check_gen = CheckGeneration()
+        self._updating = False
+        self._check_queue: "queue.Queue[tuple[int, dict]]" = queue.Queue()
 
         self.win = tk_module.Tk()
         self.win.title(f"房间监控 {__version__}")
         self.win.geometry("720x740")
         # 工具栏本身需要约 650px；窗口再窄就会把右侧按钮挤成 1px。
-        self.win.minsize(700, 640)
+        # 高度低于 700 时底栏和事件表会互相挤压（0.1.22 真机底栏被裁），
+        # 700 仍能放进 1366×768 的可用桌面。
+        self.win.minsize(700, 700)
 
         base = font_module.nametofont("TkDefaultFont")
         self.font_big = (base.actual("family"), 16, "bold")
@@ -476,6 +509,8 @@ class RoomWatchApp:
         self._pump()
         self._init_update_state()
         self.refresh_identity()
+        if not selftest:
+            self.win.after(1500, self._check_update_failure)
 
     # ---------------- 界面搭建 ----------------
 
@@ -531,6 +566,15 @@ class RoomWatchApp:
         self.btn_verify = ttk.Button(tools, text="验证", command=self.on_verify)
         self.btn_verify.pack(side="left", padx=(6, 0))
 
+        # 底栏：先占住底部，再让事件列表吃掉剩余空间。
+        # 反过来（底栏最后 pack）时，窗口一矮底栏就会被压成一行高度，第二行被裁掉。
+        # 用 tk.Label：ttk.Label 不接受 fg（会抛 unknown option "-fg"）
+        self.footer_label = tk.Label(
+            outer, text=f"项目：{self.project}\n解释器：{self.python}",
+            font=self.font_small, fg="#888", anchor="w", justify="left")
+        self.footer_label.pack(side="bottom", fill="x", pady=(8, 0))
+        self.footer_label.bind("<Configure>", self._fit_footer)
+
         # 事件列表
         box = ttk.LabelFrame(outer, text="最近事件", padding=8)
         box.pack(fill="both", expand=True)
@@ -545,11 +589,15 @@ class RoomWatchApp:
         scroll.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=scroll.set)
 
-        # 底栏
-        # 底栏用 tk.Label：ttk.Label 不接受 fg（会抛 unknown option "-fg"）
-        tk.Label(outer, text=f"项目：{self.project}   ·   解释器：{self.python}",
-                 font=self.font_small, fg="#888", anchor="w", justify="left",
-                 wraplength=660).pack(fill="x", pady=(8, 0))
+    def _fit_footer(self, event) -> None:
+        """按实际宽度换行；固定 wraplength 在窄窗口里会把路径截掉。"""
+        target = max(200, int(event.width) - 4)
+        try:
+            current = int(float(self.footer_label.cget("wraplength") or 0))
+        except (TypeError, ValueError):
+            current = 0
+        if current != target:
+            self.footer_label.configure(wraplength=target)
 
     # ---------------- 刷新 ----------------
 
@@ -1147,6 +1195,18 @@ class RoomWatchApp:
         if updater.should_auto_check(cache, interval):
             self._start_check(manual=False)
 
+    def _check_update_failure(self) -> None:
+        """上次安装器失败时明确告诉用户，别让人以为已经更新成功。"""
+        text = updater.take_update_failure(self.project)
+        if not text:
+            return
+        self.messagebox.showwarning(
+            "上次更新没有完成",
+            "安装器没有成功完成，当前版本可能仍然是旧的。\n\n"
+            f"{text}\n\n"
+            "可以回到「检查更新」重试，或手动运行安装包。\n"
+            "详细日志：var\\logs\\update.log")
+
     def _apply_update_cache(self, cache: dict) -> None:
         if not cache:
             return
@@ -1161,9 +1221,13 @@ class RoomWatchApp:
 
     def _start_check(self, manual: bool) -> None:
         if self._checking:
+            # 已经有一次检查在跑：手动请求排队，等这次结束后立刻重查。
+            if manual:
+                self._pending_manual = True
             return
         self._checking = True
         self._check_manual = manual
+        gen = self._check_gen.next()
         if manual:
             self.btn_update.configure(text="检查中…", state="disabled")
 
@@ -1178,7 +1242,7 @@ class RoomWatchApp:
                 data = {"error": f"检查失败：{exc}"}
             except ValueError:
                 data = {"error": "检查失败：输出不是有效 JSON"}
-            self._check_queue.put(data)
+            self._check_queue.put((gen, data))
 
         threading.Thread(target=work, daemon=True).start()
         self.win.after(400, self._poll_check)
@@ -1186,9 +1250,16 @@ class RoomWatchApp:
     def _poll_check(self) -> None:
         """主线程轮询检查结果（tkinter 不是线程安全的，线程只往队列里放）。"""
         try:
-            data = self._check_queue.get_nowait()
+            gen, data = self._check_queue.get_nowait()
         except queue.Empty:
-            self.win.after(400, self._poll_check)
+            if self._checking:
+                self.win.after(400, self._poll_check)
+            return
+
+        if not self._check_gen.accepts(gen):
+            # 保存了更新设置或已经发起了新一轮检查：这份结果代表旧配置，丢弃。
+            if self._checking:
+                self.win.after(50, self._poll_check)
             return
 
         self._checking = False
@@ -1201,6 +1272,7 @@ class RoomWatchApp:
                 text=f"有新版本 {self._update_badge}" if self._update_badge else "检查更新")
             if manual:
                 self.messagebox.showwarning("检查更新失败", error)
+            self._run_pending_check()
             return
 
         cache = {key: data.get(key) for key in (
@@ -1211,13 +1283,29 @@ class RoomWatchApp:
         newer = updater.available_version(cache, __version__)
         if not newer:
             if manual:
-                label = str(cache.get("channel_label") or "稳定版")
+                label = str(cache.get("channel_label") or "")
                 self.messagebox.showinfo(
-                    "已是最新",
-                    f"当前版本 {__version__} 就是最新版本（{label}通道）。")
+                    "已是最新", up_to_date_text(__version__, label))
+            self._run_pending_check()
             return
         if manual:
             self._ask_install(cache, newer)
+        self._run_pending_check()
+
+    def _run_pending_check(self) -> None:
+        if self._pending_manual and not self._updating:
+            self._pending_manual = False
+            self._start_check(manual=True)
+
+    def on_update_settings_changed(self) -> None:
+        """设置里保存了 update.* 之后调用：旧结果作废，按新配置重新检查。"""
+        self._check_gen.invalidate()
+        self._checking = False
+        self._pending_manual = False
+        self._update_info = {}
+        self._update_badge = ""
+        self.btn_update.configure(text="检查更新", state="normal")
+        self._start_check(manual=False)
 
     def on_update(self) -> None:
         if self._update_badge:
@@ -1271,6 +1359,7 @@ class RoomWatchApp:
         except OSError as exc:
             self.messagebox.showerror("更新启动失败", str(exc))
             return
+        self._updating = True
         self.status_label.configure(text="● 正在更新，界面即将关闭…", fg="#666")
         self.btn_update.configure(state="disabled")
         self.win.after(800, self.win.destroy)
@@ -1353,12 +1442,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     _trace("building app")
-    app = RoomWatchApp(root, tk, ttk, messagebox, tkfont)
+    app = RoomWatchApp(root, tk, ttk, messagebox, tkfont,
+                       selftest="--selftest" in argv)
     _trace("app built")
 
     if "--selftest" in argv:
         # 不进入事件循环：建窗 → 校验关键控件 → 打开一次设置窗 → 销毁。
-        # 用于构建后验证 exe 真的能起来，且版面没退化成空窗口。
+        # 用于构建后验证 exe 真的能起来、且每个页面在默认/最小尺寸下都不裁字。
         app.win.update()
         problems: list[str] = []
         if "●" not in app.status_label.cget("text"):
@@ -1381,6 +1471,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         if "本人模板" not in app.identity_label.cget("text"):
             problems.append("身份状态行没有渲染")
 
+        # 底栏路径：默认窗口和最小窗口都必须完整显示（0.1.22 真机被裁过）。
+        footer = app.footer_label
+        footer_text = str(footer.cget("text"))
+        if "项目：" not in footer_text or "解释器：" not in footer_text:
+            problems.append("底栏没有项目/解释器路径")
+        for geometry in ("720x740", "700x700"):
+            app.win.geometry(geometry)
+            app.win.update()
+            if footer.winfo_height() < footer.winfo_reqheight():
+                problems.append(
+                    f"底栏被裁切（{geometry}：{footer.winfo_height()}"
+                    f"<{footer.winfo_reqheight()}px）")
+            if app.tree.winfo_height() < 40:
+                problems.append(
+                    f"事件表被挤得看不见（{geometry}：{app.tree.winfo_height()}px）")
+        app.win.geometry("720x740")
+        app.win.update()
+
         # 打包后的界面必须自带 psutil：没有它，判活会回退到 tasklist，
         # 而每 2 秒一次的 tasklist 会让窗口持续闪控制台。构建自检直接拦下。
         if getattr(sys, "frozen", False):
@@ -1391,12 +1499,69 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         from . import gui_settings
 
+        def tab_clipping(frame, name: str) -> list[str]:
+            """找出被右边缘裁掉的文字和不可见的按钮/输入框。"""
+            found: list[str] = []
+            stack = [frame]
+            while stack:
+                widget = stack.pop()
+                stack.extend(widget.winfo_children())
+                if not widget.winfo_ismapped():
+                    continue
+                try:
+                    text = str(widget.cget("text") or "")
+                except Exception:  # noqa: BLE001 - 控件没有 text
+                    text = ""
+                try:
+                    wrap = int(float(widget.cget("wraplength") or 0))
+                except Exception:  # noqa: BLE001 - 控件没有 wraplength
+                    wrap = 0
+                width = widget.winfo_width()
+                if text and wrap > width + 2:
+                    found.append(
+                        f"{name}：「{text[:18]}…」换行宽度 {wrap} > 控件 {width}px")
+                if (widget.winfo_class() in ("TButton", "TEntry", "TCombobox",
+                                             "Button", "Entry")
+                        and width <= 1):
+                    found.append(f"{name}：{widget.winfo_class()} 被挤出（宽度 {width}px）")
+            return found
+
         dialog = gui_settings.SettingsDialog(app, autoload=False)
         app.win.update()
         tabs = dialog.notebook.tabs()
         expected_tabs = len(gui_settings.SECTIONS)
         if len(tabs) != expected_tabs:
             problems.append(f"设置页签数量是 {len(tabs)}，应为 {expected_tabs}")
+        snapshot = app._run_cli(["config", "--json"], timeout=60)
+        if not snapshot.get("ok") or not snapshot.get("labels"):
+            problems.append("设置页读取配置失败，无法检查版面")
+        else:
+            dialog._on_snapshot(snapshot)
+            app.win.update()
+            for geometry in ("800x700", "720x680"):
+                dialog.win.geometry(geometry)
+                dialog.win.update()
+                for idx, name in enumerate(gui_settings.SECTIONS):
+                    dialog.notebook.select(idx)
+                    dialog.win.update()
+                    frame = dialog.tab_frames[name]
+                    # 推送页是滚动区，内容可以比可视高度长；其余页必须放得下。
+                    if (name != "推送"
+                            and frame.winfo_reqheight() > frame.winfo_height() + 1):
+                        problems.append(
+                            f"{name}页内容高度不足（{geometry}："
+                            f"{frame.winfo_height()}<{frame.winfo_reqheight()}px）")
+                    problems.extend(tab_clipping(frame, name))
+            for label, btn in (("保存", dialog.btn_save), ("关闭", dialog.btn_close)):
+                if btn.winfo_width() <= 1 or not btn.winfo_ismapped():
+                    problems.append(f"设置窗口「{label}」按钮不可见")
+                elif (btn.winfo_rooty() + btn.winfo_height()
+                      > dialog.win.winfo_rooty() + dialog.win.winfo_height()):
+                    problems.append(f"设置窗口「{label}」按钮被窗口底边裁掉")
+            if dialog.footer.winfo_height() < dialog.footer.winfo_reqheight():
+                problems.append(
+                    f"设置窗口底部按钮行被裁切（{dialog.footer.winfo_height()}"
+                    f"<{dialog.footer.winfo_reqheight()}px）")
         dialog.close()
 
         width = app.win.winfo_width()
@@ -1410,7 +1575,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             log.write_text(f"FAIL {__version__} {stamp} {'; '.join(problems)}\n", encoding="utf-8")
             print(f"界面自检失败：{'; '.join(problems)}")
             return 1
-        log.write_text(f"ok {__version__} {stamp} 窗口 {width}x{height} 控件齐全\n", encoding="utf-8")
+        log.write_text(
+            f"ok {__version__} {stamp} 窗口 {width}x{height} "
+            f"九个设置页两档尺寸无裁切\n", encoding="utf-8")
         print(f"界面自检通过（{__version__}），窗口 {width}x{height}，记录：{log}")
         return 0
 

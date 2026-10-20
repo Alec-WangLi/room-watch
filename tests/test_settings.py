@@ -23,7 +23,7 @@ from unittest import mock
 
 import yaml
 
-from roomwatch import settings
+from roomwatch import gui_settings, settings
 
 WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=1fcbf0dc-d33c-4dac-83d6-10c1c99a5179"
 
@@ -567,6 +567,25 @@ class RecordSettingsTest(unittest.TestCase):
         self.assertEqual(storage["max_bytes"], 10 * 1024 ** 3)
         self.assertEqual(storage["keep_days"], 30)
         self.assertEqual(storage["forecast"]["used_bytes"], 4096)
+
+
+class SavedStatusTest(unittest.TestCase):
+    """保存结果不能被随后的 reload 盖掉，更新设置保存后要触发重查。"""
+
+    def test_saved_status_lists_restart_scope(self) -> None:
+        self.assertEqual(
+            gui_settings.saved_status_text({"requires_restart": ["watcher", "gallery"]}),
+            "已保存；需要重启：监控、相册")
+        self.assertEqual(
+            gui_settings.saved_status_text({"requires_restart": []}),
+            "已保存并立即生效。")
+
+    def test_update_settings_trigger_recheck(self) -> None:
+        self.assertTrue(gui_settings.touches_update_settings(["update.channel"]))
+        self.assertTrue(
+            gui_settings.touches_update_settings(["update.check_interval_hours"]))
+        self.assertFalse(gui_settings.touches_update_settings(["camera.index"]))
+        self.assertFalse(gui_settings.touches_update_settings(None))
 
 
 if __name__ == "__main__":

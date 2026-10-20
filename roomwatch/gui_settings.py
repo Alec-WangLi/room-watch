@@ -30,6 +30,22 @@ RESTART_TEXT = {
     "gallery": "需重启相册",
 }
 
+_RESTART_NAMES = {"watcher": "监控", "guardian": "守护进程", "gallery": "相册"}
+
+
+def saved_status_text(result: dict) -> str:
+    """保存成功后状态栏该说的话（独立成纯函数，便于单测）。"""
+    scopes = result.get("requires_restart") or []
+    if scopes:
+        names = "、".join(_RESTART_NAMES.get(str(s), str(s)) for s in scopes)
+        return "已保存；需要重启：" + names
+    return "已保存并立即生效。"
+
+
+def touches_update_settings(applied) -> bool:
+    """这次保存是否动了更新通道/检查间隔。动了就要作废旧检查结果并重查。"""
+    return any(str(key).startswith("update.") for key in (applied or []))
+
 
 class SettingsDialog:
     """一个 Toplevel。`autoload=False` 时只建骨架，供 --selftest 使用。"""
@@ -45,15 +61,18 @@ class SettingsDialog:
         self._built = False       # 控件是否已按快照建出来（只建一次）
         self._populated = False   # 是否至少成功读过一次配置
         self._saving = False
+        self._saved_notice: Optional[tuple[str, str]] = None   # reload 会覆盖状态栏，先存这里
 
         self.win = self.tk.Toplevel(app.win)
         self.win.title("设置 · 房间监控")
         self.win.geometry("800x700")
-        self.win.minsize(720, 620)
+        # 「录像」页在 720 宽时需要约 579px 内容高度；再加上页签栏和底部按钮，
+        # 680 才能既放得下内容又不裁底部按钮（1366×768 的可用桌面仍放得下）。
+        self.win.minsize(720, 680)
         self.win.transient(app.win)
 
         self.notebook = self.ttk.Notebook(self.win)
-        self.notebook.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+        # 先不 pack：底部按钮必须先占位，否则窗口一矮，页签会把「保存/关闭」挤出窗口。
 
         self.tab_frames: dict = {}
         self.rows_holder: dict = {}
@@ -101,7 +120,8 @@ class SettingsDialog:
         self._build_push_actions(self.actions_holder["推送"], self.rows_holder["推送"])
 
         footer = self.ttk.Frame(self.win)
-        footer.pack(fill="x", padx=12, pady=(0, 12))
+        self.footer = footer
+        footer.pack(side="bottom", fill="x", padx=12, pady=(0, 12))
         self.status_label = self.tk.Label(footer, text="读取当前配置…", anchor="w",
                                           font=app.font_small, fg="#666")
         self.status_label.pack(side="left", fill="x", expand=True)
@@ -109,6 +129,9 @@ class SettingsDialog:
         self.btn_close.pack(side="right", padx=(6, 0))
         self.btn_save = self.ttk.Button(footer, text="保存", command=self.on_save)
         self.btn_save.pack(side="right")
+
+        # 底部按钮占好位之后再让页签吃掉剩余空间。
+        self.notebook.pack(fill="both", expand=True, padx=12, pady=(12, 6))
 
         if autoload:
             self.reload()
@@ -260,11 +283,11 @@ class SettingsDialog:
 
     def _on_test_heartbeat(self, result: dict) -> None:
         if result.get("ok"):
-            self.status_label.configure(text="心跳成功", fg="#0F6E56")
+            self._saved_notice = ("心跳成功", "#0F6E56")
             self.app.messagebox.showinfo("心跳成功", "外部心跳 URL 已返回 2xx。")
         else:
             message = str(result.get("message") or result.get("error") or "未知原因")
-            self.status_label.configure(text="心跳失败", fg="#993C1D")
+            self._saved_notice = ("心跳失败", "#993C1D")
             self.app.messagebox.showerror("心跳失败", message)
         self.reload()
 
@@ -408,7 +431,37 @@ class SettingsDialog:
             data.get("channels") or [], data.get("outbox") or {},
             data.get("channel_issues") or {},
             events_deliverable=bool(data.get("events_deliverable", True)))
-        self.status_label.configure(text="已读取。保存后会提示哪些设置需要重启。", fg="#666")
+        if self._saved_notice:
+            text, color = self._saved_notice
+            self._saved_notice = None
+            self.status_label.configure(text=text, fg=color)
+        else:
+            self.status_label.configure(
+                text="已读取。保存后会提示哪些设置需要重启。", fg="#666")
+
+    def _autowrap_all(self, widget) -> None:
+        """让所有需要换行的标签跟随实际宽度。
+
+        原先固定 wraplength=700/560，窗口缩到最小宽度时可用宽度不足，
+        文字会在右边缘被直接裁掉（不换行）。这里统一改成按控件实际宽度换行。
+        """
+        try:
+            if int(float(widget.cget("wraplength") or 0)) > 0:
+                widget.bind("<Configure>",
+                            lambda event, target=widget: self._fit_wrap(target, event.width))
+        except Exception:  # noqa: BLE001 - 控件不支持 wraplength
+            pass
+        for child in widget.winfo_children():
+            self._autowrap_all(child)
+
+    @staticmethod
+    def _fit_wrap(label, width: int) -> None:
+        target = max(120, int(width) - 4)
+        try:
+            if int(float(label.cget("wraplength") or 0)) != target:
+                label.configure(wraplength=target)
+        except Exception:  # noqa: BLE001 - 窗口已关闭
+            pass
 
     def _fill_rows(self, values: dict, secrets: dict) -> None:
         """第一次建控件；之后只刷新值。
@@ -423,6 +476,7 @@ class SettingsDialog:
                     continue
                 self._make_row(holder, key, meta, values.get(key), secrets.get(key) or {})
             self._built = True
+            self._autowrap_all(self.win)
         else:
             for key, var in self.vars.items():
                 meta = self.labels.get(key) or {}
@@ -557,16 +611,13 @@ class SettingsDialog:
             self.status_label.configure(text="没有保存：有设置项不合法", fg="#993C1D")
             self.app.messagebox.showerror("保存失败", detail)
             return
-        scopes = result.get("requires_restart") or []
-        if scopes:
-            names = {"watcher": "监控", "guardian": "守护进程", "gallery": "相册"}
-            text = "已保存；需要重启：" + "、".join(names.get(s, s) for s in scopes)
-        else:
-            text = "已保存并立即生效。"
-        self.status_label.configure(text=text, fg="#0F6E56")
+        # reload() 会把状态栏改回「读取中/已读取」，所以保存结果留到刷新完成后再显示。
+        self._saved_notice = (saved_status_text(result), "#0F6E56")
         for key, var in self.vars.items():
             if (self.labels.get(key) or {}).get("secret"):
                 var.set("")
+        if touches_update_settings(result.get("applied")):
+            self.app.on_update_settings_changed()
         self.reload()
         self.app.refresh_identity()
 
@@ -592,7 +643,7 @@ class SettingsDialog:
         self.btn_save.configure(state="normal")
         detail = result.get("detail") or {}
         if result.get("ok"):
-            self.status_label.configure(text="测试消息已发出，去手机看看。", fg="#0F6E56")
+            self._saved_notice = ("测试消息已发出，去手机看看。", "#0F6E56")
             self.app.messagebox.showinfo("测试消息", "发送成功。手机上应该收到一条「推送测试」。")
             for key, var in self.vars.items():
                 if (self.labels.get(key) or {}).get("secret"):

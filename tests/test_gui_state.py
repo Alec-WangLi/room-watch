@@ -461,5 +461,25 @@ class StorageStateTest(unittest.TestCase):
         self.assertIsNone(state.storage_days_left)
 
 
+class UpdateCheckGenerationTest(unittest.TestCase):
+    """保存更新设置后，旧配置的检查结果不许再覆盖界面。"""
+
+    def test_old_generation_is_rejected(self) -> None:
+        gen = gui.CheckGeneration()
+        first = gen.next()
+        self.assertTrue(gen.accepts(first))
+        gen.invalidate()
+        self.assertFalse(gen.accepts(first))
+        second = gen.next()
+        self.assertTrue(gen.accepts(second))
+        self.assertFalse(gen.accepts(first))
+
+    def test_up_to_date_text_uses_result_channel(self) -> None:
+        text = gui.up_to_date_text("0.1.22", "测试版")
+        self.assertIn("测试版通道", text)
+        # 结果里没有通道时不能擅自说成稳定版（0.1.21 真机误报的来源之一）。
+        self.assertNotIn("稳定版", gui.up_to_date_text("0.1.22", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
