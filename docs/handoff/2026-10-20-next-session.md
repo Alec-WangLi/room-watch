@@ -151,3 +151,23 @@
   同场景进程 CPU 从约 128% 降到 52–55%；3 分钟 1748 帧里推理 353 次，
   `owner_throttled` 1395。
 - 待办：稳定观察后再把 `beta` 合回 `main`；再次发版需先升修订号。
+
+## 10. 0.2.2 M3 编码器 + M4 基准（开发中，2026-10-21）
+
+- 分支 `feat/m3-m4-performance`（从 `beta` 切出），未合并、未发版。
+- M3：录像后端抽象为 `videoenc.py`（编码器探测/真编验证/cv2/ffmpeg）；
+  `record.encoder: auto` = `h264_mf` → `h264_nvenc` → cv2，libx264 仅显式。
+  ffmpeg 中途失败会删坏片段、清空事件库 `video`、发 critical（每进程一次）。
+  状态新增 `video_encoder` / `video_encoder_error`。
+- M4：新增可选 `OnnxRuntimeDetector` 与 `bench-detect --engine`（p50/p95）；
+  新增 `rw bench`；`bench-encode` 加 libx264 行。
+- 基准（`docs/bench-2026-10-21-m3-m4.md`）：h264_mf 比 avc1 体积 -59%；
+  onnxruntime 每帧 CPU -40%、p95 -45%、检测一致。M4 数据支持切换，
+  但本轮不捆绑（+约 50MB），默认仍 cv2.dnn，待所有者决定。
+- 测试：全量 `rw test` 通过。本机已安装 0.2.2 并验证：doctor/卸载项/界面自检
+  均为 0.2.2；文件源复放真实抓拍，h264_mf 2.1–3.3 MB/分钟 vs avc1
+  27.0–29.8；nvenc、libx264、缺 ffmpeg 三条路径与音轨合并均通过。
+  未触发实时摄像头的陌生人事件（摄像头被运行中的监控占用）。
+- 独立评审后修复（`1a5a603`）：写线程死亡时 `recording` 误报 idle、stop 超时
+  未 abort writer、0 帧/不可播文件被当成功、实时帧未统一尺寸、熔断计数不连续、
+  bench 一致性未接入；均有回归测试，全量测试通过。

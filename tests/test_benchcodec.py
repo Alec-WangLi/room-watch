@@ -65,6 +65,35 @@ class EncoderListTest(unittest.TestCase):
                          ["h264_nvenc"])
 
 
+class DefaultWriterFactoryTest(unittest.TestCase):
+    def test_opens_a_cv2_writer(self):
+        """编码基准的 cv2 路径要和产品共用同一个 writer 实现。"""
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            writer = B._default_writer_factory(
+                Path(tmp.name) / "a.mp4", "mp4v", 10.0, (64, 36)
+            )
+            self.assertIsNotNone(writer)
+            writer.release()
+        finally:
+            tmp.cleanup()
+
+
+class CandidateListTest(unittest.TestCase):
+    def test_candidates_include_libx264(self):
+        """libx264 是软件编码基线，必须出现在对比数据里（不进 auto）。"""
+        self.assertEqual(
+            B.ffmpeg_candidates({"h264_mf", "h264_nvenc"}),
+            ["h264_nvenc", "h264_mf", "libx264"],
+        )
+
+    def test_candidates_keep_hardware_order(self):
+        self.assertEqual(
+            B.ffmpeg_candidates({"h264_amf", "h264_qsv"}),
+            ["h264_qsv", "h264_amf", "libx264"],
+        )
+
+
 class RunAllTest(unittest.TestCase):
     def test_one_failed_encoder_does_not_abort_others(self):
         tmp = tempfile.TemporaryDirectory()

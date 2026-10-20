@@ -129,5 +129,16 @@ class BuildDetectorTest(unittest.TestCase):
             D.build_detector(cfg, base_dir=".")
 
 
+class OnnxRuntimeBackendTest(unittest.TestCase):
+    def test_missing_runtime_raises_clean_error(self) -> None:
+        import importlib.util
+
+        if importlib.util.find_spec("onnxruntime") is not None:
+            self.skipTest("本机已安装 onnxruntime，缺依赖降级由无依赖环境覆盖")
+        with self.assertRaises(RuntimeError) as ctx:
+            D.OnnxRuntimeDetector("models/__nope__.onnx")
+        self.assertIn("onnxruntime", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

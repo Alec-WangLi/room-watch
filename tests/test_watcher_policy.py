@@ -33,6 +33,7 @@ class FakeRecorder:
     def __init__(self, recording: bool = False):
         self.enabled = True
         self.recording = recording
+        self.failed = False
         self.started = []
         self.observed = 0
         self.stopped = []
@@ -72,6 +73,20 @@ class FakeFaces:
     def find(self, frame, dets):
         self.calls += 1
         return self.faces
+
+
+class FakeAudio:
+    def __init__(self, wav):
+        self.enabled = True
+        self.available = True
+        self.recording = True
+        self.wav = wav
+        self.stopped = 0
+
+    def stop(self):
+        self.stopped += 1
+        self.recording = False
+        return self.wav
 
 
 class FakeOwnerTracker:
@@ -160,6 +175,18 @@ class WatcherPolicyTest(unittest.TestCase):
         Watcher.pump_recording(w, frame, [], self.now)
         self.assertEqual(w.recorder.stopped, [])
         self.assertEqual(w.recorder.observed, 1)
+
+    def test_pump_stops_failed_segment_immediately(self):
+        """写线程死了不能等策略超时：下一帧就要收尾、删坏文件并通知。"""
+        w = self._watcher(recording=True)
+        w.recorder.failed = True
+        w.record_policy = SimpleNamespace(
+            note=lambda now, has_person: None,
+            check=lambda now: "",
+        )
+        w.stop_recording = mock.Mock()
+        Watcher.pump_recording(w, np.zeros((16, 16, 3), np.uint8), [], self.now)
+        w.stop_recording.assert_called_once()
 
     # ---------- 配置错误分类 ----------
 
@@ -384,6 +411,115 @@ class WatcherPolicyTest(unittest.TestCase):
             self.assertTrue(w.stop_recording.call_args.kwargs["discard"])
         finally:
             self._close(w)
+
+    # ---------- 录像后端失败 ----------
+
+    def _failure_watcher(self):
+        w = self._watcher()
+        w.dry_run = False
+        w.recorder.recording = True
+        w.recorder.last_pre_frames = 0
+        w.recorder.last_error = "ffmpeg 返回 1"
+        w.record_policy = SimpleNamespace(finish=lambda now: None)
+        wav = self.root / "a.wav"
+        wav.write_bytes(b"x")
+        w.audio = FakeAudio(str(wav))
+        w.event_snapshot = "2026-10-19/120000.jpg"
+        w.current_video = "2026-10-19/120000.mp4"
+        w.store = EventStore(str(self.root / "events.db"))
+        w.store.add(self.now, w.event_snapshot, 0.9, True, video=w.current_video)
+        w.outbox_path = str(self.root / "outbox.db")
+        w.outbox = OutboxStore(w.outbox_path)
+        w._outbox_thread = threading.get_ident()
+        w._outbox_lock = threading.Lock()
+        w.notify_cfg = {"channels": ["webhook"],
+                        "webhook": {"url": "https://example.invalid/hook"}}
+        w._video_failure_notified = False
+        return w
+
+    def test_video_backend_failure_clears_db_and_notifies(self):
+        w = self._failure_watcher()
+        try:
+            Watcher.stop_recording(w, "测试", self.now)
+            row = w.store.conn.execute(
+                "SELECT video FROM events WHERE snapshot=?", (w.event_snapshot,)
+            ).fetchone()
+            self.assertIsNone(row[0], "坏片段的路径必须从事件库清掉")
+            self.assertFalse(Path(w.audio.wav).exists(), "没有视频的 wav 也不该留着")
+            self.assertEqual(w.audio.stopped, 1)
+            self.assertEqual(w.outbox.pending_count(), 1)
+            item = w.outbox.claim_next(now=datetime.now())
+            self.assertIsNotNone(item)
+            self.assertEqual(item.severity, "critical")
+            self.assertIn("录像中断", item.payload.get("text", ""))
+        finally:
+            w.outbox.close()
+            w.store.conn.close()
+
+    def test_video_failure_notifies_only_once(self):
+        w = self._failure_watcher()
+        try:
+            Watcher.stop_recording(w, "测试", self.now)
+            w.recorder.recording = True
+            Watcher.stop_recording(w, "测试", self.now)
+            self.assertEqual(w.outbox.pending_count(), 1,
+                             "同一进程里录像失败只提醒一次，别刷屏")
+        finally:
+            w.outbox.close()
+            w.store.conn.close()
+
+    def test_status_reports_video_encoder(self):
+        status_path = self.root / "status.json"
+        fake = SimpleNamespace(
+            status_path=str(status_path),
+            started_at=self.now,
+            last_frame_at=self.now,
+            stale_seconds=120,
+            camera_spec=SimpleNamespace(label="cam"),
+            detector=SimpleNamespace(name="onnx"),
+            gate=SimpleNamespace(stats=lambda: {}),
+            frames=10,
+            events_today=0,
+            recorder=SimpleNamespace(recording=False, last_encoder="h264_mf",
+                                     last_error=None),
+            dry_run=False,
+            outbox=SimpleNamespace(stats=lambda: {}),
+            notify_cfg={"channel": "none"},
+            _status_write_failed=False,
+            storage_forecast=None,
+        )
+        fake._outbox_stats = lambda: {}
+        Watcher.write_status(fake)
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["video_encoder"], "h264_mf")
+        self.assertIsNone(data["video_encoder_error"])
+
+    def test_status_reports_encoder_error_after_fallback(self):
+        status_path = self.root / "status.json"
+        fake = SimpleNamespace(
+            status_path=str(status_path),
+            started_at=self.now,
+            last_frame_at=self.now,
+            stale_seconds=120,
+            camera_spec=SimpleNamespace(label="cam"),
+            detector=SimpleNamespace(name="onnx"),
+            gate=SimpleNamespace(stats=lambda: {}),
+            frames=10,
+            events_today=0,
+            recorder=SimpleNamespace(recording=False, last_encoder="avc1",
+                                     last_error=None,
+                                     encoder_error="没有可用的 ffmpeg 编码器"),
+            dry_run=False,
+            outbox=SimpleNamespace(stats=lambda: {}),
+            notify_cfg={"channel": "none"},
+            _status_write_failed=False,
+            storage_forecast=None,
+        )
+        fake._outbox_stats = lambda: {}
+        Watcher.write_status(fake)
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["video_encoder"], "avc1")
+        self.assertEqual(data["video_encoder_error"], "没有可用的 ffmpeg 编码器")
 
     # ---------- 状态文件 ----------
 

@@ -20,6 +20,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -28,6 +29,7 @@ import cv2
 import numpy as np
 
 from roomwatch.recorder import PreRollBuffer, Recorder, video_path_for
+from roomwatch.videoenc import WriterFactory
 
 SIZE = (640, 360)  # 测试用小尺寸，跑得快；真实环境是 1280x720
 FPS = 10.0
@@ -115,7 +117,8 @@ class TestRecorderWritesPlayableFile(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _rec(self, **kw) -> Recorder:
-        cfg = {"enabled": True, "pre_roll_seconds": 1.0, "queue_size": 200}
+        cfg = {"enabled": True, "pre_roll_seconds": 1.0, "queue_size": 200,
+               "encoder": "cv2"}
         cfg.update(kw)
         return Recorder(cfg, fps=FPS)
 
@@ -185,6 +188,21 @@ class TestRecorderWritesPlayableFile(unittest.TestCase):
         ok, frames, size = read_back(path)
         self.assertTrue(ok)
         self.assertEqual(size, SIZE)
+        self.assertEqual(frames, 2, "换尺寸只该缩放，不该多出/丢掉帧")
+
+    def test_prime_size_does_not_change_active_writer(self):
+        """录像中途 prime_size 变化只影响下一段，不能改当前这一段。"""
+        rec = self._rec(pre_roll_seconds=0)
+        rec.prime_size(SIZE)
+        path = os.path.join(self.tmp, "freeze.mp4")
+        rec.start(path, T0)
+        rec.prime_size((1280, 720))  # 摄像头中途重开
+        rec.observe(synthetic_frame(3), T0)
+        rec.stop()
+        ok, frames, size = read_back(path)
+        self.assertTrue(ok)
+        self.assertEqual(frames, 1)
+        self.assertEqual(size, SIZE)
 
     def test_video_path_pairs_with_snapshot(self):
         self.assertEqual(
@@ -222,6 +240,205 @@ class TestRecorderWritesPlayableFile(unittest.TestCase):
         rec.stop()
         # 10fps 的每帧预算是 100ms；observe 只能占零头
         self.assertLess(worst, 50.0, f"observe() 最慢 {worst:.1f}ms，会拖垮主循环")
+
+
+class FakeBackendWriter:
+    """测试用后端：可控制写失败与 close 结果。"""
+
+    def __init__(self, path, *, fail_write=False, close_ok=True):
+        self.path = path
+        self.description = "h264_mf"
+        self.error = None
+        self.fail_write = fail_write
+        self.close_ok = close_ok
+
+    def open(self):
+        with open(self.path, "wb") as f:
+            f.write(b"header")
+        return True
+
+    def write(self, frame):
+        if self.fail_write:
+            raise OSError("disk full")
+        with open(self.path, "ab") as f:
+            f.write(b"frame")
+
+    def close(self):
+        return self.close_ok
+
+
+class FakeBackendFactory:
+    def __init__(self, writer):
+        self.writer = writer
+        self.failures = 0
+        self.disabled_reason = None
+
+    def open(self, path, size, fps):
+        return self.writer
+
+    def note_segment_failed(self, reason=""):
+        self.failures += 1
+        self.disabled_reason = reason
+
+    def note_segment_ok(self):
+        self.failures = 0
+        self.disabled_reason = None
+
+
+class BlockingWriter(FakeBackendWriter):
+    """write() 卡住，用来制造 stop() 的 join 超时。"""
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.aborted = False
+
+    def write(self, frame):
+        self.entered.set()
+        self.release.wait(5)
+
+    def close(self):
+        return False
+
+    def abort(self):
+        self.aborted = True
+        self.release.set()
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+
+class FakeSelector:
+    def __init__(self, choice):
+        self.choice = choice
+
+    def choose(self):
+        return self.choice
+
+
+class TestRecorderBackendFailure(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _rec_with(self, writer, **kw):
+        cfg = {"enabled": True, "pre_roll_seconds": 0, "queue_size": 50}
+        cfg.update(kw)
+        factory = FakeBackendFactory(writer)
+        rec = Recorder(cfg, fps=FPS, factory=factory)
+        rec.prime_size(SIZE)
+        return rec, factory
+
+    def test_close_failure_returns_none_and_deletes_file(self):
+        path = os.path.join(self.tmp, "bad.mp4")
+        rec, factory = self._rec_with(
+            FakeBackendWriter(path, close_ok=False)
+        )
+        self.assertEqual(rec.start(path, T0), path)
+        rec.observe(synthetic_frame(0), T0)
+        self.assertIsNone(rec.stop("测试"))
+        self.assertFalse(os.path.exists(path), "失败的片段不能留在相册里")
+        self.assertIsNotNone(rec.last_error)
+        self.assertEqual(factory.failures, 1)
+
+    def test_write_error_discards_segment_even_if_close_ok(self):
+        """磁盘满时 write 抛异常；即使 close 说成功，这一段也不能算数。"""
+        path = os.path.join(self.tmp, "full.mp4")
+        rec, factory = self._rec_with(
+            FakeBackendWriter(path, fail_write=True, close_ok=True)
+        )
+        rec.start(path, T0)
+        rec.observe(synthetic_frame(0), T0)
+        self.assertIsNone(rec.stop("测试"))
+        self.assertFalse(os.path.exists(path))
+        self.assertIsNotNone(rec.last_error)
+        self.assertEqual(factory.failures, 1)
+
+    def test_write_thread_death_keeps_segment_active_for_cleanup(self):
+        """线程死了但片段没收尾：recording 必须仍为真，否则清理与通知全被跳过。"""
+        path = os.path.join(self.tmp, "dead.mp4")
+        rec, factory = self._rec_with(FakeBackendWriter(path, fail_write=True))
+        rec.start(path, T0)
+        rec.observe(synthetic_frame(0), T0)
+        deadline = time.time() + 2
+        while time.time() < deadline and not rec.failed:
+            time.sleep(0.01)
+        self.assertTrue(rec.failed, "写线程应当已经因异常退出")
+        self.assertTrue(rec.recording, "片段尚未收尾，recording 不能变成 False")
+        self.assertIsNone(rec.stop("测试"))
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(factory.failures, 1)
+
+    def test_stop_timeout_aborts_writer(self):
+        """写线程卡住时，stop 必须在超时后强制结束 writer，而不是把它留在后台。"""
+        path = os.path.join(self.tmp, "hang.mp4")
+        writer = BlockingWriter(path)
+        rec, factory = self._rec_with(writer, join_timeout_seconds=0.2)
+        rec.start(path, T0)
+        rec.observe(synthetic_frame(0), T0)
+        self.assertTrue(writer.entered.wait(2), "写入应当已经卡住")
+        self.assertIsNone(rec.stop("测试"))
+        self.assertTrue(writer.aborted, "超时后必须 abort，不能留着 ffmpeg 进程")
+        self.assertFalse(rec.recording)
+        self.assertEqual(factory.failures, 1)
+
+    def test_last_encoder_is_reported(self):
+        path = os.path.join(self.tmp, "enc.mp4")
+        rec, _ = self._rec_with(FakeBackendWriter(path))
+        rec.start(path, T0)
+        self.assertEqual(rec.last_encoder, "h264_mf")
+        rec.stop()
+        self.assertEqual(rec.last_encoder, "h264_mf", "收尾后也要保留，供状态展示")
+
+    def test_encoder_error_reports_factory_reason(self):
+        path = os.path.join(self.tmp, "enc.mp4")
+        rec, factory = self._rec_with(FakeBackendWriter(path))
+        factory.disabled_reason = "没有可用的 ffmpeg 编码器"
+        self.assertEqual(rec.encoder_error, "没有可用的 ffmpeg 编码器")
+
+    def test_mismatched_frame_size_with_ffmpeg_backend(self):
+        ffmpeg = _find_ffmpeg()
+        if not ffmpeg:
+            self.skipTest("本机没有 ffmpeg")
+        encoder = _real_encoder(ffmpeg)
+        if not encoder:
+            self.skipTest("没有可用的 H.264 编码器")
+        path = os.path.join(self.tmp, "size.mp4")
+        cfg = {
+            "enabled": True, "encoder": "ffmpeg", "pre_roll_seconds": 0,
+            "queue_size": 50, "audio": {"ffmpeg": ffmpeg},
+        }
+        factory = WriterFactory(cfg, selector=FakeSelector(encoder))
+        rec = Recorder(cfg, fps=FPS, factory=factory)
+        rec.prime_size(SIZE)
+        self.assertIsNotNone(rec.start(path, T0))
+        rec.observe(synthetic_frame(1, size=(1280, 720)), T0)
+        rec.stop()
+        ok, frames, size = read_back(path)
+        self.assertTrue(ok)
+        self.assertGreater(frames, 0)
+        self.assertEqual(size, SIZE)
+        self.assertEqual(frames, 1, "一帧画面只能写出一帧，不能被 ffmpeg 拆成多块")
+
+
+def _find_ffmpeg():
+    from roomwatch.paths import ffmpeg_exe
+
+    return ffmpeg_exe() or shutil.which("ffmpeg")
+
+
+def _real_encoder(ffmpeg):
+    from roomwatch.videoenc import probe_encoders
+
+    available = probe_encoders(ffmpeg)
+    for name in ("h264_mf", "libx264"):
+        if name in available:
+            return name
+    return None
 
 
 class TestPreRollCost(unittest.TestCase):
@@ -328,6 +545,18 @@ class TestEventStoreMigration(unittest.TestCase):
         self.assertEqual(old[0], "old.jpg")
         self.assertIsNone(old[1], "迁移前的老行 video 应为空")
         self.assertIsNone(old[2], "迁移前的老行 identity 应为空")
+
+    def test_clear_video_by_snapshot(self):
+        from roomwatch.watcher import EventStore
+
+        store = EventStore(os.path.join(self.tmp, "events.db"))
+        store.add(datetime(2026, 10, 21, 9, 0, 0), "a.jpg", 0.9, True, video="a.mp4")
+        store.add(datetime(2026, 10, 21, 9, 1, 0), "b.jpg", 0.8, True, video="b.mp4")
+        removed = store.clear_video_by_snapshot("a.jpg")
+        self.assertEqual(removed, 1)
+        rows = dict(store.conn.execute("SELECT snapshot, video FROM events").fetchall())
+        self.assertIsNone(rows["a.jpg"])
+        self.assertEqual(rows["b.jpg"], "b.mp4", "别的事件不能被误改")
 
     def test_fresh_db_has_video_column(self):
         from roomwatch.watcher import EventStore

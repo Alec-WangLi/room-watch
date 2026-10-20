@@ -31,6 +31,8 @@ def summarize(
     ok: bool = True,
     error: str = "",
     cpu_seconds: float = 0.0,
+    p50_ms: float = 0.0,
+    p95_ms: float = 0.0,
 ) -> dict:
     fps = frames / seconds if frames > 0 and seconds > 0 else 0.0
     ms = (seconds * 1000.0 / frames) if frames > 0 and seconds > 0 else 0.0
@@ -43,11 +45,88 @@ def summarize(
         "seconds": round(seconds, 3),
         "fps": round(fps, 1),
         "ms_per_frame": round(ms, 1),
+        "p50_ms": round(float(p50_ms), 1),
+        "p95_ms": round(float(p95_ms), 1),
         "cpu_ms_per_frame": round(cpu_ms, 1),
         "cpu_cores": round(cores, 2),
         "detections": int(detections),
+        "consistent": None,
         "error": error,
     }
+
+
+def percentile(values: list[float], p: float) -> float:
+    """线性插值分位数；空列表返回 0。"""
+    if not values:
+        return 0.0
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (max(0.0, min(100.0, float(p))) / 100.0) * (len(ordered) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = rank - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
+def _iou(a, b) -> float:
+    x1 = max(a.x1, b.x1)
+    y1 = max(a.y1, b.y1)
+    x2 = min(a.x2, b.x2)
+    y2 = min(a.y2, b.y2)
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = max(0.0, a.x2 - a.x1) * max(0.0, a.y2 - a.y1)
+    area_b = max(0.0, b.x2 - b.x1) * max(0.0, b.y2 - b.y1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def detections_match(a: list, b: list, *, conf_tol: float = 0.02,
+                     iou_tol: float = 0.95) -> bool:
+    """两套后端在同一张图上的检测结果是否一致（贪心配对）。"""
+    if len(a) != len(b):
+        return False
+    remaining = list(b)
+    for da in a:
+        best = None
+        best_iou = -1.0
+        for i, db in enumerate(remaining):
+            iou = _iou(da, db)
+            if iou >= iou_tol and abs(da.conf - db.conf) <= conf_tol and iou > best_iou:
+                best = i
+                best_iou = iou
+        if best is None:
+            return False
+        remaining.pop(best)
+    return True
+
+
+def mark_consistency(results: list[dict], detections: list) -> list[dict]:
+    """把各引擎的检测结果与第一个（基线）对比，写进 consistent 字段。"""
+    base = detections[0] if detections else None
+    for i, result in enumerate(results):
+        if base is None or i >= len(detections) or detections[i] is None:
+            result["consistent"] = None
+        elif i == 0:
+            result["consistent"] = True
+        else:
+            result["consistent"] = detections_match(base, detections[i])
+    return results
+
+
+def engine_setting(name: str) -> Optional[str]:
+    """把基准命令里的引擎名翻译成 `detector.engine` 的取值。
+
+    `cv2` 是给人的叫法，底层仍是现有的 `onnx`（cv2.dnn）实现。
+    """
+    key = str(name or "auto").strip().lower()
+    if key in ("", "auto"):
+        return None
+    if key == "cv2":
+        return "onnx"
+    if key in ("onnx", "onnxruntime", "torch"):
+        return key
+    raise ValueError(f"未知推理引擎: {name}")
 
 
 def available_engines() -> list[str]:
@@ -100,12 +179,17 @@ def bench_detector(
         started = time.perf_counter()
         cpu_started = time.process_time()
         detections = 0
+        timings: list[float] = []
         for _ in range(max(1, int(frames))):
+            frame_started = time.perf_counter()
             detections += len(detector.detect(frame))
+            timings.append((time.perf_counter() - frame_started) * 1000.0)
         seconds = time.perf_counter() - started
         cpu_seconds = time.process_time() - cpu_started
         return summarize(frames=frames, seconds=seconds, engine=engine,
-                         detections=detections, cpu_seconds=cpu_seconds)
+                         detections=detections, cpu_seconds=cpu_seconds,
+                         p50_ms=percentile(timings, 50),
+                         p95_ms=percentile(timings, 95))
     except Exception as exc:  # noqa: BLE001 - 一个引擎失败不能拖垮基准
         return summarize(frames=frames, seconds=0, engine=engine,
                          ok=False, error=str(exc))
@@ -119,6 +203,7 @@ def run_all(
     warmup: int = 3,
     source: Optional[str] = None,
     compare: bool = False,
+    engines: Sequence[str] = ("auto",),
 ) -> list[dict]:
     """测当前配置的检测器；compare=True 时再试一次 torch 兜底。"""
     from .config import load_config
@@ -143,16 +228,39 @@ def run_all(
         if frame is None:
             return [summarize(frames=frames, seconds=0, ok=False,
                               error=f"读不了图片：{source}")]
+    if frame is None:
+        # 所有引擎必须用同一帧，否则一致性对比没有意义。
+        frame = make_frame(size)
 
     results: list[dict] = []
-    try:
-        detector = build_detector(det_cfg, base_dir=str(PROJECT_ROOT))
-        results.append(bench_detector(
-            detector, frames=frames, size=size, warmup=warmup, frame=frame,
-        ))
-    except Exception as exc:  # noqa: BLE001
-        results.append(summarize(frames=frames, seconds=0, ok=False,
-                                 error=f"检测器初始化失败：{exc}"))
+    engine_dets: list = []
+    for name in engines:
+        try:
+            setting = engine_setting(name)
+        except ValueError as exc:
+            results.append(summarize(frames=frames, seconds=0, engine=name,
+                                     ok=False, error=str(exc)))
+            engine_dets.append(None)
+            continue
+        detector_cfg = dict(det_cfg)
+        if setting:
+            detector_cfg["engine"] = setting
+        try:
+            detector = build_detector(detector_cfg, base_dir=str(PROJECT_ROOT))
+            results.append(bench_detector(
+                detector, frames=frames, size=size, warmup=warmup, frame=frame,
+            ))
+            try:
+                engine_dets.append(detector.detect(frame))
+            except Exception:  # noqa: BLE001 - 计时成功但取框失败，一致性记未知
+                engine_dets.append(None)
+        except Exception as exc:  # noqa: BLE001
+            results.append(summarize(frames=frames, seconds=0, engine=name,
+                                     ok=False,
+                                     error=f"检测器初始化失败：{exc}"))
+            engine_dets.append(None)
+
+    mark_consistency(results, engine_dets)
 
     if compare:
         base = str(PROJECT_ROOT)
@@ -202,13 +310,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="用一张真实图片计时（默认合成画面）")
     parser.add_argument("--compare", action="store_true",
                         help="额外测一次 torch 兜底（需要 ultralytics）")
+    parser.add_argument("--engine", default="auto",
+                        help="auto | cv2 | onnxruntime | torch；逗号分隔可测多个")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args(list(argv or []))
 
+    engines = [item.strip() for item in str(args.engine).split(",") if item.strip()]
     results = run_all(
         args.config, frames=args.frames, size=args.size,
         warmup=args.warmup, source=args.source, compare=args.compare,
+        engines=engines or ("auto",),
     )
 
     if args.json:
@@ -219,13 +331,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
           f"预热 {args.warmup} 帧，计时 {args.frames} 帧")
     print("可用后端：" + "、".join(available_engines()))
     print(f"{'引擎':<14}{'结果':<6}{'fps':>8}{'ms/帧':>10}"
-          f"{'CPU ms/帧':>11}{'核数':>7}{'检出':>8}")
+          f"{'p50':>8}{'p95':>8}{'CPU ms/帧':>11}{'核数':>7}{'检出':>8}")
     for item in results:
         status = "ok" if item["ok"] else "失败"
         print(f"{item['engine']:<14}{status:<6}{item['fps']:>8.1f}"
-              f"{item['ms_per_frame']:>10.1f}{item['cpu_ms_per_frame']:>11.1f}"
+              f"{item['ms_per_frame']:>10.1f}{item['p50_ms']:>8.1f}"
+              f"{item['p95_ms']:>8.1f}{item['cpu_ms_per_frame']:>11.1f}"
               f"{item['cpu_cores']:>7.2f}{item['detections']:>8}")
         if not item["ok"] and item["error"]:
             print(f"    ! {item['error']}")
+    if len(results) > 1:
+        for item in results[1:]:
+            if item.get("consistent") is not None:
+                print(f"  一致性：{item['engine']} 与 {results[0]['engine']} → "
+                      f"{item['consistent']}")
     print("结论只用于评估；运行时引擎由 detector.engine 决定，本工具不改它。")
     return 0 if any(item["ok"] for item in results) else 1

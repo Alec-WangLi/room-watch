@@ -58,6 +58,13 @@ record:
   # 那是 FFmpeg 后端在抱怨，实际由 Media Foundation 接手成功。）
   codec: avc1
 
+  # 编码器后端：auto = ffmpeg（h264_mf → h264_nvenc）→ cv2 avc1 回退。
+  # 显式写 cv2 可强制走原来的 OpenCV 写出路径。
+  encoder: auto
+  # 只在 encoder=ffmpeg 或 auto 时生效；auto 不含 libx264（软件编码，
+  # 客户机性能未知）；需要时可显式写 libx264。
+  ffmpeg_encoder: auto
+
   # 预录：把触发前几秒的画面也补进来，视频开头才是「推门走进来」那一刻，
   # 而不是从人已经站定了开始。每帧 JPEG 压缩后缓存，
   # 实测 720p 约 0.8ms/帧、10 秒约 10MB 内存。
