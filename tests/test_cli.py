@@ -139,6 +139,31 @@ class DoctorTest(unittest.TestCase):
         self.assertFalse(model.ok)
 
 
+class InstallVersionTest(unittest.TestCase):
+    """卸载列表里的版本必须和当前程序一致（0.1.22 真机版本错位的兜底）。"""
+
+    def test_matching_version_is_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(
+                cli._install_version_problem("0.1.22", "0.1.22", str(root), root))
+
+    def test_mismatch_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            problem = cli._install_version_problem("0.1.23", "0.1.22", str(root), root)
+            self.assertIsNotNone(problem)
+            self.assertIn("0.1.22", problem)
+            self.assertIn("0.1.23", problem)
+
+    def test_other_install_location_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "app"
+            other = Path(tmp) / "other"
+            self.assertIsNone(
+                cli._install_version_problem("0.1.23", "0.1.22", str(other), root))
+
+
 class TestFilesTest(unittest.TestCase):
     def test_fast_mode_skips_integration(self) -> None:
         self.assertNotIn("test_integration.py", cli.test_files(fast=True))

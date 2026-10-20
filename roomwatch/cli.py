@@ -319,6 +319,56 @@ def _check_port(port: int = 8765) -> Check:
         sock.close()
 
 
+def _install_version_problem(current: str, display: str, location: str,
+                             root: Path) -> Optional[str]:
+    """卸载项与当前程序的版本是否一致。
+
+    只对「当前这份安装」判断：从源码目录或另一份安装运行时跳过，
+    否则会被别的安装目录的卸载项误报。
+    """
+    if not display or not location:
+        return None
+    try:
+        if Path(location).resolve() != Path(root).resolve():
+            return None
+    except OSError:
+        return None
+    if str(display).strip() != str(current).strip():
+        return (f"卸载项 DisplayVersion={display} ≠ 当前程序 {current}；"
+                "重跑安装包修复卸载项")
+    return None
+
+
+def _check_install_version(root: Path) -> Check:
+    """Windows 安装版：卸载列表里的版本必须和程序一致。"""
+    if os.name != "nt":
+        return Check("安装版本", True, "非 Windows，跳过", fatal=False)
+    try:
+        import winreg
+    except ImportError:
+        return Check("安装版本", True, "没有 winreg，跳过", fatal=False)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, paths.UNINSTALL_KEY) as key:
+            display = str(winreg.QueryValueEx(key, "DisplayVersion")[0])
+            location = str(winreg.QueryValueEx(key, "InstallLocation")[0])
+    except FileNotFoundError:
+        return Check("安装版本", True,
+                     "未找到卸载项（便携版/源码运行，跳过）", fatal=False)
+    except OSError as exc:
+        return Check("安装版本", True, f"读不到卸载项：{exc}", fatal=False)
+    try:
+        same_location = Path(location).resolve() == Path(root).resolve()
+    except OSError:
+        same_location = False
+    if not same_location:
+        return Check("安装版本", True,
+                     f"不是当前安装目录，跳过（{location or '未知'}）", fatal=False)
+    problem = _install_version_problem(__version__, display, location, root)
+    if problem:
+        return Check("安装版本", False, problem, fatal=False)
+    return Check("安装版本", True, f"卸载项 {display} 与当前程序一致", fatal=False)
+
+
 def _check_runtime() -> Check:
     """分发包里必须走内嵌解释器；源码环境下这项只是提示。"""
     from .paths import bundled_python
@@ -358,6 +408,7 @@ def run_checks(project_root: Optional[Path] = None) -> list[Check]:
         _check_owner(root),
         _check_hooks(root),
         _check_port(),
+        _check_install_version(root),
     ]
 
 
