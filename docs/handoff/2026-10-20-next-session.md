@@ -75,18 +75,18 @@
 - 所有者说「推送到远程」默认等于打 tag + 发 Release；通道要判断正确。
 - 不要杀正在运行的 watcher/gallery；界面窗口可以关。
 
-## 7. 0.1.23（进行中）
+## 7. 0.1.23 / 0.1.24（更新链路）
 
-- 分支 `feat/0.1.23-stability`；VERSION 0.1.23，全量测试通过。
-- **相册假活**：gallery 新增 `GET /healthz`（无需登录，只返回 ok）；
-  guardian 每轮探测，连续 2 次失败就 `stop_gallery` + 重启 + 推送通知；
-  实际端口优先读 `var/state/gallery.json`，兼容 8765 被占用后换端口。
-- **安装版本检查**：`rw doctor` 新增「安装版本」；安装版的
-  `VERSION` 必须等于卸载项 `DisplayVersion`，不一致提示重跑安装包；
-  便携版/源码运行跳过。
-- **已真机验证**：真实会话安装 0.1.23，真实注册表/`Get-Package` 0.1.23，
-  `rw doctor` 显示一致，`room-watch.exe --selftest` ok 0.1.23，
-  `/healthz` 返回 true，单 watcher + gallery 正常。
-- **待办**：所有者批准 → 合 `beta`、推送、发 `v0.1.23-beta`；然后用本机
-  已装的 0.1.22 走界面「检查更新 → 安装」，验证整条自动更新链路
-  （这是本轮第 2 项）。24 小时 soak 按所有者意见降级，不再单独安排。
+- 0.1.23 已合 `beta` 并发 `v0.1.23-beta`（tag `96328cb`）：gallery `/healthz`
+  + guardian 假活重启、`rw doctor` 安装版本检查、安装器静默模式恢复监控。
+- **自动更新真机测试发现 0.1.22/0.1.23 的交接脚本会卡死**：helper 用
+  `tasklist /FI ... | find ...` 等更新器 PID，在无控制台的分离 cmd 里
+  `find` 一直等管道 EOF，安装器永远不启动。已改为 tasklist 先写临时文件
+  再 `find`，读不到也立刻放行。
+- 0.1.24 已构建并在真实会话安装；用本地安装包走真实交接脚本复验：
+  `installer rc=0`、监控自动恢复（新 watcher PID）、界面自动重开 0.1.24、
+  无 `update_failed.txt`；真实注册表/`Get-Package`/`rw doctor` 一致。
+- **待办**：所有者批准后合 `beta`、推、发 `v0.1.24-beta`。0.1.22/0.1.23
+  已装用户需手动安装一次 0.1.24；之后的自更新使用修复后的交接脚本。
+- 慢速网络下载没有完整跑完（3 分钟约 8MB）；检查/下载逻辑已实际触发，
+  交接/安装/恢复用本地安装包验证。

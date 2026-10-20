@@ -701,10 +701,15 @@ def _helper_script(mode: str, delay_seconds: int, pid: int = 0) -> str:
     if pid:
         lines += [
             "rem wait for the updater process to exit (RestartManager cannot close its parent)",
+            'set "WAITFILE=%TEMP%\\room-watch-wait-%~3.txt"',
             "set /a WAIT=0",
             ":waitupdater",
             'if "%~3"=="" goto runsetup',
-            'tasklist /FI "PID eq %~3" 2>nul | find "%~3" >nul',
+            # 不要用 tasklist | find：cmd 在无控制台的分离进程里，find 会一直等
+            # 管道 EOF，安装器永远不启动（0.1.22 真机交接测试发现）。
+            # 先写文件再 find，失败也只是立刻放行。
+            '%SystemRoot%\\System32\\tasklist.exe /FI "PID eq %~3" /NH > "%WAITFILE%" 2>nul',
+            'find "%~3" "%WAITFILE%" >nul',
             "if errorlevel 1 goto runsetup",
             "ping -n 2 127.0.0.1 >nul 2>&1",
             "set /a WAIT+=1",
@@ -743,6 +748,7 @@ def _helper_script(mode: str, delay_seconds: int, pid: int = 0) -> str:
         "ping -n 3 127.0.0.1 >nul 2>&1",
         'start "" "%APP%\\room-watch.exe"',
         ":done",
+        'del /f /q "%WAITFILE%" >nul 2>&1',
         # 安装包留在 %TEMP% 里没用；正在被安装器读时删不掉，失败也无所谓
         'del /f /q "%SETUP%" >nul 2>&1',
         "exit /b %RC%",

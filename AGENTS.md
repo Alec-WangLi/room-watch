@@ -735,12 +735,13 @@ room-watch-<版本>\
 - **已发布**：`v0.1.22-beta`（prerelease，tag 指向 `4b801d7`）：
   https://github.com/Alec-WangLi/room-watch/releases/tag/v0.1.22-beta
   资产 `room-watch-0.1.22-setup.exe` + `.sha256`；简介取自 CHANGELOG。
-- **0.1.23（进行中，分支 `feat/0.1.23-stability`）**：gallery 新增
-  `/healthz`，guardian 连续 2 次探测失败就重启相册并通知（实际端口读
-  `gallery.json`）；`rw doctor` 新增安装版 VERSION / 卸载项 DisplayVersion
-  一致性检查。已构建并在真实会话安装 0.1.23，真实注册表、`Get-Package`、
-  `rw doctor`、界面自检、`/healthz` 均通过。待所有者批准后合回 `beta`、
-  发 `v0.1.23-beta`，再用已装的 0.1.22 走界面自动更新验证整条链路。
+- **0.1.23（已发 `v0.1.23-beta`，tag `96328cb`）**：gallery `/healthz` +
+  guardian 假活重启、`rw doctor` 安装版本检查；已真机安装验证。
+- **0.1.24（修复中，分支 `fix/0.1.24-update-helper`）**：0.1.22/0.1.23 的更新
+  交接脚本在分离 cmd 里用 `tasklist | find` 等更新器 PID，`find` 会一直等管道
+  EOF，安装器根本不启动。改成 tasklist 先写临时文件再 find；已用本地安装包
+  走真实交接脚本验证 `installer rc=0`、监控自动恢复、界面自动重开。
+  0.1.22/0.1.23 已装用户需要手动安装一次 0.1.24；发版待所有者批准。
 - **未做**：托盘（需 pystray + 真机）、M6 平台抽象、干净机器安装验证。
 - **下一步**：观察 0.1.22 真机运行与后续自动更新；稳定后升修订号合 `main`，
   从 `main` 发 stable。发版仍需所有者明确同意。

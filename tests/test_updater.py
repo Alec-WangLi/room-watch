@@ -588,8 +588,14 @@ class HelperScriptTest(unittest.TestCase):
     def test_waits_for_updater_process_before_install(self) -> None:
         text = updater._helper_script("gui", 4, 1234)
         # RestartManager 关不掉父进程；必须等更新器 PID 消失再启动安装器。
-        self.assertIn('tasklist /FI "PID eq %~3"', text)
+        self.assertIn('tasklist.exe /FI "PID eq %~3"', text)
         self.assertIn(":waitupdater", text)
+
+    def test_wait_does_not_pipe_tasklist(self) -> None:
+        """分离的 cmd 里 `tasklist | find` 会卡住 find，安装器永远不启动。"""
+        text = updater._helper_script("gui", 4, 1234)
+        self.assertIn('tasklist.exe /FI "PID eq %~3" /NH > "%WAITFILE%"', text)
+        self.assertNotIn("| find", text)
 
     def test_failure_writes_marker_for_gui(self) -> None:
         text = updater._helper_script("gui", 4)
