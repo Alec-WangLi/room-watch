@@ -453,8 +453,9 @@ class RoomWatchApp:
 
         self.win = tk_module.Tk()
         self.win.title(f"房间监控 {__version__}")
-        self.win.geometry("680x740")
-        self.win.minsize(600, 640)
+        self.win.geometry("720x740")
+        # 工具栏本身需要约 650px；窗口再窄就会把右侧按钮挤成 1px。
+        self.win.minsize(700, 640)
 
         base = font_module.nametofont("TkDefaultFont")
         self.font_big = (base.actual("family"), 16, "bold")
@@ -487,9 +488,8 @@ class RoomWatchApp:
         self.btn_gallery = ttk.Button(bar, text="打开相册", command=self.on_gallery)
         self.btn_probe = ttk.Button(bar, text="拍预览图", command=self.on_probe)
         self.btn_enroll = ttk.Button(bar, text="注册本人", command=self.on_enroll)
-        self.btn_verify = ttk.Button(bar, text="验证", command=self.on_verify)
         for btn in (self.btn_start, self.btn_stop, self.btn_gallery,
-                    self.btn_probe, self.btn_enroll, self.btn_verify):
+                    self.btn_probe, self.btn_enroll):
             btn.pack(side="left", padx=(0, 6))
         self.btn_update = ttk.Button(bar, text="检查更新", command=self.on_update)
         self.btn_update.pack(side="right")
@@ -518,6 +518,8 @@ class RoomWatchApp:
                    command=lambda: self._open_dir(self.project / "var" / "logs")).pack(side="left")
         self.btn_diag = ttk.Button(tools, text="诊断包", command=self.on_diag)
         self.btn_diag.pack(side="left", padx=(6, 0))
+        self.btn_verify = ttk.Button(tools, text="验证", command=self.on_verify)
+        self.btn_verify.pack(side="left", padx=(6, 0))
 
         # 事件列表
         box = ttk.LabelFrame(outer, text="最近事件", padding=8)
@@ -536,7 +538,8 @@ class RoomWatchApp:
         # 底栏
         # 底栏用 tk.Label：ttk.Label 不接受 fg（会抛 unknown option "-fg"）
         tk.Label(outer, text=f"项目：{self.project}   ·   解释器：{self.python}",
-                 font=self.font_small, fg="#888", anchor="w").pack(fill="x", pady=(8, 0))
+                 font=self.font_small, fg="#888", anchor="w", justify="left",
+                 wraplength=660).pack(fill="x", pady=(8, 0))
 
     # ---------------- 刷新 ----------------
 
@@ -1343,6 +1346,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                           ("更新", app.btn_update), ("诊断", app.btn_diag)):
             if not btn.winfo_exists():
                 problems.append(f"{name}按钮不存在")
+            elif btn.winfo_width() <= 1 or not btn.winfo_ismapped():
+                problems.append(f"{name}按钮被挤出窗口（宽度 {btn.winfo_width()}px）")
+        bar = app.btn_settings.master
+        if bar.winfo_reqwidth() > bar.winfo_width():
+            problems.append(
+                f"工具栏需要 {bar.winfo_reqwidth()}px，窗口只有 {bar.winfo_width()}px")
         if len(app.tree["columns"]) != 4:
             problems.append("事件表列数不对")
         if "本人模板" not in app.identity_label.cget("text"):
