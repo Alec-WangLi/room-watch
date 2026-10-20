@@ -164,6 +164,10 @@ begin
   begin
     Cmd := 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' + AddQuotes(ScriptPath);
     Exec(ExpandConstant('{cmd}'), '/c ' + Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // 再杀一遍：第一次杀完到 Inno 开始替换文件之间，guardian 可能又拉起
+    // watcher 锁住 runtime\python（0.1.21 真机安装器返回 5 的一个来源）。
+    Sleep(2000);
+    Exec(ExpandConstant('{cmd}'), '/c ' + Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     DeleteFile(ScriptPath);
   end;
 

@@ -671,12 +671,15 @@ def run_installer(path: Path, *, timeout: float = 600.0, quiet: bool = True) -> 
     return int(proc.returncode)
 
 
-def _helper_script(mode: str, delay_seconds: int) -> str:
+def _helper_script(mode: str, delay_seconds: int, pid: int = 0) -> str:
     """生成交接脚本（**纯 ASCII**：cmd 在 936 代码页下读中文会乱）。
 
     路径一律从参数 `%~1` / `%~2` 取，不写进脚本文本 —— 客户机上的用户名可能是
     中文（`C:\\Users\\张三\\AppData\\...`），写死就没法保证 ASCII 了；
     而命令行参数走的是宽字符，cmd 内部按 Unicode 处理，不会乱码。
+
+    `pid` 是更新器自己的进程号：安装器启动前必须等它退出，否则 RestartManager
+    关不掉父进程，静默模式下 30 秒后按 Abort（返回 5）并回滚。
 
     `mode` 决定装完之后拉什么起来：
       - ``gui``      重新打开界面（客户从界面里点的更新）
@@ -692,12 +695,29 @@ def _helper_script(mode: str, delay_seconds: int) -> str:
         'set "SETUP=%~2"',
         'set "LOG=%APP%\\var\\logs\\update.log"',
         'if not exist "%APP%\\var\\logs" mkdir "%APP%\\var\\logs" >nul 2>&1',
-        # 等更新器进程退出：RestartManager 关不掉父进程，父进程活着安装器必然 Abort
+        'if not exist "%APP%\\var\\state" mkdir "%APP%\\var\\state" >nul 2>&1',
         f"ping -n {max(1, int(delay_seconds))} 127.0.0.1 >nul 2>&1",
+    ]
+    if pid:
+        lines += [
+            "rem wait for the updater process to exit (RestartManager cannot close its parent)",
+            "set /a WAIT=0",
+            ":waitupdater",
+            'if "%~3"=="" goto runsetup',
+            'tasklist /FI "PID eq %~3" 2>nul | find "%~3" >nul',
+            "if errorlevel 1 goto runsetup",
+            "ping -n 2 127.0.0.1 >nul 2>&1",
+            "set /a WAIT+=1",
+            "if %WAIT% LSS 40 goto waitupdater",
+            ":runsetup",
+        ]
+    lines += [
         '"%SETUP%" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LANG=chinesesimp >>"%LOG%" 2>&1',
         'set "RC=%ERRORLEVEL%"',
         '>>"%LOG%" echo [%DATE% %TIME%] installer rc=%RC%',
         'if not "%RC%"=="0" goto failed',
+        # 成功路径清掉上次残留的失败标记
+        'del /f /q "%APP%\\var\\state\\update_failed.txt" >nul 2>&1',
     ]
     if mode == "gui":
         lines += [
@@ -714,6 +734,9 @@ def _helper_script(mode: str, delay_seconds: int) -> str:
         "goto done",
         ":failed",
         '>>"%LOG%" echo installer failed, reopening gui if present',
+        # 失败标记：界面下次启动时会明确告诉用户「上次更新没有完成」，
+        # 而不是悄悄打开一个看起来正常的旧版本（0.1.21 真机就是这样丢了版本信息）。
+        '>>"%APP%\\var\\state\\update_failed.txt" echo [%DATE% %TIME%] installer rc=%RC%',
         'if not exist "%APP%\\room-watch.exe" goto done',
         # 回滚可能还在收尾：立刻启动会撞上 PyInstaller 解包被打断
         # （弹 "Failed to load Python DLL"），等两秒再开
@@ -761,7 +784,7 @@ def handoff_install(setup: Path, *, mode: str = "none", delay_seconds: int = 4) 
 
     helper = temp / f"room-watch-update-{os.getpid()}.cmd"
     try:
-        helper.write_text(_helper_script(mode, delay_seconds), encoding="ascii")
+        helper.write_text(_helper_script(mode, delay_seconds, os.getpid()), encoding="ascii")
     except OSError as exc:
         raise UpdateError(f"写更新脚本失败：{exc}") from exc
 
@@ -772,7 +795,9 @@ def handoff_install(setup: Path, *, mode: str = "none", delay_seconds: int = 4) 
                  | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     try:
         # 路径走参数而不是写进脚本：客户机的用户名可能是中文（见 _helper_script）
-        subprocess.Popen(["cmd.exe", "/c", str(helper), str(root), str(staged)],
+        # 第三个参数是更新器 PID：安装器启动前要等它退出。
+        subprocess.Popen(["cmd.exe", "/c", str(helper), str(root), str(staged),
+                          str(os.getpid())],
                          creationflags=flags,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, close_fds=True)
@@ -858,6 +883,29 @@ def load_check_cache(root: Optional[Path] = None) -> dict:
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def failed_update_path(root: Optional[Path] = None) -> Path:
+    root = Path(root or paths.PROJECT_ROOT)
+    return root / "var" / "state" / "update_failed.txt"
+
+
+def take_update_failure(root: Optional[Path] = None) -> str:
+    """取出「上次安装失败」标记并删除；没有标记返回空串。
+
+    交接脚本在安装器返回非 0 时写这个文件。界面启动时读一次，明确告诉用户
+    「上次更新没有完成」——否则只会看到一个看起来正常的旧版本，版本号却对不上。
+    """
+    path = failed_update_path(root)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return text
 
 
 def save_check_cache(data: dict, root: Optional[Path] = None) -> None:

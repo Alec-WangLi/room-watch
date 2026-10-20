@@ -585,6 +585,32 @@ class HelperScriptTest(unittest.TestCase):
             with self.assertRaises(updater.UpdateError):
                 updater.handoff_install(Path(tmp) / "nope.exe")
 
+    def test_waits_for_updater_process_before_install(self) -> None:
+        text = updater._helper_script("gui", 4, 1234)
+        # RestartManager 关不掉父进程；必须等更新器 PID 消失再启动安装器。
+        self.assertIn('tasklist /FI "PID eq %~3"', text)
+        self.assertIn(":waitupdater", text)
+
+    def test_failure_writes_marker_for_gui(self) -> None:
+        text = updater._helper_script("gui", 4)
+        self.assertIn("update_failed.txt", text)
+
+
+class UpdateFailureMarkerTest(unittest.TestCase):
+    def test_take_reads_and_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = updater.failed_update_path(root)
+            path.parent.mkdir(parents=True)
+            path.write_text("[x] installer rc=5\n", encoding="utf-8")
+            self.assertIn("rc=5", updater.take_update_failure(root))
+            self.assertFalse(path.exists())
+            self.assertEqual(updater.take_update_failure(root), "")
+
+    def test_missing_marker_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(updater.take_update_failure(Path(tmp)), "")
+
 
 class PruneDownloadsTest(unittest.TestCase):
     def test_keeps_only_requested_installer(self) -> None:
