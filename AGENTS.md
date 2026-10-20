@@ -753,9 +753,11 @@ room-watch-<版本>\
   （PID 40228，`/healthz` ok）。通知类设置保存后需重启 watcher+guardian，
   界面会提示「需要重启」；热更新只覆盖语音。
 - **待所有者操作**：CI 工作流粘贴（token 缺 workflow scope）。
-- **0.2.1 开发中**（`feat/0.2.1-owner-throttle`，从 `beta` 切出，未合并）：
-  本人在场且未录像时推理降到每秒 2 次（`gate.owner_interval_seconds`）；
-  全量 `rw test` 通过，尚未打包与真机复测。
+- **0.2.1 已就绪**（`beta` 合并提交 `6d1d60d`，未推送/未发版）：
+  本人在场且未录像时推理降到每秒 2 次（`gate.owner_interval_seconds`）。
+  本机已安装并验证：版本/卸载项/`rw doctor` 均为 0.2.1，界面自检通过，
+  watcher 恰好一个；同场景 CPU 从约 128% 降到 52–55%，
+  3 分钟 1748 帧里推理 353 次（`owner_throttled` 1395）。
 - **未做**：干净机器安装验证、托盘（pystray + 真机）、M6 平台抽象。
 - **详细交接**：`docs/handoff/2026-10-20-next-session.md`（第 8 节为 0.2.0）；
   新会话入口 `CLAUDE.md`。

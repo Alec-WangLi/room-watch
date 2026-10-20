@@ -127,9 +127,9 @@
   停在低速，取消后重试即可；不要改 updater 的重试逻辑。
 - **待办**：CI 启用；干净机器验证；托盘；M6。
 
-## 9. 0.2.1 资源优化（进行中，2026-10-20 深夜）
+## 9. 0.2.1 资源优化（已就绪，2026-10-21 凌晨）
 
-- 分支 `feat/0.2.1-owner-throttle`（从 `beta` 切出），未合并、未打包、未发版。
+- `beta` 已合并 `6d1d60d`（特性提交 `76083e5`）；未推送、未打 tag、未发版。
 - 内容：本人在场、画面里有人且未录像时，推理降到每秒 2 次
   （`gate.owner_interval_seconds`，默认 0.5，0 = 关闭）；录像中、身份未确认、
   画面空了仍全速。背景数据：真机 0.2.0 空闲 10 分钟 5749 帧全部推理，
@@ -139,5 +139,13 @@
   可直接观察被跳过的帧数。
 - 测试：`test_logic.py::TestOwnerInferenceThrottle`（6 项）+
   `test_integration.py::test_owner_present_throttles_inference`；
-  全量 `rw test` 通过（2026-10-20 实测）。
-- 待办：打包后装到真机对比 CPU；确认无回归再合回 `beta`。
+  全量 `rw test` 通过（2026-10-20 与 21 日各跑一次）。
+- 构建：`dist\room-watch-0.2.1-setup.exe`（143.1MB，sha256
+  `ea4e416166348d923c34f5fad497240f21ebe83b6341c459c3395841c115cf2a`）、
+  `dist\room-watch-0.2.1.zip`（177.1MB）。
+- 真机验证（2026-10-21 00:07 起）：安装版 `VERSION`/卸载项/`rw doctor`
+  均为 0.2.1；界面 `--selftest` 通过；一个 watcher + 一个 guardian +
+  一个 gallery；相机正常、`/healthz` ok、无 `update_failed.txt`。
+  同场景进程 CPU 从约 128% 降到 52–55%；3 分钟 1748 帧里推理 353 次，
+  `owner_throttled` 1395。
+- 待办：推送与发版需所有者明确同意；稳定观察后再把 `beta` 合回 `main`。
