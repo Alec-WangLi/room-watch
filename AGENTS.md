@@ -613,6 +613,10 @@ room-watch-<版本>\
     测试者手动下载安装。
   - 脚本会校验已存在的 tag/release 是否与通道一致，发现指向别的提交或
     prerelease 标志不符会拒绝复用。先 `--dry-run` 可以只看将要做的事。
+  - **Release 简介以 `CHANGELOG.md` 为唯一来源**：自动取对应版本的小节，
+    不再只写安装包与 sha256。beta 从旧版本跳到新版本时用 `--notes-include`
+    把未发布的中间版本一并写进简介；补写历史 Release 用 `--notes-only`
+    （只更新简介，不动 tag 与资产）。
   - 资产命名两个通道一致：`room-watch-<版本>-setup.exe` + `.sha256`。
     仓库名可用 `RW_REPO` 覆盖（fork 后自己发版）。
 

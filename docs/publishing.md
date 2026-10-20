@@ -118,6 +118,19 @@ python scripts/release.py --channel beta
 **幂等**：重复执行只补缺失的资产；若已有 tag/release 指向别的提交或
 prerelease 标志与通道不符，脚本会拒绝复用。可先加 `--dry-run` 预览。
 
+**Release 简介**自动从 `CHANGELOG.md` 里取对应版本的小节。beta 跨版本跳发时
+用 `--notes-include` 合并未发布的中间版本：
+
+```bash
+python scripts/release.py --channel beta --notes-include 0.1.18
+```
+
+补写已有 Release 的简介（不动 tag 与资产）：
+
+```bash
+python scripts/release.py --channel stable --version 0.1.10 --tag v0.1.10 --notes-only
+```
+
 ### 方式 B：手动
 
 ```bash
