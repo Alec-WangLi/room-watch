@@ -78,6 +78,59 @@ class BundleTest(unittest.TestCase):
             with zipfile.ZipFile(out) as zf:
                 self.assertIn("system.txt", zf.namelist())
 
+    def test_rotated_logs_are_included(self):
+        """RotatingFileHandler 的备份名是 watcher.log.1，*.log 匹配不到。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs = root / "var" / "logs"
+            logs.mkdir(parents=True)
+            (logs / "watcher.log").write_text("current", encoding="utf-8")
+            (logs / "watcher.log.1").write_text("previous", encoding="utf-8")
+            (logs / "watcher.log.2").write_text("older", encoding="utf-8")
+            out = diag.build_bundle(root)
+            with zipfile.ZipFile(out) as zf:
+                names = set(zf.namelist())
+        self.assertIn("var/logs/watcher.log.1", names)
+        self.assertIn("var/logs/watcher.log.2", names)
+
+    def test_recent_events_and_structured_log_events_are_summarized(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs = root / "var" / "logs"
+            logs.mkdir(parents=True)
+            (logs / "watcher.log").write_text(
+                "12:00:00 INFO 2026-10-19 12:00:00 event=watcher_exit code=0 reason=keyboard\n",
+                encoding="utf-8",
+            )
+            db_dir = root / "var" / "db"
+            db_dir.mkdir(parents=True)
+            conn = sqlite3.connect(db_dir / "events.db")
+            conn.execute(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, "
+                "snapshot TEXT NOT NULL, confidence REAL, notified INTEGER NOT NULL DEFAULT 0, "
+                "video TEXT, identity TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO events (ts, snapshot, confidence, notified, identity) "
+                "VALUES ('2026-10-19T12:00:00', 'data/captures/x.jpg', 0.9, 1, 'other')"
+            )
+            conn.commit()
+            conn.close()
+
+            out = diag.build_bundle(root)
+            with zipfile.ZipFile(out) as zf:
+                names = set(zf.namelist())
+                events_text = zf.read("events.txt").decode("utf-8")
+                log_text = zf.read("log_events.txt").decode("utf-8")
+
+        self.assertIn("events.txt", names)
+        self.assertIn("2026-10-19T12:00:00", events_text)
+        self.assertIn("other", events_text)
+        self.assertIn("watcher_exit", log_text)
+        self.assertNotIn("data/captures", events_text)  # 不把隐私路径带进诊断包
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

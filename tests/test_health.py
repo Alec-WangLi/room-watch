@@ -40,6 +40,31 @@ class AtomicJsonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(health.read_json(Path(tmp) / "nope.json"))
 
+    def test_concurrent_writers_do_not_collide(self):
+        """GUI 与 CLI 可能同时写 desired_state；临时文件名不能共用。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "state.json"
+            errors = []
+            barrier = threading.Barrier(8)
+
+            def writer(index):
+                try:
+                    barrier.wait()
+                    for n in range(50):
+                        health.write_json_atomic(p, {"writer": index, "n": n})
+                except Exception as exc:  # noqa: BLE001 - 失败要带回主线程
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            self.assertIn("writer", json.loads(p.read_text(encoding="utf-8")))
+            self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
+
 
 class HealthPayloadTest(unittest.TestCase):
     def test_fixed_keys_and_extra(self):

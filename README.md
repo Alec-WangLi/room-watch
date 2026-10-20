@@ -50,12 +50,15 @@ scripts\setup-hooks.bat
 ### 方式一：桌面程序（推荐日常使用）
 
 1. 双击 `dist\room-watch.exe`；
-2. 点「启动监控」，状态变成 `● 在线`；
-3. 点「打开相册」在浏览器里看抓拍；
-4. 想放到桌面：右键运行 `scripts\install-shortcut.ps1`。
+2. 首次使用先点「设置」填好摄像头、推送与相册；
+3. 点「验证」确认摄像头和推送真的可用；
+4. 点「启动监控」，状态变成 `● 在线`；
+5. 点「打开相册」在浏览器里看抓拍；
+6. 想放到桌面：右键运行 `scripts\install-shortcut.ps1`。
 
-窗口里能做的事：启动 / 停止监控、打开相册、拍预览图、注册本人、
-**设置（四个页签）**、查看最近事件、打开最新抓拍与日志目录。状态每 2 秒刷新一次。
+窗口里能做的事：启动 / 停止监控、打开相册、拍预览图、注册本人、**验证**、
+**设置（八个页签）**、生成脱敏诊断包、查看最近事件、打开最新抓拍与日志目录。
+状态每 2 秒刷新一次。
 
 > **停止是「优雅」的**：界面先让监控自己收尾（当前 mp4 写完整、音轨合上、
 > 音量还原），最多等 20 秒；只有超过这个时间才会问你要不要强制结束。
@@ -66,8 +69,12 @@ scripts\setup-hooks.bat
 
 | 页签 | 内容 |
 |---|---|
-| 推送 | 渠道、企业微信 webhook、WxPusher、Server酱、录像推送开关、**发送测试消息** |
-| 身份 | 本人模板状态（样本数/时间/维度）、注册本人、用最新抓拍注册、清除模板、阈值与策略 |
+| 摄像头 | 本机编号 / 网络地址、测试摄像头、改回本机摄像头 |
+| 推送 | 渠道勾选、各渠道凭据、录像推送、人员事件/报平安开关、**发送测试消息** |
+| 相册 | 仅本机 / 局域网、密码、实际地址与手机 URL |
+| 身份 | 本人模板状态、注册本人、用最新抓拍注册、清除模板、阈值与策略 |
+| 录像 | 时长策略、本人在场策略、容量上限、保留天数与存储预警 |
+| 心跳 | 外部死手开关 URL、间隔、状态、测试 |
 | 自启 | 开机自启的开/关与状态（指向别的安装目录时会警示） |
 | 声音 | 播报开关/文案/冷却、以及播报音量策略（默认**不碰系统音量**） |
 
@@ -155,6 +162,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 | `rw dry-run` | 抓拍存档但不推送 |
 | `rw probe` | 拍预览图后退出 |
 | `rw status` | 是否在线（读取时重算心跳） |
+| `rw verify [--json] [--no-camera]` | 一次验证摄像头、推送与自检是否真的在工作 |
 | `rw gallery [--host H] [--port 8765]` | 相册（非回环地址必须配 token） |
 | `rw guard [--once\|--status\|--dry-run]` | 守护进程：监控 + 相册 |
 | `rw enroll [--from IMG]` | 注册本人人脸 |
@@ -165,13 +173,15 @@ powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 | `rw config [--json\|--set 键=值\|--test]` | 读/改界面设置、发测试消息 |
 | `rw autostart [--json\|--enable\|--disable]` | 开机自启（计划任务优先，失败回退 Run 键） |
 | `rw identity [--json\|--clear]` | 查看/清除本人模板元信息 |
-| `rw storage` | 磁盘占用与最旧文件 |
+| `rw storage [--json]` | 磁盘占用、容量预测与最旧文件 |
+| `rw bench-encode` | 编码基准（cv2 与 ffmpeg 硬件编码器，只测量） |
+| `rw bench-detect` | 推理基准（只测量，不切换引擎） |
 | `rw push` | 配置推送渠道 |
 | `rw setup` | 首次配置向导（摄像头 / webhook / 相册密码 / 开机自启） |
 | `rw push-video PATH` | 把一段录像发到企业微信（验证视频推送） |
 | `rw test [--fast]` | 跑全部测试（`--fast` 跳过集成测试） |
 | `rw doctor` | 环境自检 |
-| `rw diag` | 生成脱敏诊断包（日志/健康快照/退出记录/脱敏配置） |
+| `rw diag [--json]` | 生成脱敏诊断包（轮转日志/健康快照/退出记录/事件摘要/脱敏配置） |
 | `rw update [--check\|--yes\|--force\|--json]` | 检查并安装更新（见「自动更新」） |
 | `rw version` | 版本号 + 当前 git 提交 |
 | `rw gui` | 打开桌面界面 |
@@ -184,8 +194,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build-portable.ps1
 room-watch/
 ├─ rw / rw.cmd            # 全局命令
 ├─ config.yaml            # 所有可调参数
-├─ roomwatch/             # 源码包（13 个模块 + cli/paths/gui）
-├─ tests/                 # 11 个测试文件，全部离线可跑
+├─ roomwatch/             # 源码包（40 个模块，含 cli/paths/gui）
+├─ tests/                 # 38 个测试文件，全部离线可跑
 ├─ scripts/               # 启动脚本、钩子、开机自启、打包
 ├─ models/  yolov8n.pt    # 权重（已入库，别删）
 ├─ data/captures/<日期>/   # 抓拍 jpg + 录像 mp4 + 音频 wav（隐私，不入库）
@@ -320,12 +330,15 @@ rw test --fast   # 跳过最慢的集成测试（约 55 秒）
 
 已知限制：
 
-- **录像不知道「你是不是在电脑前」**：`behavior.skip_when_user_active` 只抑制推送，
-  不抑制录像。按 65.6 MB/分钟算，全天办公能写数 GB。
-- **相册只按 PID 判活**：进程还在但 HTTP 卡死时，guardian 不会发现；
-  这时看 `var/logs/gallery.log` 或手动重启相册。
+- **本人在场时默认仍录像**：`record.owner_at_computer` 默认 `mute`（照录不推送）。
+  想连录像一起停就显式改成 `skip`；容量上限与存储预测会兜底。
+- **相册按 PID + `/healthz` 判活**：进程在但 HTTP 连续两次无响应（默认检查间隔
+  60 秒）时，guardian 会重启相册并推送通知；实际端口从 `var/state/gallery.json`
+  读取，8765 被占用后自动换端口也能探测到。
 - **暂停后需要显式启动**：`rw stop` / 界面「停止监控」会写 `paused`，
   之后必须 `rw start` / 界面「启动监控」才会恢复；guardian 不会自动拉起。
+
+更多问题见 [FAQ](docs/faq.md)；数据去向与隐私边界见 [隐私说明](docs/privacy.md)。
 
 原生崩溃转储（WER LocalDumps）默认不开启：它需要注册表写权限，普通安装不应
 擅自修改系统设置。要抓 cv2 或驱动层崩溃时，按
@@ -349,11 +362,22 @@ rw test --fast   # 跳过最慢的集成测试（约 55 秒）
 界面启动时也会按 `update.check_interval_hours`（默认 24 小时）在后台静默查一次，
 结果缓存在 `var/state/update.json`；**只提示，不自动安装**。
 
+**更新通道**在「设置 → 更新」里选：
+
+- `stable`（默认）：只收 GitHub 正式 Release，行为最稳。
+- `beta`：连测试版预发布一起收，尝鲜用；同一版本同时有稳定版时优先稳定版。
+  切换后旧检查缓存会被清掉，下次检查立即按新通道执行。
+
+```bash
+rw update --channel beta   # 临时按测试版通道检查/更新
+```
+
 命令行等价写法：
 
 ```bash
 rw update            # 检查并在允许时直接安装
 rw update --check    # 只看有没有新版，不下载
+rw update --channel stable|beta  # 选择更新通道（也可写在 config.local.yaml）
 rw update --yes      # 允许跨次版本（0.1.4 → 0.2.0）
 rw update --force    # 允许降级（回滚排障用）
 rw update --json     # 机器可读（一行 JSON，隐含 --check，界面用）

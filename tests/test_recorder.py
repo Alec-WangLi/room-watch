@@ -287,6 +287,23 @@ class TestEventStoreMigration(unittest.TestCase):
         store = EventStore(self._legacy_db())
         self.assertIn("video", self._columns(store))
 
+    def test_identity_column_added_to_legacy_db(self):
+        from roomwatch.watcher import EventStore
+
+        store = EventStore(self._legacy_db())
+        self.assertIn("identity", self._columns(store))
+
+    def test_can_write_identity_on_legacy_db(self):
+        from roomwatch.watcher import EventStore
+
+        store = EventStore(self._legacy_db())
+        store.add(datetime(2026, 10, 17, 9, 4, 10), "090410.jpg", 0.88, True,
+                  video=None, identity="other")
+        row = store.conn.execute(
+            "SELECT identity FROM events WHERE snapshot='090410.jpg'"
+        ).fetchone()
+        self.assertEqual(row, ("other",))
+
     def test_can_write_video_on_legacy_db(self):
         from roomwatch.watcher import EventStore
 
@@ -306,10 +323,11 @@ class TestEventStoreMigration(unittest.TestCase):
         total = store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         self.assertEqual(total, 1)
         old = store.conn.execute(
-            "SELECT snapshot, video FROM events WHERE snapshot='old.jpg'"
+            "SELECT snapshot, video, identity FROM events WHERE snapshot='old.jpg'"
         ).fetchone()
         self.assertEqual(old[0], "old.jpg")
         self.assertIsNone(old[1], "迁移前的老行 video 应为空")
+        self.assertIsNone(old[2], "迁移前的老行 identity 应为空")
 
     def test_fresh_db_has_video_column(self):
         from roomwatch.watcher import EventStore

@@ -74,7 +74,10 @@
 | `roomwatch/diagnostics.py` | faulthandler 与 excepthooks | |
 | `roomwatch/logutil.py` | 日志轮转与固定字段事件 | |
 | `roomwatch/diag.py` | 脱敏诊断包 | **不收 `data/`** |
+| `roomwatch/benchcodec.py` | 编码基准（cv2 + ffmpeg 硬件编码器） | 只测量，不在主链路 |
+| `roomwatch/benchdetect.py` | 推理基准（墙钟 + CPU 核数） | 只测量，不切换引擎 |
 | `roomwatch/selfcheck.py` | 启动自检（模型/目录/推送/磁盘） | |
+| `roomwatch/verify.py` | 「真的在工作」验证：自检+摄像头+推送+心跳 | 所有外部动作可注入 |
 | `roomwatch/procutil.py` | 进程判活 / 等退出 / 结束 | 判活的唯一实现，updater 也用它 |
 | `roomwatch/control.py` | 停止协议 + 期望状态 + gallery PID | 不许再用 taskkill 当主路径 |
 | `roomwatch/settings.py` | 界面设置的后端：读生效值、写 `config.local.yaml`、复读校验 | 凭据只回掩码 |
@@ -174,7 +177,10 @@ SHA256 校验都跑通了**（下载 142.1MB、摘要逐位一致），不是只
 | 验证识别 | `rw whoami IMG` |
 | 试听语音 | `rw say` / `rw say-raw` / `rw ab` |
 | 音量 | `rw volume-check` / `rw volume-set 70` |
-| 磁盘占用 | `rw storage` |
+| 磁盘占用 | `rw storage`（`--json` 供界面/脚本） |
+| 编码基准 | `rw bench-encode`（只测量，不改默认编码器） |
+| 推理基准 | `rw bench-detect`（只测量，不切换引擎） |
+| 验证「真的在工作」 | `rw verify [--json] [--no-camera]` |
 | 相册 | `rw gallery [--port 9000]` |
 | 守护（监控 + 相册） | `rw guard [--once\|--status\|--dry-run]` |
 | 推送配置 | `rw push` |
@@ -328,7 +334,9 @@ room-watch-<版本>\
 ### F.1 摄像头同时只能被一个进程占用；改完代码必须重启
 
 - **现象**：第二份监控打不开摄像头；改完 `config.yaml` 后运行中的进程行为不变。
-- **原因**：设备独占；配置只在 `Watcher.__init__` 里读一次，不热加载。
+- **原因**：设备独占；摄像头/模型等配置只在 `Watcher.__init__` 里读一次。
+  **0.1.21 起**「更新 / 自启 / 声音」三页保存后热更新（reload 标记），
+  不再需要重启；其余设置仍按原样重启生效，界面会逐项提示。
 - **正解**：改完代码或配置，必须重启监控与相册。不要靠「再开一份」验证。
 - **另**：**禁止同时跑两组实例**（2026-10-18 实测出现过两个 guardian + 两个 watcher
   同时存在的局面，互相抢摄像头）。发现重复实例先 `rw status` 看 PID，再确认后终止。
@@ -541,6 +549,17 @@ room-watch-<版本>\
 - gallery 用 `gallery.pid` + 命令行（必须同时含 `roomwatch` 与 `gallery`）判活，
   PID 复用不会误杀；挂了由 guardian 拉起并写历史。
 
+### F.25 Agent 的 Bash 工具和真实会话不是同一个注册表
+
+- Claude 桌面端的 Bash 工具跑在隔离命名空间：**文件写入是真实的，HKCU 注册表
+  写入不落用户会话**。
+- 2026-10-20 实测：从 Bash 跑 0.1.22 安装器后，真实安装目录 `VERSION` 已是
+  0.1.22，但用户 PowerShell、卸载工具和真实终端里的 `reg query` 仍是 0.1.20。
+  同一个路径、同一个用户、同一个会话，Bash 里读到的却是 0.1.22。
+- **安装器、更新器、卸载项验证必须通过终端面板（真实用户会话）执行**；
+  Bash 里的 `dangerouslyDisableSandbox` 不改变注册表命名空间。
+- 文件、进程、摄像头仍可在 Bash 里验证；注册表和“已安装版本”要在真实会话复核。
+
 ---
 
 ## G. Git、隐私与钩子
@@ -591,20 +610,33 @@ room-watch-<版本>\
 - 仓库：<https://github.com/Alec-WangLi/room-watch>（public，主分支 `main`）。
 - 许可证 **AGPL-3.0**，原因写在 `README.md`：`models/yolov8n.onnx` 来自 Ultralytics，
   本身即 AGPL-3.0，主许可证与之一致才不会自相矛盾。`NOTICE` 逐项列第三方来源。
-- **发版一条命令**（幂等，重复跑只补缺失资产）：
+- **发版两个通道，不要发错**（脚本幂等，重复跑只补缺失资产）：
 
   ```
   set GH_TOKEN=ghp_xxx        :: PowerShell: $env:GH_TOKEN="ghp_xxx"
-  python scripts/release.py
+
+  python scripts/release.py --channel stable
+  python scripts/release.py --channel beta
   ```
 
-  它做：读 `VERSION` → 算 SHA256 并写 `.sha256` → 在 `main` 当前提交上建 tag
-  → 建 Release → 上传两个资产。仓库名可用 `RW_REPO` 覆盖（fork 后自己发版）。
+  - `stable`：取 `main` 的提交，tag `v<版本>`，普通 Release。
+    内置自动更新只认这个通道。
+  - `beta`：取 `beta` 的提交，tag `v<版本>-beta`，**必须勾 prerelease**。
+    GitHub 的 `/releases/latest` 不返回预发布，所以稳定用户不会被推测试版；
+    测试者手动下载安装。
+  - 脚本会校验已存在的 tag/release 是否与通道一致，发现指向别的提交或
+    prerelease 标志不符会拒绝复用。先 `--dry-run` 可以只看将要做的事。
+  - **Release 简介以 `CHANGELOG.md` 为唯一来源**：自动取对应版本的小节，
+    不再只写安装包与 sha256。beta 从旧版本跳到新版本时用 `--notes-include`
+    把未发布的中间版本一并写进简介；补写历史 Release 用 `--notes-only`
+    （只更新简介，不动 tag 与资产）。
+  - 资产命名两个通道一致：`room-watch-<版本>-setup.exe` + `.sha256`。
+    仓库名可用 `RW_REPO` 覆盖（fork 后自己发版）。
 
-- **资产命名是硬约束**，自动更新靠正则 `room-watch-(\d+\.\d+\.\d+)-setup\.exe$` 匹配：
-  `room-watch-<版本>-setup.exe` + `room-watch-<版本>-setup.exe.sha256`。tag 必须 `v<版本>`。
-- **不要勾 prerelease**：`/releases/latest` 与 302 回退都不返回预发布，等于自动更新看不见它。
-- 打 tag = 对外发布，按第 12 条版本纪律需所有者批准。
+- **所有者口径（2026-10-19）**：只要本人说「推送到远程」，就默认同时打 tag
+  并发 GitHub Release；但仍必须先判断版本性质——`main`/稳定版走 `stable`，
+  `beta`/测试版走 `beta`，不确定就先问，不许猜着发。
+- 打 tag = 对外发布；除上述默认口径外，仍按第 12 条版本纪律需所有者批准。
 
 ### G.5 推送权限与历史重写（2026-10-19 真机踩过）
 
@@ -666,8 +698,10 @@ room-watch-<版本>\
 1. ~~**gallery 的长期守护方案未定**~~（**0.1.12 已修**）—— guardian 现在同时守护
    watcher 与 gallery：gallery 写 `var/state/gallery.pid`，guardian 用 PID + 命令行
    校验判活，挂了拉起并写历史。保留这条记录，避免有人再退回「只守 watcher」。
-2. **录像在本人坐在电脑前时仍会录** —— `behavior.skip_when_user_active` 只抑制推送。
-   实测约 65.6 MB/分钟，长期会吃满盘。**暂缓原因**：这是产品决策，需用户拍板。
+2. ~~**录像在本人坐在电脑前时仍会录**~~（**0.1.17 已提供选项**）——
+   `record.owner_at_computer` 三档 keep / mute / skip，默认 `mute`（照录不推，
+   与旧版一致）；想连录像一起停下来的人显式设 `skip`。默认值不为省磁盘牺牲取证：
+   你坐在电脑前时有人进来，仍然要录到。保留这条记录，避免有人把默认值悄悄改成 skip。
 3. ~~桌面的「停止监控」不优雅~~（**0.1.9 已修**）—— 改成 `stop.request` + 两段式停止，
    见 F.17。保留这条记录，避免有人再「优化」回 `taskkill /F`。
 4. **~~`install-autostart.ps1` 硬编码绝对路径~~（已在 v0.1.0 修掉）** ——
@@ -681,20 +715,36 @@ room-watch-<版本>\
    **待所有者本人操作**，代码侧已无需改动。
 7. **Watcher 每 30~63 分钟静默退出未根治** —— 0.1.11 已加健康快照、退出记录、
    崩溃栈、看门狗与 guardian 历史，先用真机数据定位；guardian 仍常驻兜底。
-8. **未在干净机器上验证过安装包** —— 0.1.12 已本地构建
-   `dist\room-watch-0.1.12-setup.exe`，但同机存在开发环境，仍需干净机器验证。
+8. **未在干净机器上验证过安装包** —— 0.1.21 已本地构建
+   `dist\room-watch-0.1.21-setup.exe`，但同机存在开发环境，仍需干净机器验证。
 
 ---
 
-## J. 当前状态（2026-10-19 交接）
+## J. 当前状态（2026-10-20 晚）
 
-- **分支**：`main` = `546b846`（稳定版 0.1.12）；`beta` = `f6a0670`
-  （0.1.12 + GUI 子进程隐藏控制台修复），两个远程分支均已推送。
-- **已完成**：M0 可观测性（0.1.11）+ M1 守护自愈（0.1.12）；
-  评审的 2 个 Critical 与 11 个 Important 已修；全量测试通过。
-- **未发布**：v0.1.11 / v0.1.12 没有 GitHub tag/Release；内置更新看不到新版本。
-- **下一步**：M2 持久化 outbox + 重试 + 多渠道 + 外部心跳；M3 录制/存储；
-  M4 推理性能；M5 产品化；M6 平台抽象。
-- **详细交接**：`docs/handoff/2026-10-19-session.md`；新会话入口 `CLAUDE.md`。
-- **待用户操作**：用 `dist\room-watch-0.1.12-setup.exe` 覆盖安装 0.1.10；
-  发版前先把 `beta` 升到 0.1.13，避免与 `main` 的 0.1.12 同号不同内容。
+- **分支**：`main` = `b63f8a2`（稳定版 0.1.12）；`beta` = `4b801d7`（0.1.22，
+  已发 `v0.1.22-beta` 预发布）；本轮功能分支 `feat/0.1.22-ui-fixes` 已合回 beta。
+- **本机安装**：已用 `dist\room-watch-0.1.22-setup.exe` 覆盖安装，`VERSION` 与
+  卸载项均显示 0.1.22；配置、本人模板与抓拍/录像数据保留。
+- **已完成（0.1.22）**：更新通道代次与保存后重查、底栏/设置页版面修复、
+  保存提示保留、构建自检扩成九个设置页 × 两档尺寸；真机发现并修复
+  guardian 与 `guard --once` 双起 watcher、安装器失败不回显两个问题。
+- **真机验证**：安装后 `rw start` 只有一个 watcher 与一个 guardian，gallery 正常；
+  `room-watch.exe --selftest` 通过；更新检查返回「测试版通道」；保存提示保留；
+  九页两档尺寸无裁切（详见 `ui-check/` 与 `var/logs/gui-selftest.log`）。
+- **已发布**：`v0.1.22-beta`（prerelease，tag 指向 `4b801d7`）：
+  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.1.22-beta
+  资产 `room-watch-0.1.22-setup.exe` + `.sha256`；简介取自 CHANGELOG。
+- **0.1.23（已发 `v0.1.23-beta`，tag `96328cb`）**：gallery `/healthz` +
+  guardian 假活重启、`rw doctor` 安装版本检查；已真机安装验证。
+- **0.1.24（已发 `v0.1.24-beta`，tag `d852c2c`）**：0.1.22/0.1.23 的更新
+  交接脚本在分离 cmd 里用 `tasklist | find` 等更新器 PID，`find` 会一直等管道
+  EOF，安装器根本不启动。已改成 tasklist 先写临时文件再 find；真实会话用
+  本地安装包走交接脚本验证 `installer rc=0`、监控自动恢复、界面自动重开。
+  0.1.22/0.1.23 用户需要手动安装一次 0.1.24；0.1.23 的 Release 保留。
+  https://github.com/Alec-WangLi/room-watch/releases/tag/v0.1.24-beta
+- **未做**：托盘（需 pystray + 真机）、M6 平台抽象、干净机器安装验证。
+- **下一步**：观察 0.1.22 真机运行与后续自动更新；稳定后升修订号合 `main`，
+  从 `main` 发 stable。发版仍需所有者明确同意。
+- **详细交接**：`docs/handoff/2026-10-19-session.md`（第 18 节为 0.1.21）、
+  `docs/handoff/2026-10-20-next-session.md`（下一轮入口）；新会话入口 `CLAUDE.md`。

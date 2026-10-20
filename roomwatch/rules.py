@@ -325,9 +325,13 @@ def is_stale(last_frame_at: Optional[datetime], now: datetime, tolerance_seconds
 
 
 def snapshot_path(base_dir: str, when: datetime) -> str:
-    """按 日期目录/时分秒.jpg 归档。"""
+    """按 日期目录/完整时间戳.jpg 归档。
+
+    文件名带完整日期：相册里一眼能看出是哪天几点，按名字排序也天然是
+    时间顺序。日期目录保留，方便按天清理。
+    """
     day = when.strftime("%Y-%m-%d")
-    name = when.strftime("%H%M%S") + ".jpg"
+    name = when.strftime("%Y-%m-%d_%H%M%S") + ".jpg"
     return os.path.join(base_dir, day, name)
 
 
@@ -391,6 +395,151 @@ def iter_media_files(base_dir: str) -> list:
 def usage_bytes(base_dir: str) -> int:
     """当前占用了多少字节。"""
     return sum(size for _m, _p, size in iter_media_files(base_dir))
+
+
+# 存储预测的四种状态。UI 与日志共用同一套值，避免各写各的中文。
+STORAGE_UNLIMITED = "unlimited"   # 不限容量也不限天数
+STORAGE_OK = "ok"
+STORAGE_WARNING = "warning"       # 按当前增速，很快会碰到上限
+STORAGE_OVER = "over"             # 已经超过上限（清理还没跟上）
+
+# 本人在电脑前时，录像与推送各自怎么处理。
+OWNER_KEEP = "keep"   # 照录照推
+OWNER_MUTE = "mute"   # 照录不推（0.1.16 及以前的默认行为）
+OWNER_SKIP = "skip"   # 不录不推
+OWNER_POLICIES = (OWNER_KEEP, OWNER_MUTE, OWNER_SKIP)
+
+
+def normalize_owner_policy(raw, legacy_skip=None) -> str:
+    """把配置里的策略值收成一个已知值，并兼容旧的布尔开关。
+
+    `behavior.skip_when_user_active` 只表达「要不要推送」：
+    true 等价于 mute，false 等价于 keep。新配置优先，缺失时才看旧键。
+    """
+    text = str(raw or "").strip().lower()
+    if text in OWNER_POLICIES:
+        return text
+    if legacy_skip is None:
+        return OWNER_MUTE
+    return OWNER_MUTE if bool(legacy_skip) else OWNER_KEEP
+
+
+def allow_record(policy: str, user_active: bool) -> bool:
+    """当前这一帧允许开录吗？策略只在「人确实在电脑前」时生效。"""
+    return not (policy == OWNER_SKIP and user_active)
+
+
+def allow_notify(policy: str, user_active: bool) -> bool:
+    """当前这一帧允许推送吗？"""
+    return policy == OWNER_KEEP or not user_active
+
+
+def storage_forecast(
+    files: Iterable[Tuple[float, str, int]],
+    now: Optional[datetime] = None,
+    max_bytes: int = 0,
+    keep_days: int = 0,
+    warn_days: float = 7.0,
+    window_days: int = 7,
+) -> dict:
+    """根据媒体文件的修改时间估计「按当前速度还能撑多久」。
+
+    为什么增长率不含今天：今天的量是半天/小半天的累计，直接拿它当一整天的
+    增长率会把预警吹得虚高。先取最近 window_days 天里**完整**自然日的平均；
+    完全没有完整数据（刚装的机器）才退回今天的累计量——那是个下限，不是方向。
+
+    容量预警只看 `days_to_cap`：`keep_days` 是用户主动选择的保留期，
+    它比 warn_days 短不代表出问题，只在展示「预计保留多久」时参与取小。
+    """
+    now = now or datetime.now()
+    files = list(files)
+    used = sum(size for _m, _p, size in files)
+
+    per_day: dict = {}
+    oldest = newest = None
+    for mtime, _path, size in files:
+        day = datetime.fromtimestamp(mtime).date()
+        per_day[day] = per_day.get(day, 0) + size
+        if oldest is None or mtime < oldest:
+            oldest = mtime
+        if newest is None or mtime > newest:
+            newest = mtime
+
+    today = now.date()
+    complete = []
+    for offset in range(1, max(1, int(window_days)) + 1):
+        day = today - timedelta(days=offset)
+        if day in per_day:
+            complete.append(per_day[day])
+    daily = int(sum(complete) / len(complete)) if complete else int(per_day.get(today, 0))
+
+    days_to_cap: Optional[float] = None
+    if max_bytes > 0:
+        if used >= max_bytes:
+            days_to_cap = 0.0
+        elif daily > 0:
+            days_to_cap = round((max_bytes - used) / daily, 1)
+
+    days_to_keep = float(keep_days) if keep_days > 0 else None
+    candidates = [d for d in (days_to_cap, days_to_keep) if d is not None]
+    projected = min(candidates) if candidates else None
+
+    if max_bytes > 0 and used >= max_bytes:
+        status = STORAGE_OVER
+    elif max_bytes > 0 and days_to_cap is not None and days_to_cap < warn_days:
+        status = STORAGE_WARNING
+    elif max_bytes <= 0 and keep_days <= 0:
+        status = STORAGE_UNLIMITED
+    else:
+        status = STORAGE_OK
+
+    return {
+        "status": status,
+        "used_bytes": used,
+        "file_count": len(files),
+        "daily_bytes": daily,
+        "max_bytes": max_bytes,
+        "keep_days": keep_days,
+        "warn_days": warn_days,
+        "window_days": int(window_days),
+        "days_to_cap": days_to_cap,
+        "days_to_keep_expiry": days_to_keep,
+        "projected_days": projected,
+        "oldest_at": (
+            datetime.fromtimestamp(oldest).isoformat(timespec="seconds")
+            if oldest is not None else None
+        ),
+        "newest_at": (
+            datetime.fromtimestamp(newest).isoformat(timespec="seconds")
+            if newest is not None else None
+        ),
+    }
+
+
+
+def storage_summary(
+    directory,
+    *,
+    max_bytes: int = 0,
+    keep_days: int = 0,
+    warn_days: float = 7.0,
+    free_bytes: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """目录级存储摘要：`rw storage`、设置页与主界面共用同一份口径。"""
+    files = iter_media_files(str(directory))
+    forecast = storage_forecast(
+        files, now=now, max_bytes=max_bytes, keep_days=keep_days, warn_days=warn_days
+    )
+    return {
+        "directory": str(directory),
+        "used_bytes": forecast["used_bytes"],
+        "max_bytes": max_bytes,
+        "free_bytes": free_bytes,
+        "keep_days": keep_days,
+        "warn_days": warn_days,
+        "forecast": forecast,
+    }
 
 
 def _drop_empty_day_dirs(base_dir: str) -> None:

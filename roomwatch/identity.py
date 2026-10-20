@@ -311,6 +311,34 @@ class Identity:
 # 本身端出去：那是生物特征，只在本地存在。所以这里只回元信息。
 
 
+def owner_photo_path(owner_file: str) -> Path:
+    return Path(owner_file).with_suffix(".png")
+
+
+def save_owner_photo(owner_file: str, frame, row) -> Optional[str]:
+    """注册成功时留一张现场照片，供界面显示「本人是谁」。
+
+    不是识别依据，只是给人看的；失败不影响注册。
+    """
+    try:
+        import cv2  # noqa: PLC0415 - 与识别模型一样按需导入
+
+        x1, y1, x2, y2 = (int(round(float(row[i]))) for i in range(4))
+        margin = int(max(x2 - x1, y2 - y1) * 0.6)
+        height, width = frame.shape[:2]
+        crop = frame[max(0, y1 - margin):min(height, y2 + margin),
+                     max(0, x1 - margin):min(width, x2 + margin)]
+        if crop.size == 0:
+            crop = frame
+        path = owner_photo_path(owner_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if cv2.imwrite(str(path), crop):
+            return str(path)
+    except Exception as exc:  # noqa: BLE001 - 照片只是附加信息
+        log.warning("保存本人照片失败: %s", exc)
+    return None
+
+
 def owner_summary(owner_file: str) -> dict:
     """读本人模板的元信息（样本数、维度、注册时间、文件大小）。
 
@@ -321,6 +349,7 @@ def owner_summary(owner_file: str) -> dict:
     info = {
         "registered": False,
         "path": str(path),
+        "photo": "",
         "samples": 0,
         "dim": 0,
         "created_at": "",
@@ -328,6 +357,9 @@ def owner_summary(owner_file: str) -> dict:
         "size": 0,
         "error": "",
     }
+    photo = owner_photo_path(owner_file)
+    if photo.is_file():
+        info["photo"] = str(photo)
     if not path.is_file():
         return info
 
@@ -354,14 +386,20 @@ def owner_summary(owner_file: str) -> dict:
 
 
 def clear_owner(owner_file: str) -> bool:
-    """删除本人模板。返回是否真的删掉了。"""
+    """删除本人模板与照片。返回模板是否真的删掉了。"""
     path = Path(owner_file)
+    removed = False
     try:
         path.unlink()
+        removed = True
     except FileNotFoundError:
-        return False
+        pass
     except OSError as exc:
         log.warning("删除本人模板失败: %s", exc)
         return False
+    try:
+        owner_photo_path(owner_file).unlink()
+    except OSError:
+        pass
     log.info("已删除本人模板：%s", path)
-    return True
+    return removed

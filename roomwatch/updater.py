@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -37,7 +38,9 @@ from . import procutil
 
 DEFAULT_REPO = "Alec-WangLi/room-watch"
 API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
+API_RELEASES = "https://api.github.com/repos/{repo}/releases?per_page=30"
 API_RELEASE_BY_TAG = "https://api.github.com/repos/{repo}/releases/tags/{tag}"
+ATOM_FEED = "https://github.com/{repo}/releases.atom"
 LATEST_PAGE = "https://github.com/{repo}/releases/latest"
 ASSET_URL = "https://github.com/{repo}/releases/download/{tag}/{name}"
 
@@ -162,6 +165,132 @@ def _default_get(timeout: float = 10.0, **extra):
     return get
 
 
+def _release_from_api(data: dict, repo: str) -> Optional[Release]:
+    """把 GitHub API 的一个 release 对象转成 Release；tag 不合法时返回 None。"""
+    tag = str(data.get("tag_name") or "")
+    try:
+        version = Version.parse(tag)
+    except UpdateError:
+        return None
+    return Release(
+        version=version,
+        tag=tag,
+        title=str(data.get("name") or tag),
+        notes=str(data.get("body") or ""),
+        prerelease=bool(data.get("prerelease")),
+        assets=list(data.get("assets") or []),
+        published_at=str(data.get("published_at") or ""),
+        repo=repo,
+    )
+
+
+def _fetch_beta_via_atom(repo: str, *, timeout: float = 10.0,
+                         get: Optional[Callable[..., object]] = None) -> Release:
+    """API 被限流时，从 `releases.atom` 取版本列表。
+
+    网页的 atom 源不消耗 API 配额，且包含预发布（实测 v0.1.19-beta 就在里面）。
+    代价是拿不到简介和资产列表：安装包地址按固定命名约定拼，SHA256 仍会
+    从 `.sha256` 资产下载校验。
+    """
+    get = get or _default_get(timeout)
+    url = ATOM_FEED.format(repo=repo)
+    try:
+        resp = get(url, headers={"Accept": "application/atom+xml"})
+    except Exception as exc:  # noqa: BLE001
+        raise UpdateError(f"测试版通道：API 被限流，atom 源也连不上（{exc}）") from exc
+    status = getattr(resp, "status_code", 0)
+    if status != 200:
+        raise UpdateError(f"测试版通道：API 被限流，atom 源返回 HTTP {status}")
+    try:
+        root = ET.fromstring(getattr(resp, "text", "") or "")
+    except ET.ParseError as exc:
+        raise UpdateError("测试版通道：atom 源内容无法解析") from exc
+
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    candidates: list[Release] = []
+    for entry in root.findall("a:entry", ns):
+        href = ""
+        for link in entry.findall("a:link", ns):
+            href = str(link.get("href") or "")
+            if "/releases/tag/" in href:
+                break
+        if "/releases/tag/" not in href:
+            continue
+        tag = href.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            version = Version.parse(tag)
+        except UpdateError:
+            continue
+        candidates.append(Release(
+            version=version,
+            tag=tag,
+            title=str(entry.findtext("a:title", default=tag, namespaces=ns) or tag),
+            notes="",
+            prerelease=("-" in tag),
+            assets=[],
+            published_at=str(entry.findtext("a:updated", default="", namespaces=ns) or ""),
+            repo=repo,
+        ))
+    if not candidates:
+        raise UpdateError("测试版通道：atom 源里没有可识别的 release")
+    return max(candidates, key=lambda r: (r.version, 0 if not r.prerelease else -1))
+
+
+def fetch_channel(repo: str = DEFAULT_REPO, channel: str = "stable", *,
+                  timeout: float = 10.0,
+                  get: Optional[Callable[..., object]] = None) -> Release:
+    """按更新通道取版本。
+
+    - stable：走 `/releases/latest`，GitHub 自己排除预发布。
+    - beta：读 `/releases` 列表，把预发布也算进来，挑版本最高的一个；
+      同一版本同时存在稳定版与测试版时，优先稳定版。
+      beta 通道必须走 API（网页 `/releases/latest` 不返回预发布），
+      被限流时无法退回重定向，只能提示稍后再试。
+    """
+    if str(channel or "stable").strip().lower() != "beta":
+        return fetch_latest(repo, timeout=timeout, get=get)
+
+    get = get or _default_get(timeout)
+    url = API_RELEASES.format(repo=repo)
+    try:
+        resp = get(url)
+    except Exception as exc:  # noqa: BLE001 - 网络异常先尝试 atom 兜底
+        try:
+            return _fetch_beta_via_atom(repo, timeout=timeout, get=get)
+        except UpdateError as atom_exc:
+            raise UpdateError(f"连不上 GitHub：{exc}；{atom_exc}") from exc
+
+    status = getattr(resp, "status_code", 0)
+    if status in (403, 429):
+        # 匿名 API 每小时只有 60 次；atom 源不耗配额，且包含预发布。
+        return _fetch_beta_via_atom(repo, timeout=timeout, get=get)
+    if status != 200:
+        raise UpdateError(f"GitHub 返回 {status}：{(getattr(resp, 'text', '') or '')[:200]}")
+    try:
+        data = resp.json()
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise UpdateError("GitHub 返回的 releases 不是有效 JSON") from exc
+    if not isinstance(data, list):
+        raise UpdateError("GitHub 返回的 releases 格式不对")
+
+    candidates: list[Release] = []
+    for item in data:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        release = _release_from_api(item, repo)
+        if release is None:
+            continue
+        # 列表模式必须确认真的有安装包资产；不能像重定向模式那样按名字拼。
+        if not any(INSTALLER_RE.search(str(a.get("name") or ""))
+                   for a in release.assets):
+            continue
+        candidates.append(release)
+
+    if not candidates:
+        raise UpdateError("beta 通道没有可用的安装包 release")
+    return max(candidates, key=lambda r: (r.version, 0 if not r.prerelease else -1))
+
+
 def fetch_latest(repo: str = DEFAULT_REPO, *, timeout: float = 10.0,
                  get: Optional[Callable[..., object]] = None) -> Release:
     """取最新 release。
@@ -190,17 +319,9 @@ def fetch_latest(repo: str = DEFAULT_REPO, *, timeout: float = 10.0,
         except (ValueError, json.JSONDecodeError):
             data = None
         if isinstance(data, dict):
-            tag = str(data.get("tag_name") or "")
-            return Release(
-                version=Version.parse(tag),
-                tag=tag,
-                title=str(data.get("name") or tag),
-                notes=str(data.get("body") or ""),
-                prerelease=bool(data.get("prerelease")),
-                assets=list(data.get("assets") or []),
-                published_at=str(data.get("published_at") or ""),
-                repo=repo,
-            )
+            release = _release_from_api(data, repo)
+            if release is not None:
+                return release
 
     if status == 404:
         raise UpdateError(f"仓库 {repo} 还没有发布任何 release")
@@ -357,7 +478,8 @@ def stop_watcher(status_path: Optional[Path] = None, *, grace: float = 8.0) -> b
     try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, timeout=grace + 5)
+                           capture_output=True, timeout=grace + 5,
+                           creationflags=procutil.no_window_flags())
         else:
             import signal
 
@@ -515,7 +637,8 @@ def _pid_alive(pid: int) -> bool:
     if os.name == "nt":
         try:
             r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                               capture_output=True, timeout=8)
+                               capture_output=True, timeout=8,
+                               creationflags=procutil.no_window_flags())
             # 不 text=True：中文 Windows 的 tasklist 输出是 GBK，
             # 按 UTF-8 解码会在 subprocess 的读线程里抛 UnicodeDecodeError。
             return str(pid).encode("ascii") in (r.stdout or b"")
@@ -548,12 +671,15 @@ def run_installer(path: Path, *, timeout: float = 600.0, quiet: bool = True) -> 
     return int(proc.returncode)
 
 
-def _helper_script(mode: str, delay_seconds: int) -> str:
+def _helper_script(mode: str, delay_seconds: int, pid: int = 0) -> str:
     """生成交接脚本（**纯 ASCII**：cmd 在 936 代码页下读中文会乱）。
 
     路径一律从参数 `%~1` / `%~2` 取，不写进脚本文本 —— 客户机上的用户名可能是
     中文（`C:\\Users\\张三\\AppData\\...`），写死就没法保证 ASCII 了；
     而命令行参数走的是宽字符，cmd 内部按 Unicode 处理，不会乱码。
+
+    `pid` 是更新器自己的进程号：安装器启动前必须等它退出，否则 RestartManager
+    关不掉父进程，静默模式下 30 秒后按 Abort（返回 5）并回滚。
 
     `mode` 决定装完之后拉什么起来：
       - ``gui``      重新打开界面（客户从界面里点的更新）
@@ -569,12 +695,34 @@ def _helper_script(mode: str, delay_seconds: int) -> str:
         'set "SETUP=%~2"',
         'set "LOG=%APP%\\var\\logs\\update.log"',
         'if not exist "%APP%\\var\\logs" mkdir "%APP%\\var\\logs" >nul 2>&1',
-        # 等更新器进程退出：RestartManager 关不掉父进程，父进程活着安装器必然 Abort
+        'if not exist "%APP%\\var\\state" mkdir "%APP%\\var\\state" >nul 2>&1',
         f"ping -n {max(1, int(delay_seconds))} 127.0.0.1 >nul 2>&1",
+    ]
+    if pid:
+        lines += [
+            "rem wait for the updater process to exit (RestartManager cannot close its parent)",
+            'set "WAITFILE=%TEMP%\\room-watch-wait-%~3.txt"',
+            "set /a WAIT=0",
+            ":waitupdater",
+            'if "%~3"=="" goto runsetup',
+            # 不要用 tasklist | find：cmd 在无控制台的分离进程里，find 会一直等
+            # 管道 EOF，安装器永远不启动（0.1.22 真机交接测试发现）。
+            # 先写文件再 find，失败也只是立刻放行。
+            '%SystemRoot%\\System32\\tasklist.exe /FI "PID eq %~3" /NH > "%WAITFILE%" 2>nul',
+            'find "%~3" "%WAITFILE%" >nul',
+            "if errorlevel 1 goto runsetup",
+            "ping -n 2 127.0.0.1 >nul 2>&1",
+            "set /a WAIT+=1",
+            "if %WAIT% LSS 40 goto waitupdater",
+            ":runsetup",
+        ]
+    lines += [
         '"%SETUP%" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LANG=chinesesimp >>"%LOG%" 2>&1',
         'set "RC=%ERRORLEVEL%"',
         '>>"%LOG%" echo [%DATE% %TIME%] installer rc=%RC%',
         'if not "%RC%"=="0" goto failed',
+        # 成功路径清掉上次残留的失败标记
+        'del /f /q "%APP%\\var\\state\\update_failed.txt" >nul 2>&1',
     ]
     if mode == "gui":
         lines += [
@@ -591,12 +739,16 @@ def _helper_script(mode: str, delay_seconds: int) -> str:
         "goto done",
         ":failed",
         '>>"%LOG%" echo installer failed, reopening gui if present',
+        # 失败标记：界面下次启动时会明确告诉用户「上次更新没有完成」，
+        # 而不是悄悄打开一个看起来正常的旧版本（0.1.21 真机就是这样丢了版本信息）。
+        '>>"%APP%\\var\\state\\update_failed.txt" echo [%DATE% %TIME%] installer rc=%RC%',
         'if not exist "%APP%\\room-watch.exe" goto done',
         # 回滚可能还在收尾：立刻启动会撞上 PyInstaller 解包被打断
         # （弹 "Failed to load Python DLL"），等两秒再开
         "ping -n 3 127.0.0.1 >nul 2>&1",
         'start "" "%APP%\\room-watch.exe"',
         ":done",
+        'del /f /q "%WAITFILE%" >nul 2>&1',
         # 安装包留在 %TEMP% 里没用；正在被安装器读时删不掉，失败也无所谓
         'del /f /q "%SETUP%" >nul 2>&1',
         "exit /b %RC%",
@@ -638,7 +790,7 @@ def handoff_install(setup: Path, *, mode: str = "none", delay_seconds: int = 4) 
 
     helper = temp / f"room-watch-update-{os.getpid()}.cmd"
     try:
-        helper.write_text(_helper_script(mode, delay_seconds), encoding="ascii")
+        helper.write_text(_helper_script(mode, delay_seconds, os.getpid()), encoding="ascii")
     except OSError as exc:
         raise UpdateError(f"写更新脚本失败：{exc}") from exc
 
@@ -649,7 +801,9 @@ def handoff_install(setup: Path, *, mode: str = "none", delay_seconds: int = 4) 
                  | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     try:
         # 路径走参数而不是写进脚本：客户机的用户名可能是中文（见 _helper_script）
-        subprocess.Popen(["cmd.exe", "/c", str(helper), str(root), str(staged)],
+        # 第三个参数是更新器 PID：安装器启动前要等它退出。
+        subprocess.Popen(["cmd.exe", "/c", str(helper), str(root), str(staged),
+                          str(os.getpid())],
                          creationflags=flags,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, close_fds=True)
@@ -737,6 +891,29 @@ def load_check_cache(root: Optional[Path] = None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def failed_update_path(root: Optional[Path] = None) -> Path:
+    root = Path(root or paths.PROJECT_ROOT)
+    return root / "var" / "state" / "update_failed.txt"
+
+
+def take_update_failure(root: Optional[Path] = None) -> str:
+    """取出「上次安装失败」标记并删除；没有标记返回空串。
+
+    交接脚本在安装器返回非 0 时写这个文件。界面启动时读一次，明确告诉用户
+    「上次更新没有完成」——否则只会看到一个看起来正常的旧版本，版本号却对不上。
+    """
+    path = failed_update_path(root)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return text
+
+
 def save_check_cache(data: dict, root: Optional[Path] = None) -> None:
     """原子写：先写 .tmp 再 replace，界面读到半个文件也不会炸。"""
     path = check_cache_path(root)
@@ -787,9 +964,13 @@ def available_version(data: dict, current: str) -> Optional[Version]:
 def update_config(cfg: dict) -> dict:
     """把 config.yaml 的 update 段补齐默认值。"""
     raw = cfg.get("update") if isinstance(cfg.get("update"), dict) else {}
+    channel = str(raw.get("channel") or "stable").strip().lower()
+    if channel not in ("stable", "beta"):
+        channel = "stable"
     return {
         "enabled": bool(raw.get("enabled", True)),
         "repo": str(raw.get("repo") or DEFAULT_REPO),
+        "channel": channel,
         "check_interval_hours": float(raw.get("check_interval_hours", 24)),
         "allow_minor": bool(raw.get("allow_minor", False)),
         "allow_downgrade": bool(raw.get("allow_downgrade", False)),

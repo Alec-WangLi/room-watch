@@ -39,6 +39,14 @@ class RotatingHandlerTest(unittest.TestCase):
             self.assertTrue(p.exists())
             self.assertTrue((Path(tmp) / "x.log.1").exists())
 
+    def test_safe_handler_degrades_instead_of_aborting(self):
+        """日志路径不可写时返回 None，让监控只剩控制台输出也能跑。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "blocker"
+            blocker.write_text("not a directory", encoding="utf-8")
+            handler = logutil.safe_rotating_file_handler(blocker / "x.log")
+        self.assertIsNone(handler)
+
 
 class EventFormatTest(unittest.TestCase):
     def test_event_has_stable_key_value_format(self):
@@ -87,6 +95,23 @@ class DiagnosticsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             d = diagnostics.Diagnostics(Path(tmp) / "fault.log", Path(tmp) / "last_exit.json")
             d.uninstall()
+
+    def test_install_survives_unwritable_fault_log(self):
+        """磁盘满/权限不足时，崩溃转储开不了也不能拖死监控启动。"""
+        old_sys, old_thread = sys.excepthook, threading.excepthook
+        with tempfile.TemporaryDirectory() as tmp:
+            fault = Path(tmp) / "fault.log"
+            fault.mkdir()          # 目录占住文件名，open 必然失败
+            d = diagnostics.Diagnostics(fault, Path(tmp) / "last_exit.json")
+            d.install()
+            try:
+                self.assertIsNone(d.fault_file)
+                self.assertIsNot(sys.excepthook, old_sys)
+                self.assertIsNot(threading.excepthook, old_thread)
+            finally:
+                d.uninstall()
+        self.assertIs(sys.excepthook, old_sys)
+        self.assertIs(threading.excepthook, old_thread)
 
 
 if __name__ == "__main__":

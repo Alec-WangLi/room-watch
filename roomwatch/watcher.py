@@ -19,7 +19,8 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import cv2
 import yaml
@@ -31,18 +32,25 @@ from .rules import (
     ACTION_FIRE,
     ACTION_START,
     RECORD_STOP_MAX,
+    STORAGE_OVER,
+    STORAGE_WARNING,
     Detection,
     RecordPolicy,
     TriggerState,
+    allow_notify,
+    allow_record,
     gap_seconds,
     humanize_duration,
     is_stale,
     iter_media_files,
+    normalize_owner_policy,
     prune_by_size,
     prune_old,
     should_heartbeat,
     should_speak,
     snapshot_path,
+    storage_forecast,
+    storage_summary,
     usage_bytes,
 )
 from . import audio_device
@@ -61,13 +69,31 @@ from .audio_recorder import AudioRecorder, pre_roll_delay_ms
 from .detector import FaceFinder
 from .gate import MotionGate
 from .onnx_detector import build_detector
-from .identity import LABEL_OWNER, LABEL_UNKNOWN, Identity, OwnerTracker
-from .notifier import Notifier
+from .delivery import ChannelDispatcher, DeliveryWorker, build_items, enabled_channels
+from .identity import (
+    LABEL_OTHER,
+    LABEL_OWNER,
+    LABEL_UNKNOWN,
+    Identity,
+    OwnerTracker,
+    save_owner_photo,
+)
+from .labels import identity_text
+from .outbox import OutboxStore
 from .recorder import Recorder, video_path_for
 from .speaker import Speaker
-from .videopush import VideoPusher
 
 log = logging.getLogger("room-watch")
+
+# 事件触发后先压住通知多久，给「侧脸 → 正脸」留出本人识别时间。
+# 窗口内持续识别；确认本人则撤销整条事件，确认陌生人则立刻放行。
+OWNER_GRACE_SECONDS = 15.0
+# 连续几次「明确不像本人」才提前放行，避免单帧抖动误推。
+STRANGER_CONFIRM_CHECKS = 2
+# 相似度比本人阈值低这么多，才算「明确不是本人」；介于中间继续等。
+STRANGER_MARGIN = 0.20
+# 等待窗口内重新做身份识别的间隔。
+IDENTITY_RECHECK_SECONDS = 1.0
 
 # 采集源解析（USB / RTSP / 文件）已搬到 camera.py。
 # 主循环只面对 cap 对象，不再关心背后是哪个后端。
@@ -97,10 +123,10 @@ def idle_seconds_windows() -> float:
 class EventStore:
     """极简 SQLite 事件日志，方便事后按时间查。"""
 
-    # 录像功能上线时给表加了一列。老库里没有这列，
+    # 录像功能上线时给表加了一列；0.1.13 又加了身份列。老库里没有这些列，
     # 而 CREATE TABLE IF NOT EXISTS 对「表已存在」是不做任何事的——
     # 所以新列必须由这里显式补齐，否则写事件直接报错。
-    SCHEMA_COLUMNS = {"video": "TEXT"}
+    SCHEMA_COLUMNS = {"video": "TEXT", "identity": "TEXT"}
 
     def __init__(self, db_path: str):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
@@ -138,19 +164,46 @@ class EventStore:
         conf: float,
         notified: bool,
         video: str | None = None,
+        identity: str | None = None,
     ) -> None:
         self.conn.execute(
-            "INSERT INTO events (ts, snapshot, confidence, notified, video) "
-            "VALUES (?,?,?,?,?)",
-            (ts.isoformat(), snapshot, conf, int(notified), video),
+            "INSERT INTO events (ts, snapshot, confidence, notified, video, identity) "
+            "VALUES (?,?,?,?,?,?)",
+            (ts.isoformat(), snapshot, conf, int(notified), video, identity),
         )
         self.conn.commit()
+
+    def delete_by_snapshot(self, snapshot: str) -> int:
+        """删掉某次抓拍对应的事件行；返回删除条数。晚到本人识别撤销事件时用。"""
+        cur = self.conn.execute("DELETE FROM events WHERE snapshot=?", (str(snapshot),))
+        self.conn.commit()
+        return int(cur.rowcount)
 
 
 class Watcher:
     def __init__(self, cfg: dict, dry_run: bool = False,
-                 diagnostics: Diagnostics | None = None):
+                 diagnostics: Diagnostics | None = None,
+                 config_path: str | None = None):
+        """配置类型写错时按「配置错误」退出，而不是「未处理异常」。
+
+        后者会写 EXIT_UNHANDLED（5），guardian 会当成崩溃并触发恢复/告警；
+        而一个 `imgsz: abc` 的笔误应该是可读的配置错误（退出码 2），
+        修配置后重启即可，不该进入崩溃统计。
+        """
+        try:
+            self._init_impl(cfg, dry_run, diagnostics, config_path)
+        except SystemExit:
+            raise
+        except (ValueError, TypeError) as exc:
+            log.error("配置项类型不合法，无法启动：%s（检查 config.yaml 与 config.local.yaml）",
+                      exc)
+            raise SystemExit(health.EXIT_CONFIG) from exc
+
+    def _init_impl(self, cfg: dict, dry_run: bool = False,
+                   diagnostics: Diagnostics | None = None,
+                   config_path: str | None = None):
         self.cfg = cfg
+        self.config_path = str(config_path or resolve("config.yaml"))
         self.dry_run = dry_run
         self.diagnostics = diagnostics
         # 停止请求文件放在这个根下的 var/state/，与界面/`rw stop` 共用同一处
@@ -217,7 +270,9 @@ class Watcher:
         self.draw_boxes = bool(snap.get("draw_boxes", True))
 
         behavior = cfg.get("behavior") or {}
-        self.skip_when_active = bool(behavior.get("skip_when_user_active", True))
+        # 旧键只表达「要不要推送」；新键 record.owner_at_computer 优先。
+        # 保留原始值（不填默认），让 normalize_owner_policy 能区分「没配」和「配了 false」。
+        self.legacy_skip_when_active = behavior.get("skip_when_user_active")
         self.idle_threshold = float(behavior.get("idle_threshold_seconds", 120))
 
         voice = cfg.get("voice") or {}
@@ -254,6 +309,8 @@ class Watcher:
         self.last_identity_label = "other"
         self.last_identity_score = 0.0
         self.identity_hits = 0
+        # 「明确不是本人」的阈值：比本人阈值低一截，避免侧脸被当成陌生人。
+        self.stranger_threshold = max(0.0, self.identity.threshold - STRANGER_MARGIN)
 
         heartbeat = cfg.get("heartbeat") or {}
         self.heartbeat_minutes = float(heartbeat.get("interval_minutes", 30))
@@ -261,20 +318,63 @@ class Watcher:
 
         storage = cfg.get("storage") or {}
         self.status_path = storage.get("status") or resolve("var/state/status.json")
-        self.store = EventStore(storage.get("database") or resolve("var/db/events.db"))
-        self.notifier = Notifier(cfg.get("notify") or {})
-        # 录像推送：转码+上传要几十秒，走后台队列，不在主循环里等
-        self.video_pusher = VideoPusher(cfg.get("notify") or {}, resolve("var/cache/push"))
+        # 磁盘满/权限抖动时状态文件可能写不出去；主循环不能因此退出。
+        # 只在「好→坏」和「坏→好」时各记一条，避免每秒刷屏。
+        self._status_write_failed = False
+        self._health_write_failed = False
+        event_db = Path(storage.get("database") or resolve("var/db/events.db"))
+        self.store = EventStore(str(event_db))
+        self.notify_cfg = cfg.get("notify") or {}
+        outbox_cfg = cfg.get("outbox") or {}
+        outbox_db = Path(outbox_cfg.get("database") or (event_db.parent / "outbox.db"))
+        if not outbox_db.is_absolute():
+            outbox_db = Path(resolve(str(outbox_db)))
+        self.outbox_path = str(outbox_db)
+        media_dir = Path(outbox_cfg.get("media_dir") or (event_db.parent.parent / "outbox"))
+        if not media_dir.is_absolute():
+            media_dir = Path(resolve(str(media_dir)))
+        self.outbox_media = str(media_dir)
+        self.outbox = OutboxStore(self.outbox_path)
+        # outbox 连接属于创建它的线程。录像合并回调在 audio-merge 线程里
+        # 调 push_video，若直接复用主线程的连接，sqlite3 会拒绝（跨线程使用）。
+        # 记下主线程，异步入队时临时开一条本线程的连接。
+        self._outbox_thread = threading.get_ident()
+        self._outbox_lock = threading.Lock()
+        self.dispatcher = ChannelDispatcher(self.notify_cfg, self.outbox_media)
+        max_age_days = float(outbox_cfg.get("max_age_days", 7))
+        max_total_bytes = int(float(outbox_cfg.get("max_total_mb", 2048)) * 1024 * 1024)
+        common = dict(
+            media_dir=self.outbox_media,
+            max_age_days=max_age_days,
+            max_total_bytes=max_total_bytes,
+        )
+        self.delivery_fast = DeliveryWorker(
+            self.outbox_path, self.dispatcher, kinds=("text", "image"), **common)
+        # 视频转码/上传可能几十秒，单独一条慢道，不能挡住文字告警。
+        self.delivery_video = DeliveryWorker(
+            self.outbox_path, self.dispatcher, kinds=("video",),
+            poll_seconds=5.0, **common)
 
         # 容量上限：keep_days 管不住「一天之内写满盘」，所以再加一道体积闸门
         self.max_total_bytes = int(float(storage.get("max_total_gb", 20)) * (1024 ** 3))
         self.min_free_bytes = int(float(storage.get("min_free_gb", 3)) * (1024 ** 3))
         self.storage_check_seconds = float(storage.get("check_minutes", 10)) * 60.0
         self.storage_protect_seconds = float(storage.get("protect_seconds", 300))
+        self.storage_warn_days = float(storage.get("warn_days", 7))
         self.last_storage_check = None
+        # 最近一次容量预测。None 表示还没算过（或容量完全不受限）。
+        self.storage_forecast: dict | None = None
+        # 预警每个自然日最多写一条日志，避免十分钟刷一次。
+        self.storage_warned_on = None
 
         rec_cfg = cfg.get("record") or {}
         self.recorder = Recorder(rec_cfg, self.fps)
+        # 本人在电脑前时：keep 照录照推 / mute 照录不推 / skip 不录不推。
+        # 旧配置 behavior.skip_when_user_active 仍可推导出同样的语义。
+        self.owner_policy = normalize_owner_policy(
+            rec_cfg.get("owner_at_computer"),
+            legacy_skip=self.legacy_skip_when_active,
+        )
         # 音轨单独一路：VideoWriter 写不了声音，录成 WAV 收尾再并进 mp4
         self.audio = AudioRecorder(rec_cfg.get("audio") or {})
         # 「录到什么时候为止」是纯逻辑，放在 logic 里便于单测
@@ -287,6 +387,17 @@ class Watcher:
         self.current_video: str | None = None
         # 录像收尾时才知道文件名，推送文案要用事件发生的时刻，先存着
         self.last_event_at: datetime | None = None
+
+        # 「事件已触发但通知还在等待窗口」的状态。None/True 表示没有待决事件。
+        self.event_snapshot: str | None = None
+        self.event_event_id: str | None = None
+        self.event_hold_until: datetime | None = None
+        self.event_resolved = True
+        self.stranger_streak = 0
+        self.last_identity_check_at: datetime | None = None
+        # 已被晚到的本人识别撤销的事件 id；合并音轨等异步回调据此放弃入队。
+        self.cancelled_event_ids: set[str] = set()
+        self.last_reload_check_at: datetime | None = None
 
         self.cap = None
         self.detector = None
@@ -369,18 +480,50 @@ class Watcher:
             return []
 
     def user_is_active(self) -> bool:
-        """人在电脑前（刚有键鼠输入）就不推送，避免给自己发自己的照片。"""
-        if not self.skip_when_active:
-            return False
+        """键鼠是否活跃（人在电脑前）。策略怎么用这个信号由调用方决定。"""
         return idle_seconds_windows() < self.idle_threshold
 
+    def record_allowed(self) -> bool:
+        """本人在电脑前时，按策略决定要不要开录。进行中的录像不走这里。"""
+        return allow_record(self.owner_policy, self.user_is_active())
+
+    def enqueue_notification(self, items: list[dict],
+                             delay_seconds: float = 0.0) -> int:
+        """把一批通知写进 outbox。数据库故障只降级为「本次没入队」，不拖垮监控。
+
+        可能被主循环调用，也可能被 audio-merge 线程的完成回调调用
+        （视频合完音轨后再入队）。SQLite 连接不能跨线程共享，所以后者
+        临时开一条属于自己的连接；锁把两条路径的写入串起来。
+        """
+        if not items:
+            return 0
+        lock = getattr(self, "_outbox_lock", None)
+        owner = getattr(self, "_outbox_thread", None)
+        try:
+            if owner is None or threading.get_ident() == owner:
+                if lock is None:
+                    return self.outbox.enqueue_many(items, delay_seconds=delay_seconds)
+                with lock:
+                    return self.outbox.enqueue_many(items, delay_seconds=delay_seconds)
+            store = OutboxStore(self.outbox_path)
+            try:
+                if lock is None:
+                    return store.enqueue_many(items, delay_seconds=delay_seconds)
+                with lock:
+                    return store.enqueue_many(items, delay_seconds=delay_seconds)
+            finally:
+                store.close()
+        except Exception as exc:  # noqa: BLE001 - 通知层故障不能影响采集
+            log.warning("写入通知队列失败: %s", exc)
+            return 0
+
     def notify_allowed(self) -> bool:
-        """图片和视频共用同一道闸门：dry-run 不发，本人坐在电脑前不发。"""
+        """图片和视频共用同一道闸门：dry-run 不发，本人坐在电脑前按策略不发。"""
         if self.dry_run:
             log.info("dry-run 模式，跳过推送")
             return False
-        if self.user_is_active():
-            log.info("检测到你本人正在电脑前，跳过推送")
+        if not allow_notify(self.owner_policy, self.user_is_active()):
+            log.info("检测到你本人正在电脑前，按策略跳过推送")
             return False
         return True
 
@@ -450,7 +593,12 @@ class Watcher:
         return img
 
     def save_snapshot(self, frame, dets: list, when: datetime) -> str:
-        path = snapshot_path(self.snap_dir, when)
+        # 录像开始于 ACTION_START，抓拍发生在 ACTION_FIRE，两者天然差几秒。
+        # 用录像的文件名做抓拍名，照片和录像才配成一对；没有录像时回退到时间戳。
+        if self.current_video:
+            path = os.path.splitext(self.current_video)[0] + ".jpg"
+        else:
+            path = snapshot_path(self.snap_dir, when)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         img = self.annotate(frame, dets, when) if self.draw_boxes else frame
         ok = cv2.imwrite(path, img, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
@@ -458,12 +606,22 @@ class Watcher:
             raise IOError(f"写图失败: {path}")
         return path
 
+    def _outbox_stats(self) -> dict:
+        try:
+            return self.outbox.stats()
+        except Exception:  # noqa: BLE001 - 状态展示不能影响主循环
+            return {}
+
     def write_status(self, camera_ok: bool = True) -> None:
         """把「我还在跑」写成一个文件，供 gallery 的 /status 读取。
 
         这是回答「监控还在线吗」最直接的依据：看 last_frame_at 距现在多久。
         """
         now = datetime.now()
+        outbox_stats = self._outbox_stats()
+        storage = getattr(self, "storage_forecast", None) or {}
+        used_bytes = storage.get("used_bytes")
+        max_bytes = storage.get("max_bytes")
         payload = {
             "pid": os.getpid(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
@@ -485,18 +643,38 @@ class Watcher:
             "events_today": self.events_today,
             "recording": self.recorder.recording,
             "dry_run": self.dry_run,
+            "pending_outbox": outbox_stats.get("pending", 0),
+            "last_push_success_at": outbox_stats.get("last_success_at"),
+            "notify_channels": len(enabled_channels(getattr(self, "notify_cfg", {}))),
+            "storage_status": storage.get("status"),
+            "storage_days_left": storage.get("projected_days"),
+            "storage_used_gb": (
+                round(used_bytes / (1024 ** 3), 2) if used_bytes is not None else None
+            ),
+            "storage_max_gb": (
+                round(max_bytes / (1024 ** 3), 2) if max_bytes is not None else None
+            ),
         }
-        tmp = self.status_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, self.status_path)
+        try:
+            health.write_json_atomic(self.status_path, payload)
+            if getattr(self, "_status_write_failed", False):
+                log.info("状态文件已恢复写入")
+                self._status_write_failed = False
+        except OSError as exc:
+            if not getattr(self, "_status_write_failed", False):
+                log.warning("写状态文件失败（主循环继续）: %s", exc)
+                self._status_write_failed = True
 
     def write_health(self) -> None:
         """每秒写一次的健康快照，供 guardian / 界面 / 诊断包读取。"""
         recorder = getattr(self, "recorder", None)
+        outbox_stats = self._outbox_stats()
         extra = {
             "recording": bool(getattr(recorder, "recording", False)),
             "camera_ok": bool(getattr(self, "camera_ok", True)),
+            "pending_outbox": outbox_stats.get("pending", 0),
+            "last_push_success_at": outbox_stats.get("last_success_at"),
+            "notify_channels": len(enabled_channels(getattr(self, "notify_cfg", {}))),
         }
         try:
             extra["desired_state"] = control.read_desired_state(self.root)
@@ -513,7 +691,15 @@ class Watcher:
             selfcheck=self.selfcheck,
             extra=extra,
         )
-        health.write_health(self.health_path, payload)
+        try:
+            health.write_health(self.health_path, payload)
+            if getattr(self, "_health_write_failed", False):
+                log.info("健康快照已恢复写入")
+                self._health_write_failed = False
+        except OSError as exc:
+            if not getattr(self, "_health_write_failed", False):
+                log.warning("写健康快照失败（主循环继续）: %s", exc)
+                self._health_write_failed = True
 
     def _dump_stacks(self) -> None:
         fault = getattr(self.diagnostics, "fault_file", None)
@@ -551,15 +737,22 @@ class Watcher:
         if self.diagnostics is not None:
             self.diagnostics.note_exit(code, reason)
             return
-        health.write_exit_record(
-            self.exit_record_path, pid=os.getpid(), code=code, reason=reason
-        )
+        try:
+            health.write_exit_record(
+                self.exit_record_path, pid=os.getpid(), code=code, reason=reason
+            )
+        except OSError:
+            # 退出路径上写文件失败不能反过来把进程搞挂
+            pass
 
-    def maybe_speak(self, frame, dets: list, now: datetime) -> None:
+    def maybe_speak(
+        self, frame, dets: list, now: datetime, *, force_check: bool = False
+    ) -> None:
         """有人进入时，对现场的人播报语音提示。
 
         只在「确认有人」之后调用。require_face 为真时会先找脸，
         找到才开口——对着背影说话没有意义，也容易误伤路过的人。
+        force_check=True 用于事件期间的定时重试：不再受每隔 N 帧的限制。
         """
         if not self.speaker.enabled or self.spoke_this_event:
             return
@@ -567,7 +760,7 @@ class Watcher:
         face_found = False
         if self.require_face:
             # 人脸检测不必每帧都跑，隔几帧一次，省 CPU
-            if self.frames % self.face_every_n != 0:
+            if not force_check and self.frames % self.face_every_n != 0:
                 return
             faces = self.face_finder.find(frame, dets)
             face_found = len(faces) > 0
@@ -585,6 +778,144 @@ class Watcher:
         self.last_spoke_at = now
         self.spoke_this_event = True
         log.info("语音提示已触发（检测到人脸: %s）", "是" if face_found else "否")
+
+    def maybe_reload(self, now: datetime) -> None:
+        """界面保存「立即生效」的设置后写 reload.watcher，这里应用。
+
+        目前热更新的范围是语音（开关、文案、冷却、音量策略）。其余设置
+        要么每次用时现读（更新/推送），要么确实需要重启对应进程。
+        """
+        if (self.last_reload_check_at is not None
+                and (now - self.last_reload_check_at).total_seconds() < 1.0):
+            return
+        self.last_reload_check_at = now
+        marker = Path(self.root) / "var" / "state" / "reload.watcher"
+        if not marker.exists():
+            return
+        try:
+            marker.unlink()
+        except OSError:
+            return
+        try:
+            cfg = load_config(self.config_path)
+            voice = cfg.get("voice") or {}
+            self.voice_cooldown = float(voice.get("cooldown_seconds", 60))
+            self.require_face = bool(voice.get("require_face", True))
+            old = getattr(self, "speaker", None)
+            if old is not None:
+                old.shutdown()
+            self.speaker = Speaker(voice)
+            log.info("设置已热更新：语音（enabled=%s，冷却 %.0f 秒）",
+                     self.speaker.enabled, self.voice_cooldown)
+        except Exception as exc:  # noqa: BLE001 - 热更新失败继续用旧配置
+            log.warning("热更新设置失败（继续用旧配置）: %s", exc)
+
+    def check_pending_event(self, frame, dets: list, now: datetime) -> None:
+        """事件触发后的等待窗口：持续识别，决定撤销还是提前发送。
+
+        - 确认本人：删除抓拍/录像/音频、撤销未发通知、删除事件行。
+        - 明确陌生人（连续两次相似度远低于阈值）：立刻放行通知，不用等满窗口。
+        - 始终认不出：窗口到期按陌生人发送。
+        """
+        if self.event_resolved or self.event_hold_until is None:
+            return
+
+        if now >= self.event_hold_until:
+            if self.event_event_id:
+                try:
+                    self.outbox.release_event(self.event_event_id, now=now)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("释放等待窗口通知失败: %s", exc)
+            # 窗口结束仍认不出：按陌生人处理，人在画面里才出声。
+            if dets:
+                self.maybe_speak(frame, dets, now, force_check=True)
+            self.event_resolved = True
+            log.info("本人等待窗口结束，按当前身份「%s」发送", self.last_identity_label)
+            return
+
+        if (self.last_identity_check_at is not None
+                and (now - self.last_identity_check_at).total_seconds()
+                < IDENTITY_RECHECK_SECONDS):
+            return
+        self.last_identity_check_at = now
+        if not dets:
+            return
+
+        label = self.identify(frame, dets)
+        self.last_identity_label = label
+        self.owner_tracker.observe(label)
+        if self.is_owner_event():
+            self._cancel_owner_event(now, "等待窗口内识别为本人")
+            return
+
+        if label == LABEL_OTHER and self.last_identity_score <= self.stranger_threshold:
+            self.stranger_streak += 1
+        else:
+            self.stranger_streak = 0
+        if self.stranger_streak < STRANGER_CONFIRM_CHECKS:
+            return
+
+        released = 0
+        if self.event_event_id:
+            try:
+                released = self.outbox.release_event(self.event_event_id, now=now)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("提前发送通知失败: %s", exc)
+        self.event_resolved = True
+        log.info("确认陌生人（相似度 %.2f），提前发送告警（释放 %d 条）",
+                 self.last_identity_score, released)
+        # 明确是陌生人：这时才出声，避免侧脸进门被误念。
+        self.maybe_speak(frame, dets, now, force_check=True)
+
+    def _cancel_owner_event(self, now: datetime, reason: str) -> None:
+        """晚到的本人识别：撤销整条事件，做到「什么动作都不做」。"""
+        event_id = self.event_event_id
+        snapshot = self.event_snapshot
+        if event_id:
+            self.cancelled_event_ids.add(event_id)
+
+        if self.recorder.recording:
+            self.stop_recording(reason, now, discard=True)
+        else:
+            # 录像已经收尾：按同名约定删除 mp4 / wav / jpg
+            if snapshot:
+                stem = os.path.splitext(snapshot)[0]
+                for path in (stem + ".mp4", stem + ".wav", snapshot):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+        if snapshot:
+            try:
+                self.store.delete_by_snapshot(snapshot)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("删除事件记录失败: %s", exc)
+        if snapshot and os.path.exists(snapshot):
+            try:
+                os.remove(snapshot)
+            except OSError:
+                pass
+        self.events_today = max(0, self.events_today - 1)
+
+        counts = {}
+        if event_id:
+            try:
+                counts = self.outbox.cancel_event(event_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("撤销通知失败: %s", exc)
+        if counts.get("delivered") or counts.get("sending"):
+            log.warning(
+                "识别为本人时已有 %d 条通知离开发件箱，无法撤回（已发 %d，发送中 %d）",
+                int(counts.get("delivered", 0)) + int(counts.get("sending", 0)),
+                int(counts.get("delivered", 0)), int(counts.get("sending", 0)))
+        log.info("识别为本人（晚到），事件已撤销：删除媒体并取消通知 %s", counts)
+
+        self.event_snapshot = None
+        self.event_event_id = None
+        self.event_hold_until = None
+        self.event_resolved = True
+        self.stranger_streak = 0
 
     # ---------- 录像 ----------
 
@@ -612,6 +943,9 @@ class Watcher:
         那时最想看的「推门、进门、往哪走」早过去了。
         """
         if not self.recorder.enabled or self.recorder.recording:
+            return
+        if not self.record_allowed():
+            log.info("本人在电脑前，按策略不开始录像")
             return
         target = video_path_for(snapshot_path(self.snap_dir, when))
         started = self.recorder.start(target, when)
@@ -656,23 +990,47 @@ class Watcher:
 
         if video and wav:
             # 视频开头是预录画面（当时还没开始录音），音轨要补等长静音才对得上
-            # 合并完成后才推视频——合并前的 mp4 还没有音轨
+            # 合并完成后才推视频——合并前的 mp4 还没有音轨。
+            # 把事件 id 一起带过去：合并是异步的，期间可能已经触发下一个事件。
+            event_id = self.last_event_at.isoformat() if self.last_event_at else ""
             self.audio.merge_async(
-                video, wav, pre_roll_delay_ms(pre_frames, self.fps), on_done=self.push_video
+                video, wav, pre_roll_delay_ms(pre_frames, self.fps),
+                on_done=lambda path, eid=event_id: self.push_video(path, event_id=eid),
             )
         elif video:
-            self.push_video(video)
+            event_id = self.last_event_at.isoformat() if self.last_event_at else ""
+            self.push_video(video, event_id=event_id)
 
-    def push_video(self, video_path: str) -> None:
-        """把一段收尾好的录像交给后台队列推送。"""
+    def push_video(self, video_path: str, event_id: str | None = None) -> None:
+        """把一段收尾好的录像写进 outbox 的视频慢道。"""
         if not video_path or not os.path.exists(video_path):
+            return
+        when = self.last_event_at
+        eid = str(event_id or (when.isoformat() if when else datetime.now().isoformat()))
+        # 晚到的本人识别已经撤销这条事件：不要再入队，把文件删掉。
+        if eid in self.cancelled_event_ids:
+            self.cancelled_event_ids.discard(eid)
+            try:
+                os.remove(video_path)
+            except OSError:
+                pass
+            log.info("事件已撤销，跳过录像推送并删除: %s", video_path)
             return
         if not self.notify_allowed():
             return
-        when = self.last_event_at
-        stamp = when.strftime("%H:%M:%S") if when else os.path.basename(video_path)[:6]
+        stamp = (when.strftime("%H:%M:%S") if when
+                 else os.path.splitext(os.path.basename(video_path))[0])
         mb = os.path.getsize(video_path) / 1048576
-        self.video_pusher.submit(video_path, f"{stamp} 房间录像（{mb:.1f} MB，已压缩）")
+        items = build_items(
+            self.notify_cfg,
+            event_id=eid,
+            text=f"{stamp} 房间录像（{mb:.1f} MB，已压缩）",
+            video_path=video_path,
+            severity="event",
+            owner=self.last_identity_label,
+        )
+        # text/image 已经由 fire_event 入队；这里只补视频，避免重复文字。
+        self.enqueue_notification([item for item in items if item["kind"] == "video"])
 
     def pump_recording(self, frame, dets: list, now: datetime) -> None:
         """每帧一次：喂帧 + 判断该不该收尾。"""
@@ -726,6 +1084,7 @@ class Watcher:
                 used,
                 self.max_total_bytes / (1024 ** 3),
             )
+        self._update_storage_forecast(now)
 
         if self.min_free_bytes <= 0:
             return
@@ -749,17 +1108,52 @@ class Watcher:
         )
         if more:
             log.info("额外清理 %d 个文件", len(more))
+            self._update_storage_forecast(now)
+
+    def _update_storage_forecast(self, now: datetime) -> None:
+        """按最近几天的实际写入量预测还能撑多久；预警每天最多说一次。"""
+        try:
+            files = iter_media_files(self.snap_dir)
+        except OSError:
+            return
+        forecast = storage_forecast(
+            files,
+            now=now,
+            max_bytes=self.max_total_bytes,
+            keep_days=self.keep_days,
+            warn_days=self.storage_warn_days,
+        )
+        self.storage_forecast = forecast
+        if forecast["status"] not in (STORAGE_WARNING, STORAGE_OVER):
+            return
+        if self.storage_warned_on == now.date():
+            return
+        self.storage_warned_on = now.date()
+        if forecast["status"] == STORAGE_OVER:
+            log.warning(
+                "存储预警：已用 %.2f GB，超过上限 %.2f GB，正在按最旧优先清理",
+                forecast["used_bytes"] / (1024 ** 3),
+                forecast["max_bytes"] / (1024 ** 3),
+            )
+        else:
+            log.warning(
+                "存储预警：已用 %.2f GB，按最近增速约 %.1f 天后达到上限 %.2f GB"
+                "（可调 storage.max_total_gb / snapshot.keep_days）",
+                forecast["used_bytes"] / (1024 ** 3),
+                forecast["days_to_cap"] or 0.0,
+                forecast["max_bytes"] / (1024 ** 3),
+            )
 
     def maybe_heartbeat(self, now: datetime) -> None:
         """定时报平安。收不到心跳，就说明它挂了。"""
         if not should_heartbeat(now, self.last_heartbeat_at, self.heartbeat_minutes):
             return
-        self.last_heartbeat_at = now
 
         if self.dry_run:
             log.info("[心跳-仅日志] 监控在线 %s，今日抓拍 %d 次",
                      humanize_duration((now - self.started_at).total_seconds()),
                      self.events_today)
+            self.last_heartbeat_at = now
             return
 
         text = (
@@ -767,30 +1161,57 @@ class Watcher:
             f"今日抓拍 {self.events_today} 次 · 最后画面 "
             f"{self.last_frame_at.strftime('%H:%M:%S') if self.last_frame_at else '未知'}"
         )
-        # 注意 send() 的第二个参数是图片字节，不是副标题。
-        # 曾误写成 send("监控在线", text)，正文被当图片做 base64，抛
-        # "a bytes-like object is required" 而整条推送失败（wxpusher 时更隐蔽：
-        # 只取第一个参数，于是永远只发出去「监控在线」四个字）。
-        self.notifier.send(text)
+        # 走 outbox：断网时这条报平安也应该补发，而不是直接消失。
+        items = build_items(
+            self.notify_cfg,
+            event_id=f"digest:{now.date().isoformat()}",
+            text=text,
+            severity="digest",
+        )
+        if not items or self.enqueue_notification(items):
+            # 没有渠道也算处理过，避免每个循环重复尝试；入队失败则保持到期，下轮重试。
+            self.last_heartbeat_at = now
 
     def fire_event(self, frame, dets: list, when: datetime) -> None:
         conf = max((d.conf for d in dets), default=0.0)
         path = self.save_snapshot(frame, dets, when)
         self.events_today += 1
-        log.info("事件已抓拍: %s (置信度 %.2f)，今日第 %d 次", path, conf, self.events_today)
+        log.info("事件已抓拍: %s (人体置信度 %.2f)，今日第 %d 次",
+                 path, conf, self.events_today)
         if self.current_video:
             log.info("配套录像: %s", self.current_video)
 
+        event_id = when.isoformat()
         self.last_event_at = when
+        # 通知先压住：窗口内继续识别，确认本人就整条撤销；确认陌生人则提前放行。
+        self.event_snapshot = path
+        self.event_event_id = event_id
+        self.event_hold_until = when + timedelta(seconds=OWNER_GRACE_SECONDS)
+        self.event_resolved = False
+        self.last_identity_check_at = when
+        self.stranger_streak = (
+            1 if (self.last_identity_label == LABEL_OTHER
+                  and self.last_identity_score <= self.stranger_threshold)
+            else 0
+        )
+
         notified = False
         if self.notify_allowed():
-            text = f"{when.strftime('%H:%M:%S')} 检测到有人进入房间\n存档: {path}"
+            text = (f"{when.strftime('%H:%M:%S')} 检测到有人进入房间"
+                    f"（{identity_text(self.last_identity_label)}）\n存档: {path}")
             if self.current_video:
                 text += f"\n录像: {self.current_video}"
-            with open(path, "rb") as f:
-                notified = self.notifier.send(text, image_bytes=f.read())
+            notified = self.enqueue_notification(build_items(
+                self.notify_cfg,
+                event_id=event_id,
+                text=text,
+                image_path=path,
+                severity="event",
+                owner=self.last_identity_label,
+            ), delay_seconds=OWNER_GRACE_SECONDS) > 0
 
-        self.store.add(when, path, conf, notified, video=self.current_video)
+        self.store.add(when, path, conf, notified, video=self.current_video,
+                       identity=self.last_identity_label)
 
     def run(self) -> None:
         results = selfcheck_mod.run(self.cfg, self.root)
@@ -817,6 +1238,8 @@ class Watcher:
         threading.Thread(
             target=self._watchdog, daemon=True, name="health-watchdog"
         ).start()
+        self.delivery_fast.start()
+        self.delivery_video.start()
         self.write_health()
         interval = 1.0 / max(1, self.fps)
         last_status_write = 0.0
@@ -947,11 +1370,9 @@ class Watcher:
                     self.candidate_frame = frame.copy()
                     self.candidate_dets = dets
                     # 本人不播报——否则你坐着工作，每过一阵就被自己念一次。
-                    # 这里比抓拍更严：**单帧**判定本人就不出声，不等投票确认。
-                    # 理由：播报是说错一句就打扰你一整天，而抓拍/录像才是证据，
-                    # 那两者仍走 confirm_frames 的确认流程，不能被单帧结果放行。
-                    if not self.is_owner_event() and self.last_identity_label != LABEL_OWNER:
-                        self.maybe_speak(frame, dets, now)
+                    # 语音不在这里响：先等身份等待窗口给出结论。
+                    # 否则侧脸进门会先念一句，随后认出本人再撤销事件——
+                    # 用户听到声音却看不到任何事件（0.1.20 真机反馈）。
                 elif action == ACTION_FIRE and self.candidate_frame is not None:
                     # 收尾这一帧再认一次：此刻人已站定，脸通常比第一帧清楚。
                     # 少了这一步，若中间帧的「适不适合存档」分数一直没创出新高，
@@ -987,6 +1408,11 @@ class Watcher:
                     if not self.is_owner_event():
                         self.start_recording(dets, now)
 
+                self.maybe_reload(now)
+                try:
+                    self.check_pending_event(frame, dets, now)
+                except Exception as exc:  # noqa: BLE001 - 等待窗口异常不能拖垮主循环
+                    log.warning("等待窗口身份检查异常: %s", exc)
                 self.pump_recording(frame, dets, now)
                 self.enforce_storage(now)
                 self.maybe_heartbeat(now)
@@ -1012,6 +1438,8 @@ class Watcher:
             raise
         finally:
             self._watchdog_stop.set()
+            self.delivery_fast.stop()
+            self.delivery_video.stop()
             self._record_exit(self._exit_code(), self.exit_reason)
             logutil.event(log, "watcher_exit",
                           code=self._exit_code(), reason=self.exit_reason)
@@ -1032,6 +1460,10 @@ class Watcher:
             restored = self.volume_guard.restore()
             if restored:
                 log.info("系统音量：%s", restored)
+            try:
+                self.outbox.close()
+            except Exception:  # noqa: BLE001 - 退出路径上不抛
+                pass
 
     def probe(self) -> None:
         """打开摄像头拍一张 preview.jpg，用来确认画面角度对不对。
@@ -1099,6 +1531,9 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
 
     ff = FaceFinder(cfg.get("face") or {})
     feats = []
+    best_frame = None
+    best_row = None
+    best_area = 0.0
 
     if image_path:
         img = cv2.imread(image_path)
@@ -1113,6 +1548,9 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
             feat = idn.embedder.embed(img, hit.row)
             if feat is not None:
                 feats.append(feat)
+                area = float((hit.row[2] - hit.row[0]) * (hit.row[3] - hit.row[1]))
+                if area > best_area:
+                    best_area, best_frame, best_row = area, img, hit.row
         if not feats:
             print("这张图里没提取到可用的人脸特征（可能太小/太糊/侧脸）")
             return 3
@@ -1150,6 +1588,12 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
                     feat = idn.embedder.embed(frame, hits[0].row)
                     if feat is not None:
                         feats.append(feat)
+                        area = float(
+                            (hits[0].row[2] - hits[0].row[0])
+                            * (hits[0].row[3] - hits[0].row[1])
+                        )
+                        if area > best_area:
+                            best_area, best_frame, best_row = area, frame.copy(), hits[0].row
                         print(f"  已采集 {len(feats)}/{samples}")
                 time.sleep(0.5)
         finally:
@@ -1165,6 +1609,10 @@ def enroll_owner(cfg: dict, image_path: str | None = None, samples: int = 12) ->
 
     if not idn.save_owner(feats, extra={"created_at": datetime.now().isoformat(timespec="seconds")}):
         return 4
+    if best_frame is not None and best_row is not None:
+        photo = save_owner_photo(idn.owner_file, best_frame, best_row)
+        if photo:
+            print(f"已保存本人照片：{photo}")
     print(f"注册完成：{idn.owner_file}（{len(feats)} 个样本，阈值 {idn.threshold}）")
     print("接下来可以验证一下：rw whoami <某张你自己的截图>")
     return 0
@@ -1199,8 +1647,8 @@ def whoami(cfg: dict, image_path: str) -> int:
     return 0
 
 
-def print_storage(config_path: str) -> None:
-    """看存储占用、上限，以及最旧/最新文件。"""
+def print_storage(config_path: str, as_json: bool = False) -> None:
+    """看存储占用、上限、容量预测，以及最旧/最新文件。"""
     cfg = load_config(config_path)
     snap = cfg.get("snapshot") or {}
     directory = snap.get("dir") or resolve("data/captures")
@@ -1208,13 +1656,32 @@ def print_storage(config_path: str) -> None:
     max_gb = float(st.get("max_total_gb", 20))
     min_free_gb = float(st.get("min_free_gb", 3))
     keep_days = int(snap.get("keep_days", 30))
+    warn_days = float(st.get("warn_days", 7))
+    max_bytes = int(max_gb * (1024 ** 3))
+
+    try:
+        free = shutil.disk_usage(directory).free if os.path.isdir(directory) else None
+    except OSError:
+        free = None
+
+    summary = storage_summary(
+        directory,
+        max_bytes=max_bytes,
+        keep_days=keep_days,
+        warn_days=warn_days,
+        free_bytes=free,
+    )
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=False))
+        return
 
     if not os.path.isdir(directory):
         print(f"存档目录还不存在：{directory}")
         return
 
+    forecast = summary["forecast"]
     files = iter_media_files(directory)
-    total = sum(size for _m, _p, size in files)
+    total = summary["used_bytes"]
 
     print("=== 存储占用 ===")
     print(f"目录        : {os.path.abspath(directory)}")
@@ -1222,11 +1689,28 @@ def print_storage(config_path: str) -> None:
     print(f"当前占用    : {total / (1024 ** 3):.2f} GB")
     print(f"容量上限    : {max_gb:.0f} GB" + ("（0 = 不限）" if max_gb <= 0 else ""))
     print(f"按天保留    : {keep_days} 天" + ("（0 = 不限）" if keep_days <= 0 else ""))
-    try:
-        free = shutil.disk_usage(directory).free
+    if free is not None:
         print(f"磁盘剩余    : {free / (1024 ** 3):.2f} GB（低于 {min_free_gb:.0f} GB 会逼近清理）")
-    except OSError:
-        pass
+
+    daily_mb = forecast["daily_bytes"] / (1024 ** 2)
+    print(f"最近增速    : {daily_mb:.1f} MB/天（按最近完整自然日估算）")
+    if forecast["projected_days"] is None:
+        print("预计可用    : 不受容量或保留期限制")
+    else:
+        print(f"预计可用    : {forecast['projected_days']:.1f} 天"
+              "（取容量上限与保留期中较早到的那个）")
+
+    status = forecast["status"]
+    if status == "over":
+        print("状态        : ⚠ 已超过容量上限，下一轮检查会删掉最旧的文件")
+    elif status == "warning":
+        days = forecast["days_to_cap"]
+        print(f"状态        : ⚠ 按当前增速约 {days:.1f} 天后达到容量上限"
+              "（可调大 storage.max_total_gb 或调小 snapshot.keep_days）")
+    elif status == "unlimited":
+        print("状态        : 不限容量与天数（磁盘由你自行管理）")
+    else:
+        print("状态        : 正常")
 
     if files:
         def fmt(ts: float) -> str:
@@ -1236,11 +1720,6 @@ def print_storage(config_path: str) -> None:
         newest = max(files, key=lambda x: x[0])
         print(f"最旧文件    : {fmt(oldest[0])}  {oldest[1]}")
         print(f"最新文件    : {fmt(newest[0])}  {newest[1]}")
-
-        if max_gb > 0:
-            over = total - max_gb * (1024 ** 3)
-            if over > 0:
-                print(f"⚠ 已超出上限 {over / (1024 ** 3):.2f} GB，下一轮检查会删掉最旧的文件")
 
         by_ext: dict = {}
         for _m, path, size in files:
@@ -1258,7 +1737,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--dry-run", action="store_true", help="抓拍但不推送")
     parser.add_argument("--probe", action="store_true", help="只拍一张预览图然后退出")
     parser.add_argument("--json", action="store_true",
-                        help="配合 --probe：额外输出一行 JSON（界面用）")
+                        help="配合 --probe / --storage：输出一行 JSON（界面用）")
     parser.add_argument("--status", action="store_true", help="打印监控是否还在线")
     parser.add_argument("--say", action="store_true", help="试听语音提示（响度处理后的版本）然后退出")
     parser.add_argument("--say-raw", action="store_true", help="试听未处理的原始语音，用来做对比")
@@ -1279,7 +1758,9 @@ def main(argv: list[str] | None = None) -> None:
 
     handlers = [logging.StreamHandler()]
     if args.log:
-        handlers.append(logutil.rotating_file_handler(args.log))
+        handler = logutil.safe_rotating_file_handler(args.log)
+        if handler is not None:
+            handlers.append(handler)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1306,7 +1787,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.storage:
-        print_storage(args.config)
+        print_storage(args.config, as_json=args.json)
         return
 
     cfg = load_config(args.config)
@@ -1348,7 +1829,8 @@ def main(argv: list[str] | None = None) -> None:
         diagnostics.install()
 
     try:
-        w = Watcher(cfg, dry_run=args.dry_run, diagnostics=diagnostics)
+        w = Watcher(cfg, dry_run=args.dry_run, diagnostics=diagnostics,
+                    config_path=args.config)
     except SystemExit as exc:
         if diagnostics is not None:
             diagnostics.note_exit(int(exc.code or 0), "config")

@@ -55,15 +55,19 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from . import control
 from . import health
+from . import heartbeat as heartbeat_mod
 from . import logutil
 from . import procutil
 from .config import load_config as _merge_config
+from .delivery import ChannelDispatcher, DeliveryWorker, build_items
+from .outbox import OutboxStore
 from .paths import PROJECT_ROOT, resolve
 
 log = logging.getLogger("guardian")
@@ -122,6 +126,13 @@ def append_history(path: str | Path, record: dict) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError as exc:
         log.warning("写守护历史失败: %s", exc)
+        return
+    logutil.event(
+        log, "guardian_restart",
+        service=record.get("service", ""),
+        action=record.get("action", ""),
+        exit_reason=record.get("exit_reason", ""),
+    )
 
 
 def read_history(path: str | Path, limit: int = 20) -> list[dict]:
@@ -220,6 +231,22 @@ def decide_gallery(pid: Optional[int], alive, *, cmdline=None) -> str:
         if "roomwatch" not in text or "gallery" not in text:
             return ACT_RESTART_GONE
     return ACT_OK
+
+
+def gallery_http_ok(port: int, *, timeout: float = 3.0) -> bool:
+    """探测相册的 /healthz。
+
+    PID 活着不代表 HTTP 还能响应：线程死锁、事件循环卡住时，进程和端口都在，
+    但手机相册打不开。guardian 只查 PID 会漏掉这种情况。
+    """
+    try:
+        # 不走系统代理：代理会把 127.0.0.1 的请求转出去，健康检查必然失败。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{int(port)}/healthz", timeout=timeout) as resp:
+            code = getattr(resp, "status", None) or resp.getcode()
+            return 200 <= int(code) < 300
+    except Exception:  # noqa: BLE001 - 任何网络异常都按不健康处理
+        return False
 
 
 def crash_window_count(timestamps: list[str], now: datetime, window_minutes: float) -> int:
@@ -345,7 +372,14 @@ class Guard:
         )
         self.root = Path(self.desired_state_path).parents[2]
         self.gallery_pid_path = _abs(g.get("gallery_pid", "var/state/gallery.pid"))
+        self.gallery_state_path = Path(self.gallery_pid_path).with_name("gallery.json")
         self.gallery_log = _abs(g.get("gallery_log", "var/logs/gallery.log"))
+        gallery_cfg = cfg.get("gallery") or {}
+        # 没显式配置端口就不探测（源码/测试里的最小配置没有 gallery 段）；
+        # 正式 config.yaml 一定有 gallery.port。
+        self.gallery_port = int(gallery_cfg.get("port", 0) or 0)
+        self.gallery_health_timeout = float(g.get("gallery_health_timeout_seconds", 3))
+        self.gallery_health_failures = max(1, int(g.get("gallery_health_failures", 2)))
         self.owner_lock_path = _abs(
             g.get("owner_lock", "var/state/guardian.owner.lock")
         )
@@ -364,6 +398,33 @@ class Guard:
         self.python = g.get("python") or sys.executable
 
         self.state = self._load_state()
+
+        # 关键通知与外部心跳。outbox 延迟到真正要发通知时再建，
+        # 这样 `guard --status` 和纯判定单测不会碰数据库。
+        self.notify_cfg = cfg.get("notify") or {}
+        self.heartbeat = heartbeat_mod.HeartbeatSender(
+            heartbeat_mod.load_heartbeat(cfg), self.state, self._save_state
+        )
+        outbox_cfg = cfg.get("outbox") or {}
+        event_db = Path(storage.get("database") or (self.root / "var" / "db" / "events.db"))
+        if not event_db.is_absolute():
+            event_db = self.root / event_db
+        outbox_db = Path(outbox_cfg.get("database") or (event_db.parent / "outbox.db"))
+        if not outbox_db.is_absolute():
+            outbox_db = self.root / outbox_db
+        media_dir = Path(outbox_cfg.get("media_dir") or (event_db.parent.parent / "outbox"))
+        if not media_dir.is_absolute():
+            media_dir = self.root / media_dir
+        self.outbox_db_path = str(outbox_db)
+        self.outbox_media = str(media_dir)
+        self.outbox_max_age_days = float(outbox_cfg.get("max_age_days", 7))
+        self.outbox_max_total_bytes = int(
+            float(outbox_cfg.get("max_total_mb", 2048)) * 1024 * 1024
+        )
+        self.outbox = None
+        self.dispatcher = None
+        self.delivery_fast = None
+        self.delivery_video = None
 
     # ---------- 状态 ----------
 
@@ -386,6 +447,15 @@ class Guard:
             "gallery_failures": 0,
             "last_gallery_restart_at": None,
             "last_gallery_alert_at": None,
+            "last_gallery_spawn_at": None,
+            "last_gallery_spawn_pid": None,
+            "last_heartbeat_at": None,
+            "last_heartbeat_ok": None,
+            "last_heartbeat_error": "",
+            "last_heartbeat_fail_at": None,
+            "last_heartbeat_start_at": None,
+            "heartbeat_fail_streak": 0,
+            "last_heartbeat_alert_at": None,
         }
         try:
             with open(self.state_path, "r", encoding="utf-8") as f:
@@ -396,11 +466,21 @@ class Guard:
             pass
         return base
 
+    def _reload_state(self) -> None:
+        """拿到检查锁后重新读状态。
+
+        常驻 guardian 和 `guard --once` 是两个进程；后者在拿到锁之前就构造了
+        Guard，内存里的 last_spawn_pid 还是旧的，会把刚拉起的 watcher 当成
+        「进程已不存在」再拉一个。原地更新字典，保证 HeartbeatSender 的引用不失效。
+        """
+        fresh = self._load_state()
+        self.state.clear()
+        self.state.update(fresh)
+
     def _save_state(self) -> None:
         self.state["last_check_at"] = datetime.now().isoformat(timespec="seconds")
         try:
-            with open(self.state_path, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, ensure_ascii=False, indent=2)
+            health.write_json_atomic(self.state_path, self.state)
         except OSError as exc:
             log.warning("写守护状态失败: %s", exc)
 
@@ -444,6 +524,25 @@ class Guard:
         if elapsed < wait:
             return wait - elapsed
         return None
+
+    def _stop_stalled(self, pid: Optional[int]) -> None:
+        """卡死但仍活着的 watcher：先走优雅停止，再考虑强杀。
+
+        真正冻死的进程读不到 stop.request，`stop_watcher` 会在 kill_grace
+        之后强制结束；如果它只是主循环卡住但收尾路径还能跑，这段录音、
+        音轨合并和音量还原都能保住。
+        """
+        if not pid:
+            return
+        try:
+            result = control.stop_watcher(
+                self.root, int(pid), grace=self.kill_grace, force=True)
+            log.warning("卡死进程 PID %s 已停止（%s）", pid, result.get("method"))
+            if result.get("method") in ("timeout", "stuck"):
+                self._kill(pid)
+        except Exception as exc:  # noqa: BLE001 - 兜底路径不能把守护自己搞挂
+            log.warning("优雅停止卡死进程失败，退回强制终止：%s", exc)
+            self._kill(pid)
 
     def _kill(self, pid: Optional[int]) -> None:
         if not pid:
@@ -597,21 +696,133 @@ class Guard:
         elapsed = (now - last).total_seconds()
         return wait - elapsed if elapsed < wait else None
 
+    def _gallery_pid_age(self, now: datetime) -> Optional[float]:
+        """PID 文件有多久没更新：相册只在启动成功时写它。
+
+        文件很旧说明上一次确实健康运行过；文件缺失或很新，说明刚拉起的
+        相册可能还没来得及监听就退了（端口被保留/占用时就是这样）。
+        """
+        try:
+            mtime = Path(self.gallery_pid_path).stat().st_mtime
+        except OSError:
+            return None
+        return max(0.0, now.timestamp() - mtime)
+
+    def _gallery_probe_port(self) -> int:
+        """优先用 gallery.json 里的实际端口（8765 被占用时会自动换端口）。"""
+        data = health.read_json(self.gallery_state_path) or {}
+        try:
+            state_pid = int(data.get("pid") or 0)
+            port = int(data.get("port") or 0)
+        except (TypeError, ValueError):
+            state_pid, port = 0, 0
+        if port and state_pid == self._gallery_pid():
+            return port
+        return self.gallery_port
+
+    def _gallery_http_alive(self) -> bool:
+        port = self._gallery_probe_port()
+        if port <= 0:
+            return True
+        return gallery_http_ok(port, timeout=self.gallery_health_timeout)
+
+    def _notify_gallery_stall(self, now: datetime) -> None:
+        last = self.state.get("last_gallery_alert_at")
+        if last:
+            try:
+                elapsed = (now - datetime.fromisoformat(str(last))).total_seconds()
+                if elapsed < self.crash_window_minutes * 60:
+                    return
+            except (TypeError, ValueError):
+                pass
+        self._notify("room-watch：相册进程在但 HTTP 无响应，已自动重启")
+        self.state["last_gallery_alert_at"] = now.isoformat(timespec="seconds")
+
     def _check_gallery(self, now: datetime) -> str:
         pid = self._gallery_pid()
         action = decide_gallery(pid, pid_alive, cmdline=_psutil_cmdline)
+        if action == ACT_OK:
+            # 进程还在不代表服务还在：HTTP 线程卡死时手机相册打不开，
+            # 但 PID 和端口都正常，只查 PID 会一直把它当成健康的。
+            if not self._gallery_http_alive():
+                fails = int(self.state.get("gallery_http_failures", 0)) + 1
+                self.state["gallery_http_failures"] = fails
+                self.state["last_action"] = f"gallery_http_fail({fails})"
+                self._save_state()
+                if fails < self.gallery_health_failures:
+                    log.warning("相册进程在，但 HTTP 无响应（%s/%s）",
+                                fails, self.gallery_health_failures)
+                    return ACT_WAIT
+                log.warning("相册 HTTP 连续 %s 次无响应，重启相册", fails)
+                self._notify_gallery_stall(now)
+                self.state["gallery_http_failures"] = 0
+                self.state["gallery_failures"] = int(
+                    self.state.get("gallery_failures", 0)
+                ) + 1
+                self.state["last_gallery_restart_at"] = now.isoformat(timespec="seconds")
+                try:
+                    control.stop_gallery(self.root,
+                                         pid_file=Path(self.gallery_pid_path))
+                except Exception as exc:  # noqa: BLE001 - 停不掉也要继续尝试拉起
+                    log.warning("停止无响应相册失败：%s", exc)
+                new_pid = self._start_gallery()
+                if new_pid:
+                    self.state["last_gallery_spawn_at"] = now.isoformat(timespec="seconds")
+                    self.state["last_gallery_spawn_pid"] = int(new_pid)
+                append_history(self.history_path, {
+                    "at": now.isoformat(timespec="seconds"),
+                    "service": "gallery",
+                    "action": "restart_stalled",
+                    "exit_code": None,
+                    "exit_reason": "http-timeout",
+                    "new_pid": new_pid,
+                    "failures": self.state["gallery_failures"],
+                })
+                self._save_state()
+                return ACT_RESTART_STALLED
+            if int(self.state.get("gallery_http_failures", 0)):
+                self.state["gallery_http_failures"] = 0
+                self.state["last_action"] = "gallery_ok"
+                self._save_state()
+            # 只有「下一次检查时还活着」才算恢复。拉起成功（Popen 返回 PID）
+            # 不代表监听成功——端口 bind 失败会立刻退出。
+            if int(self.state.get("gallery_failures", 0)):
+                log.info("相册已恢复，清空失败计数")
+                self.state["gallery_failures"] = 0
+                self._save_state()
+            return action
         if action != ACT_RESTART_GONE:
             return action
         if self._gallery_restart_blocked(now) is not None:
             return ACT_BACKOFF
 
-        new_pid = self._start_gallery()
         failures = int(self.state.get("gallery_failures", 0))
+        spawn_age = None
+        raw = self.state.get("last_gallery_spawn_at")
+        if raw:
+            try:
+                spawn_age = (now - datetime.fromisoformat(str(raw))).total_seconds()
+            except (TypeError, ValueError):
+                spawn_age = None
+        recent_spawn = spawn_age is not None and spawn_age < self.crash_window_minutes * 60
+        age = self._gallery_pid_age(now)
+        # 旧 PID 文件可能一直留在盘上。只有「最近没有拉起过」且文件很旧，
+        # 才能认定上一轮活过了整个崩溃窗口；否则会把崩溃循环误判成健康。
+        if not recent_spawn and age is not None and age >= self.crash_window_minutes * 60:
+            failures = 0
+        first_start = not self.state.get("last_gallery_spawn_at")
+
+        new_pid = self._start_gallery()
         if new_pid:
-            self.state["gallery_failures"] = 0
+            self.state["last_gallery_spawn_at"] = now.isoformat(timespec="seconds")
+            self.state["last_gallery_spawn_pid"] = int(new_pid)
+            # 成功拉起 ≠ 健康；除了第一次启动，每次重启都先记一次失败，
+            # 等下一次检查看到它还活着再清零。
+            if not first_start:
+                failures += 1
         else:
             failures += 1
-            self.state["gallery_failures"] = failures
+        self.state["gallery_failures"] = failures
         self.state["last_gallery_restart_at"] = now.isoformat(timespec="seconds")
         append_history(self.history_path, {
             "at": now.isoformat(timespec="seconds"),
@@ -620,6 +831,7 @@ class Guard:
             "exit_code": None,
             "exit_reason": "not-running" if not pid else "unknown",
             "new_pid": new_pid,
+            "failures": failures,
         })
 
         if failures >= self.crash_threshold:
@@ -639,18 +851,92 @@ class Guard:
         self._save_state()
         return action
 
-    def _notify(self, text: str) -> None:
+    def _ensure_outbox(self) -> OutboxStore:
+        if self.outbox is None:
+            self.outbox = OutboxStore(self.outbox_db_path)
+            self.dispatcher = ChannelDispatcher(self.notify_cfg, self.outbox_media)
+            self.delivery_fast = DeliveryWorker(
+                self.outbox_db_path,
+                self.dispatcher,
+                kinds=("text", "image"),
+                media_dir=self.outbox_media,
+                max_age_days=self.outbox_max_age_days,
+                max_total_bytes=self.outbox_max_total_bytes,
+            )
+            self.delivery_video = DeliveryWorker(
+                self.outbox_db_path,
+                self.dispatcher,
+                kinds=("video",),
+                poll_seconds=5.0,
+                media_dir=self.outbox_media,
+                max_age_days=self.outbox_max_age_days,
+                max_total_bytes=self.outbox_max_total_bytes,
+            )
+        return self.outbox
+
+    def _notify(self, text: str, severity: str = "critical") -> None:
+        try:
+            store = self._ensure_outbox()
+            items = build_items(
+                self.notify_cfg,
+                event_id=f"{severity}:{datetime.now().isoformat()}",
+                text=text,
+                severity=severity,
+            )
+            if not items:
+                log.info("没有启用的通知渠道，跳过：%s", text[:80])
+                return
+            if store.enqueue_many(items):
+                return
+            return
+        except Exception as exc:  # noqa: BLE001 - outbox 故障回退直发
+            log.warning("写入通知队列失败，回退直发：%s", exc)
+
         def send() -> None:
             try:
                 from .notifier import Notifier
 
-                ok = Notifier(self.cfg.get("notify") or {}).send(text)
+                ok = Notifier(self.notify_cfg).send(text)
                 if not ok:
                     log.warning("守护通知未送达：%s", text[:80])
             except Exception as exc:  # noqa: BLE001 - 通知失败不能拖累守护
                 log.warning("发送守护通知失败: %s", exc)
 
         threading.Thread(target=send, daemon=True, name="guardian-notify").start()
+
+    def _heartbeat(self, now: datetime, action: str) -> str:
+        """按本轮检查结果发外部心跳；反复失败时发一条 critical 告警。"""
+        if self.dry_run:
+            return "dry-run"
+        if action in (ACT_STARTED, ACT_WAIT):
+            # 刚拉起/还在观察，不能算「健康」，也不该立刻发失败心跳。
+            return "starting"
+        healthy = action == ACT_OK
+        if healthy and self.supervise_gallery:
+            gpid = self._gallery_pid()
+            healthy = decide_gallery(
+                gpid, pid_alive, cmdline=_psutil_cmdline
+            ) == ACT_OK
+        paused = action == ACT_PAUSED
+        outcome = self.heartbeat.maybe_send(
+            healthy=healthy, paused=paused, now=now
+        )
+
+        if (not healthy and not paused
+                and self.heartbeat.failure_streak >= 3):
+            last = self.state.get("last_heartbeat_alert_at")
+            should_alert = True
+            if last:
+                try:
+                    elapsed = (now - datetime.fromisoformat(str(last))).total_seconds()
+                    should_alert = elapsed >= self.crash_window_minutes * 60
+                except (TypeError, ValueError):
+                    pass
+            if should_alert:
+                self._notify("room-watch：外部心跳连续失败，整机可能已失联")
+                self.state["last_heartbeat_alert_at"] = now.isoformat(timespec="seconds")
+                self._save_state()
+        return outcome
 
     def _check_selfcheck(self, now: datetime) -> None:
         data = health.read_json(self.health_path)
@@ -680,6 +966,7 @@ class Guard:
         if control.read_desired_state(self.root) == "paused":
             if self.state.get("last_desired_state") != "paused":
                 self._notify("room-watch：监控已暂停（不会再自动拉起）")
+                logutil.event(log, "guardian_paused")
             self.state["last_desired_state"] = "paused"
             self.state["pending_recovery"] = None
             self.state["stall_streak"] = 0
@@ -761,7 +1048,7 @@ class Guard:
             return ACT_BACKOFF
 
         if action == ACT_RESTART_STALLED:
-            self._kill((status or {}).get("pid"))
+            self._stop_stalled((status or {}).get("pid"))
             reason = "进程卡死（心跳停摆）"
         else:
             reason = "进程已不存在"
@@ -843,6 +1130,24 @@ class Guard:
 
     # ---------- 常驻 ----------
 
+    def maybe_reload(self) -> None:
+        """界面保存自启/守护设置后写 reload.guardian，这里应用检查间隔。"""
+        marker = Path(self.root) / "var" / "state" / "reload.guardian"
+        if not marker.exists():
+            return
+        try:
+            marker.unlink()
+        except OSError:
+            return
+        try:
+            cfg = _merge_config(self.config_path)
+            g = cfg.get("guardian") or {}
+            self.check_seconds = max(
+                15.0, float(g.get("check_seconds", self.check_seconds)))
+            log.info("守护配置已热更新：检查间隔 %.0f 秒", self.check_seconds)
+        except Exception as exc:  # noqa: BLE001 - 热更新失败继续用旧值
+            log.warning("守护配置热更新失败（继续用旧值）: %s", exc)
+
     def run_forever(self) -> None:
         log.info("守护启动：每 %d 秒检查一次，卡死判据 %d 秒",
                  self.check_seconds, self.stale_seconds)
@@ -854,11 +1159,22 @@ class Guard:
             log.info("已有 guardian 实例在运行，本实例退出")
             return
         try:
+            self._ensure_outbox()
+            self.delivery_fast.start()
+            self.delivery_video.start()
+        except Exception as exc:  # noqa: BLE001 - 通知层故障不能阻止守护
+            log.error("outbox 初始化失败，守护继续运行（通知将回退直发）：%s", exc)
+        self.heartbeat.note_start()
+        try:
             while True:
+                action = ""
+                checked = False
                 try:
                     with FileLock(self.lock_path) as got:
                         if got:
-                            self.check_once()
+                            checked = True
+                            self._reload_state()
+                            action = self.check_once()
                         else:
                             log.debug("另一个守护实例正在检查，跳过本轮")
                 except KeyboardInterrupt:
@@ -866,8 +1182,18 @@ class Guard:
                     return
                 except Exception as exc:  # noqa: BLE001 - 守护者自己绝不能崩
                     log.error("检查轮次异常（已吞掉，继续看守）: %s", exc)
+                if checked:
+                    try:
+                        self._heartbeat(datetime.now(), action)
+                    except Exception as exc:  # noqa: BLE001 - 心跳不能拖垮守护
+                        log.warning("外部心跳异常: %s", exc)
+                self.maybe_reload()
                 time.sleep(self.check_seconds)
         finally:
+            if self.delivery_fast is not None:
+                self.delivery_fast.stop()
+            if self.delivery_video is not None:
+                self.delivery_video.stop()
             owner.release()
 
 
@@ -890,8 +1216,9 @@ def main(argv: list[str] | None = None) -> None:
     handlers: list[logging.Handler] = []
     if args.log:
         log_path = _abs(args.log)
-        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-        handlers.append(logutil.rotating_file_handler(log_path))
+        handler = logutil.safe_rotating_file_handler(log_path)
+        if handler is not None:
+            handlers.append(handler)
     if sys.stderr is not None:  # pythonw 下 stderr 为 None，写 console handler 会抛异常
         handlers.append(logging.StreamHandler(sys.stderr))
 
@@ -917,7 +1244,8 @@ def main(argv: list[str] | None = None) -> None:
         print("=== 守护状态 ===")
         print(f"期望状态     : {control.read_desired_state(guard.root)}")
         gpid = guard._gallery_pid()
-        galive = bool(gpid) and pid_alive(gpid)
+        # 与巡检用同一条判活规则：PID 会被复用，必须核对命令行。
+        galive = decide_gallery(gpid, pid_alive, cmdline=_psutil_cmdline) == ACT_OK
         print(f"相册         : PID {gpid or '无'}（{'存活' if galive else '未运行'}）")
         print(f"监控状态文件 : {guard.status_path}")
         if status is None:
@@ -948,8 +1276,15 @@ def main(argv: list[str] | None = None) -> None:
             if not got:
                 log.info("另一个守护实例正在检查，本轮跳过")
                 return
+            guard._reload_state()
             action = guard.check_once()
         log.info("单次检查完成：%s", action)
+        try:
+            guard._heartbeat(datetime.now(), action)
+            guard._ensure_outbox()
+            guard.delivery_fast.flush(5)
+        except Exception as exc:  # noqa: BLE001 - 单次模式也要尽量退出干净
+            log.warning("单次模式投递/心跳失败: %s", exc)
         return
 
     guard.run_forever()

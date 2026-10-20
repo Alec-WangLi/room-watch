@@ -139,7 +139,14 @@ def _delete_run_value() -> bool:
 
 def _default_runner(cmd: list[str]) -> tuple[int, str, str]:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        # 界面/隐藏启动时没有控制台；schtasks 是控制台程序，必须显式隐藏，
+        # 否则从界面里切换自启会闪一个黑框。
+        from . import procutil
+
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=20,
+            creationflags=procutil.no_window_flags(),
+        )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except (OSError, subprocess.SubprocessError) as exc:
         return 1, "", str(exc)

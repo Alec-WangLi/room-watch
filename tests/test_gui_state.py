@@ -16,7 +16,9 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -59,12 +61,17 @@ class ReadStateTest(unittest.TestCase):
     def test_fresh_heartbeat_with_live_pid_is_online(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_status(root, seconds_ago=1)
+            write_status(root, seconds_ago=1, pending_outbox=3,
+                         last_push_success_at="2026-10-19T12:00:00",
+                         notify_channels=0)
             state = gui.read_state(root, alive=ALIVE)
         self.assertTrue(state.online)
         self.assertEqual(state.phase, "running")
         self.assertEqual(state.pid, 1234)
         self.assertEqual(state.events_today, 3)
+        self.assertEqual(state.pending_outbox, 3)
+        self.assertEqual(state.last_push_success_at, "2026-10-19T12:00:00")
+        self.assertEqual(state.notify_channels, 0)
 
     def test_fresh_heartbeat_but_dead_pid_is_offline(self) -> None:
         """这就是「停止后点不了启动」的根因，必须判离线。"""
@@ -75,6 +82,7 @@ class ReadStateTest(unittest.TestCase):
         self.assertFalse(state.online)
         self.assertEqual(state.phase, "stopped")
         self.assertIn("已停止", state.caption)
+        self.assertIsNone(state.pid, "死掉的 PID 不能再让预览/注册按钮变灰")
 
     def test_old_heartbeat_is_offline_even_if_file_says_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,12 +176,43 @@ class ReadEventsTest(unittest.TestCase):
             events = gui.read_events(root)
         self.assertEqual([e["ts"] for e in events], ["2026-10-18T02:00:00", "2026-10-18T01:00:00"])
         self.assertEqual(events[0]["confidence"], 0.77)
+        self.assertIsNone(events[0]["identity"], "旧库没有身份列时应回退为空")
+
+    def test_identity_column_is_returned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_dir = root / "var" / "db"
+            db_dir.mkdir(parents=True)
+            conn = sqlite3.connect(db_dir / "events.db")
+            conn.execute(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, "
+                "snapshot TEXT, confidence REAL, notified INTEGER, video TEXT, identity TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO events (ts, snapshot, confidence, notified, video, identity) "
+                "VALUES (?,?,?,?,?,?)",
+                ("2026-10-18T03:00:00", "c.jpg", 0.8, 1, None, "other"),
+            )
+            conn.commit()
+            conn.close()
+            events = gui.read_events(root)
+        self.assertEqual(events[0]["identity"], "other")
 
     def test_limit_is_respected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.make_db(root)
             self.assertEqual(len(gui.read_events(root, limit=1)), 1)
+
+
+class IdentityLabelTest(unittest.TestCase):
+    def test_known_labels(self) -> None:
+        from roomwatch.labels import identity_text
+
+        self.assertEqual(identity_text("owner"), "本人")
+        self.assertEqual(identity_text("other"), "访客")
+        self.assertEqual(identity_text("unknown"), "认不出")
+        self.assertEqual(identity_text(None), "-")
 
 
 class LatestSnapshotTest(unittest.TestCase):
@@ -235,11 +274,12 @@ class PreviewImageTest(unittest.TestCase):
 
 
 class ControlTest(unittest.TestCase):
-    def test_start_command_layout(self) -> None:
-        cmd = gui.start_command("C:/py/python.exe", Path("C:/proj"), "C:/proj/config.yaml")
+    def test_guard_command_layout(self) -> None:
+        cmd = gui.guard_command("C:/py/python.exe", Path("C:/proj"), "C:/proj/config.yaml")
         self.assertEqual(cmd[:3], ["C:/py/python.exe", "-m", "roomwatch"])
-        self.assertIn("start", cmd)
+        self.assertIn("guard", cmd)
         self.assertIn("C:/proj/config.yaml", cmd)
+        self.assertIn("guardian.log", cmd[-1])
 
     def test_force_kill_command_is_the_fallback_only(self) -> None:
         self.assertEqual(gui.force_kill_command(4321), ["taskkill", "/PID", "4321", "/F"])
@@ -311,6 +351,134 @@ class GuardCommandTest(unittest.TestCase):
         cmd = gui.guard_command("C:/py/python.exe", Path("C:/proj"), "C:/proj/config.yaml",
                                 once=True)
         self.assertIn("--once", cmd)
+
+
+class HeadlessSubprocessTest(unittest.TestCase):
+    def test_headless_flags_on_non_windows(self):
+        self.assertEqual(gui._headless_flags("linux"), 0)
+
+    def test_headless_flags_on_windows(self):
+        if os.name != "nt":
+            self.skipTest("Windows only")
+        self.assertTrue(gui._headless_flags("nt") & subprocess.CREATE_NO_WINDOW)
+
+    def test_run_headless_passes_creationflags(self):
+        with mock.patch.object(gui.subprocess, "run", return_value=mock.Mock()) as run:
+            gui._run_headless(["python.exe", "-c", "pass"])
+        self.assertEqual(
+            run.call_args.kwargs.get("creationflags"), gui._headless_flags()
+        )
+
+    def test_update_check_uses_headless_run(self):
+        with mock.patch.object(gui.subprocess, "run", return_value=mock.Mock()) as run:
+            gui._update_check("py", Path("C:/proj"))
+        args = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        self.assertEqual(args, ["py", "-m", "roomwatch", "update", "--json"])
+        self.assertTrue(kwargs.get("capture_output"))
+        self.assertEqual(kwargs.get("creationflags"), gui._headless_flags())
+
+
+class GalleryUrlTest(unittest.TestCase):
+    """相册端口不再写死：相册可能因系统保留端口而改用别的端口。"""
+
+    def _write_state(self, root: Path, payload) -> None:
+        state = root / "var" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "gallery.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def test_missing_state_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(gui.gallery_url(Path(tmp)))
+
+    def test_reads_actual_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_state(root, {
+                "pid": 123, "host": "127.0.0.1", "port": 54321,
+                "url": "http://127.0.0.1:54321/",
+            })
+            self.assertEqual(gui.gallery_url(root), "http://127.0.0.1:54321/")
+
+    def test_builds_url_from_host_and_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_state(root, {"pid": 123, "host": "127.0.0.1", "port": 54321})
+            self.assertEqual(gui.gallery_url(root), "http://127.0.0.1:54321/")
+
+    def test_invalid_state_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_state(root, {"pid": 123, "port": "not-a-port"})
+            self.assertIsNone(gui.gallery_url(root))
+            self._write_state(root, {"pid": 123, "port": 70000})
+            self.assertIsNone(gui.gallery_url(root))
+
+    def test_zero_host_opens_via_loopback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_state(root, {
+                "pid": 123, "host": "0.0.0.0", "port": 18765,
+                "url": "http://0.0.0.0:18765/",
+            })
+            self.assertEqual(gui.gallery_url(root), "http://127.0.0.1:18765/")
+
+
+class UptimeStateTest(unittest.TestCase):
+    def test_uptime_and_start_time_are_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_status(root, seconds_ago=1, uptime="49m17s",
+                         started_at="2026-10-20T17:16:06")
+            state = gui.read_state(root, alive=ALIVE)
+        self.assertEqual(state.uptime, "49m17s")
+        self.assertEqual(state.started_at, "2026-10-20T17:16:06")
+        self.assertIn("已运行 49m17s", state.caption)
+
+
+class StorageStateTest(unittest.TestCase):
+    """存储预警要从 status.json 一路带到界面状态，不能只写日志。"""
+
+    def test_storage_warning_fields_are_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_status(root, seconds_ago=1, storage_status="warning",
+                         storage_days_left=2.4, storage_used_gb=8.0,
+                         storage_max_gb=10.0)
+            state = gui.read_state(root, alive=ALIVE)
+        self.assertEqual(state.storage_status, "warning")
+        self.assertAlmostEqual(state.storage_days_left, 2.4, places=1)
+        self.assertAlmostEqual(state.storage_used_gb, 8.0, places=2)
+
+    def test_missing_storage_fields_are_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_status(root, seconds_ago=1)
+            state = gui.read_state(root, alive=ALIVE)
+        self.assertIsNone(state.storage_status)
+        self.assertIsNone(state.storage_days_left)
+
+
+class UpdateCheckGenerationTest(unittest.TestCase):
+    """保存更新设置后，旧配置的检查结果不许再覆盖界面。"""
+
+    def test_old_generation_is_rejected(self) -> None:
+        gen = gui.CheckGeneration()
+        first = gen.next()
+        self.assertTrue(gen.accepts(first))
+        gen.invalidate()
+        self.assertFalse(gen.accepts(first))
+        second = gen.next()
+        self.assertTrue(gen.accepts(second))
+        self.assertFalse(gen.accepts(first))
+
+    def test_up_to_date_text_uses_result_channel(self) -> None:
+        text = gui.up_to_date_text("0.1.22", "测试版")
+        self.assertIn("测试版通道", text)
+        # 结果里没有通道时不能擅自说成稳定版（0.1.21 真机误报的来源之一）。
+        self.assertNotIn("稳定版", gui.up_to_date_text("0.1.22", ""))
 
 
 if __name__ == "__main__":

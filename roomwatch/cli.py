@@ -85,11 +85,15 @@ COMMANDS: dict[str, Command] = {
     "volume-set": Command("直接设置系统主音量（0~100）", "watcher",
                           takes="--volume-set", requires_value=True),
     "storage": Command("查看磁盘占用、容量上限与最旧文件", "watcher", ("--storage",)),
+    "bench-encode": Command("测量录像编码速度（只测量，不改默认编码器）"),
+    "bench-detect": Command("测量人体检测推理速度（只测量，不切换引擎）"),
     "stop": Command("优雅停止监控：先让录像收尾，再退出"),
     "gallery": Command("启动本地相册（默认 127.0.0.1:8765）", "gallery"),
     "config": Command("读取或修改界面设置（--json / --set 键=值 / --test）"),
     "autostart": Command("开机自启：查看状态或开启/关闭（--json / --enable / --disable）"),
     "identity": Command("查看或清除本人人脸模板（--json / --clear）"),
+    "heartbeat": Command("测试外部心跳 URL（--test / --json）"),
+    "verify": Command("验证摄像头、推送与自检是否真的在工作（--json）"),
     "guard": Command("守护进程：保证监控进程一直活着", "guardian"),
     "push": Command("配置微信/Server酱推送渠道", "setup_push"),
     "setup": Command("首次配置向导：摄像头、微信推送、相册密码、开机自启", "wizard"),
@@ -301,10 +305,68 @@ def _check_port(port: int = 8765) -> Check:
     try:
         sock.bind(("127.0.0.1", port))
         return Check("相册端口", True, f"127.0.0.1:{port} 空闲", fatal=False)
-    except OSError:
-        return Check("相册端口", False, f"127.0.0.1:{port} 已被占用（相册可能已在跑）", fatal=False)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 10013:
+            return Check(
+                "相册端口", False,
+                f"127.0.0.1:{port} 被 Windows 保留（端口排除范围）；"
+                "相册启动时会自动改用其它端口，不需要手工处理",
+                fatal=False,
+            )
+        return Check("相册端口", False,
+                     f"127.0.0.1:{port} 已被占用（相册可能已在跑）", fatal=False)
     finally:
         sock.close()
+
+
+def _install_version_problem(current: str, display: str, location: str,
+                             root: Path) -> Optional[str]:
+    """卸载项与当前程序的版本是否一致。
+
+    只对「当前这份安装」判断：从源码目录或另一份安装运行时跳过，
+    否则会被别的安装目录的卸载项误报。
+    """
+    if not display or not location:
+        return None
+    try:
+        if Path(location).resolve() != Path(root).resolve():
+            return None
+    except OSError:
+        return None
+    if str(display).strip() != str(current).strip():
+        return (f"卸载项 DisplayVersion={display} ≠ 当前程序 {current}；"
+                "重跑安装包修复卸载项")
+    return None
+
+
+def _check_install_version(root: Path) -> Check:
+    """Windows 安装版：卸载列表里的版本必须和程序一致。"""
+    if os.name != "nt":
+        return Check("安装版本", True, "非 Windows，跳过", fatal=False)
+    try:
+        import winreg
+    except ImportError:
+        return Check("安装版本", True, "没有 winreg，跳过", fatal=False)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, paths.UNINSTALL_KEY) as key:
+            display = str(winreg.QueryValueEx(key, "DisplayVersion")[0])
+            location = str(winreg.QueryValueEx(key, "InstallLocation")[0])
+    except FileNotFoundError:
+        return Check("安装版本", True,
+                     "未找到卸载项（便携版/源码运行，跳过）", fatal=False)
+    except OSError as exc:
+        return Check("安装版本", True, f"读不到卸载项：{exc}", fatal=False)
+    try:
+        same_location = Path(location).resolve() == Path(root).resolve()
+    except OSError:
+        same_location = False
+    if not same_location:
+        return Check("安装版本", True,
+                     f"不是当前安装目录，跳过（{location or '未知'}）", fatal=False)
+    problem = _install_version_problem(__version__, display, location, root)
+    if problem:
+        return Check("安装版本", False, problem, fatal=False)
+    return Check("安装版本", True, f"卸载项 {display} 与当前程序一致", fatal=False)
 
 
 def _check_runtime() -> Check:
@@ -346,6 +408,7 @@ def run_checks(project_root: Optional[Path] = None) -> list[Check]:
         _check_owner(root),
         _check_hooks(root),
         _check_port(),
+        _check_install_version(root),
     ]
 
 
@@ -409,8 +472,10 @@ def _cmd_update(argv: Sequence[str]) -> int:
     if "--help" in argv or "-h" in argv:
         print(
             "用法：rw update [--check] [--yes] [--force] [--no-restart]\n"
-            "                [--json] [--wait-exit PID] [--relaunch-gui]\n"
+            "                [--json] [--channel stable|beta]\n"
+            "                [--wait-exit PID] [--relaunch-gui]\n"
             "  --check        只检查，不下载不安装\n"
+            "  --channel      更新通道：stable=只收稳定版；beta=测试版预发布也收\n"
             "  --yes          允许跨次版本/主版本升级（版本纪律要求显式确认）\n"
             "  --force        允许降级（一般只用于回滚到旧版排障）\n"
             "  --no-restart   装完不自动把监控拉起来\n"
@@ -420,7 +485,8 @@ def _cmd_update(argv: Sequence[str]) -> int:
         )
         return 0
 
-    flags = {"--check", "--yes", "--force", "--no-restart", "--json", "--relaunch-gui"}
+    flags = {"--check", "--yes", "--force", "--no-restart", "--json",
+             "--relaunch-gui", "--channel"}
     json_mode = "--json" in argv
     check_only = "--check" in argv or json_mode
     assume_yes = "--yes" in argv
@@ -429,6 +495,7 @@ def _cmd_update(argv: Sequence[str]) -> int:
     relaunch_gui = "--relaunch-gui" in argv
 
     wait_pid = 0
+    channel_override = ""
     unknown: list[str] = []
     idx = 0
     while idx < len(argv):
@@ -437,6 +504,12 @@ def _cmd_update(argv: Sequence[str]) -> int:
             if idx + 1 >= len(argv) or not argv[idx + 1].isdigit():
                 raise UsageError("--wait-exit 后面要跟一个进程号（数字）")
             wait_pid = int(argv[idx + 1])
+            idx += 2
+            continue
+        if item == "--channel":
+            if idx + 1 >= len(argv) or argv[idx + 1] not in ("stable", "beta"):
+                raise UsageError("--channel 只能是 stable 或 beta")
+            channel_override = argv[idx + 1]
             idx += 2
             continue
         if item not in flags:
@@ -448,6 +521,8 @@ def _cmd_update(argv: Sequence[str]) -> int:
     cfg_path = paths.PROJECT_ROOT / "config.yaml"
     cfg = load_config(str(cfg_path)) if cfg_path.is_file() else {}
     opt = updater.update_config(cfg)
+    channel = channel_override or opt["channel"]
+    channel_label = "测试版" if channel == "beta" else "稳定版"
 
     current = updater.Version.parse(__version__)
     payload: dict = {
@@ -458,6 +533,8 @@ def _cmd_update(argv: Sequence[str]) -> int:
         "notes": "",
         "error": "",
         "checked_at": "",
+        "channel": channel,
+        "channel_label": channel_label,
         "check_interval_hours": opt["check_interval_hours"],
         "installed": False,
         "handed_off": False,
@@ -476,7 +553,7 @@ def _cmd_update(argv: Sequence[str]) -> int:
             # 检查结果落盘，界面下次启动按 check_interval_hours 复用，不用每次联网
             updater.save_check_cache({key: payload[key] for key in (
                 "checked_at", "current", "latest", "policy", "tag", "notes",
-                "check_interval_hours")})
+                "channel", "channel_label", "check_interval_hours")})
         if json_mode:
             print(json.dumps(payload, ensure_ascii=False))
         return code
@@ -487,8 +564,9 @@ def _cmd_update(argv: Sequence[str]) -> int:
         return done(0, policy="disabled")
 
     say(f"检查仓库  {opt['repo']}")
+    say(f"检查通道  {channel_label}")
     try:
-        release = updater.fetch_latest(opt["repo"])
+        release = updater.fetch_channel(opt["repo"], channel)
     except updater.UpdateError as exc:
         say(f"✗ {exc}")
         return done(1, error=str(exc))
@@ -503,7 +581,7 @@ def _cmd_update(argv: Sequence[str]) -> int:
              "notes": (release.notes or "").strip()}
 
     if policy == "up-to-date":
-        say("\n已是最新版本。")
+        say(f"\n已是最新版本（{channel_label}通道）。")
         return done(0, **found)
     if policy == "blocked-downgrade":
         say(f"\n远端 {latest} 比本地 {current} 旧，默认不降级。"
@@ -681,7 +759,18 @@ def _cmd_stop(argv: Sequence[str]) -> int:
 
     root = paths.PROJECT_ROOT
     control.set_desired_state(root, "paused", by="cli")
-    gallery = control.stop_gallery(root)
+    # guardian.gallery_pid 允许自定义；读不到配置就按默认路径停。
+    pid_file = None
+    try:
+        from .config import load_config
+
+        configured = ((load_config(str(root / "config.yaml")).get("guardian") or {})
+                      .get("gallery_pid"))
+        if configured:
+            pid_file = Path(str(configured))
+    except Exception:  # noqa: BLE001 - 配置坏了也要能停监控
+        pid_file = None
+    gallery = control.stop_gallery(root, pid_file=pid_file)
 
     pid = _status_pid()
     if not pid or not procutil.pid_alive(pid):
@@ -707,8 +796,7 @@ def _cmd_stop(argv: Sequence[str]) -> int:
     return 0 if result["method"] in ("graceful", "already-stopped", "forced") else 1
 
 
-def _pairs_after(argv: Sequence[str], flag: str) -> dict:
-    """收集 `--set 键=值 键=值` 里的键值对。值里含 = 也安全（只按第一个 = 切）。"""
+def _items_after(argv: Sequence[str], flag: str) -> list[str]:
     items: list[str] = []
     idx = 0
     while idx < len(argv):
@@ -719,13 +807,47 @@ def _pairs_after(argv: Sequence[str], flag: str) -> dict:
                 idx += 1
             continue
         idx += 1
+    return items
+
+
+def _pairs_after(argv: Sequence[str], flag: str) -> dict:
+    """收集 `--set 键=值 键=值` 里的键值对。值里含 = 也安全（只按第一个 = 切）。"""
     pairs: dict = {}
-    for item in items:
+    for item in _items_after(argv, flag):
         if "=" not in item:
             raise UsageError(f"{flag} 之后每项都要写成 键=值，收到：{item}")
         key, _, value = item.partition("=")
         pairs[key.strip()] = value
     return pairs
+
+
+def _cmd_heartbeat(argv: Sequence[str]) -> int:
+    """测试外部心跳 URL；输出里绝不带完整 URL。"""
+    from datetime import datetime
+
+    from .config import load_config
+    from .heartbeat import load_heartbeat, ping
+
+    json_mode = "--json" in argv
+    if "--test" not in argv:
+        raise UsageError("用法：rw heartbeat --test [--json]")
+
+    cfg = load_config(str(paths.PROJECT_ROOT / "config.yaml"))
+    hb = load_heartbeat(cfg)
+    if not hb.configured:
+        result = {"ok": False, "message": "还没有配置 monitor.heartbeat_url", "at": None}
+    else:
+        ok, error = ping(hb.url, hb.timeout_seconds)
+        result = {
+            "ok": ok,
+            "message": "" if ok else error,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+    if json_mode:
+        print(json.dumps(result, ensure_ascii=True))
+    else:
+        print("✓ 心跳成功" if result["ok"] else f"✗ 心跳失败：{result['message']}")
+    return 0 if result["ok"] else 1
 
 
 def _cmd_config(argv: Sequence[str]) -> int:
@@ -737,15 +859,30 @@ def _cmd_config(argv: Sequence[str]) -> int:
 
     if "--help" in argv or "-h" in argv:
         print(
-            "用法：rw config [--json] [--set 键=值 …] [--test]\n"
+            "用法：rw config [--json] [--set 键=值 …] [--unset 键 …] [--test]\n"
             "  --json       机器可读输出（界面用）\n"
             "  --set        保存一批设置到 config.local.yaml（先全量校验再落盘）\n"
+            "  --unset      删除本机覆盖，回落到 config.yaml 的默认值\n"
             "  --test       用当前生效的凭据发一条测试消息"
         )
         return 0
 
     if "--test" in argv:
         return _config_test(root, json_mode)
+
+    if "--unset" in argv:
+        keys = _items_after(argv, "--unset")
+        if not keys:
+            raise UsageError("--unset 后面要跟至少一个键")
+        result = settings.unset(root, keys)
+        if json_mode:
+            print(json.dumps(result, ensure_ascii=True))
+        else:
+            for key in result.get("applied") or []:
+                print(f"✓ 已删除 {key}")
+            for key, message in (result.get("errors") or {}).items():
+                print(f"✗ {key}: {message}")
+        return 0 if result["ok"] else 1
 
     if "--set" in argv:
         changes = _pairs_after(argv, "--set")
@@ -783,37 +920,34 @@ def _cmd_config(argv: Sequence[str]) -> int:
 
 
 def _config_test(root: Path, json_mode: bool) -> int:
-    """用生效配置里的凭据发一条测试消息。"""
-    import io
-    from contextlib import redirect_stdout
-
+    """用当前生效的所有渠道各发一条测试消息。"""
     from .config import load_config
-    from .setup_push import send_test
+    from .delivery import enabled_channels
+    from .notifier import Notifier
 
     cfg = load_config(str(root / "config.yaml"))
     notify = cfg.get("notify") or {}
-    channel = str(notify.get("channel") or "none")
-    creds: dict = {}
-    if channel == "wecom_bot":
-        creds = {"webhook": str((notify.get("wecom_bot") or {}).get("webhook") or "")}
-    elif channel == "wxpusher":
-        block = notify.get("wxpusher") or {}
-        creds = {"token": str(block.get("app_token") or ""), "uid": str(block.get("uid") or "")}
-    elif channel == "serverchan":
-        creds = {"sendkey": str((notify.get("serverchan") or {}).get("sendkey") or "")}
-
-    missing = [key for key, value in creds.items() if not value or "replace_me" in value.lower()]
-    if channel == "none" or missing:
-        payload = {"ok": False, "channel": channel,
-                   "message": "推送渠道是 none" if channel == "none"
-                   else f"凭据不完整：缺少 {', '.join(missing)}"}
+    channels = enabled_channels(notify)
+    if not channels:
+        payload = {"ok": False, "channel": "none", "channels": {},
+                   "message": "没有启用任何推送渠道"}
     else:
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            ok = send_test(channel, creds)
-        detail = buffer.getvalue().strip()
-        payload = {"ok": bool(ok), "channel": channel,
-                   "message": "" if ok else (detail[-600:] or "发送失败，服务端没有返回原因")}
+        body = ("room-watch 推送测试\n"
+                "收到这条消息，说明推送配置成功。有人进入房间时你会收到类似提醒。")
+        notifier = Notifier(notify)
+        results: dict = {}
+        errors: list[str] = []
+        for channel in channels:
+            result = notifier.deliver(channel, "text", {"text": body})
+            results[channel] = {"ok": bool(result.ok), "error": result.error}
+            if not result.ok:
+                errors.append(f"{channel}: {result.error}")
+        payload = {
+            "ok": not errors,
+            "channel": ",".join(channels),
+            "channels": results,
+            "message": "" if not errors else "；".join(errors)[-600:],
+        }
 
     if json_mode:
         print(json.dumps(payload, ensure_ascii=True))
@@ -834,8 +968,8 @@ def _cmd_autostart(argv: Sequence[str]) -> int:
     if "--help" in argv or "-h" in argv:
         print(
             "用法：rw autostart [--json] [--enable | --disable]\n"
-            "  --enable   写入 HKCU\\...\\Run\\RoomWatch（拉起守护进程）\n"
-            "  --disable  删除该注册表值"
+            "  --enable   注册登录时启动的计划任务（被安全策略拦截时回退 Run 键），拉起守护进程\n"
+            "  --disable  取消计划任务并删除 Run 回退值"
         )
         return 0
 
@@ -900,13 +1034,18 @@ def _cmd_identity(argv: Sequence[str]) -> int:
 
 
 def _cmd_diag(argv: Sequence[str]) -> int:
-    """生成诊断包并打印路径。"""
+    """生成诊断包并打印路径。--json 供界面调用，只输出一行。"""
     from . import diag
 
-    if argv:
-        raise UsageError(f"rw diag 不接受参数，收到：{' '.join(argv)}")
+    json_mode = "--json" in argv
+    rest = [arg for arg in argv if arg != "--json"]
+    if rest:
+        raise UsageError(f"rw diag 只接受 --json，收到：{' '.join(rest)}")
     path = diag.build_bundle(paths.PROJECT_ROOT)
-    print(f"诊断包已生成：{path}")
+    if json_mode:
+        print(json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False))
+    else:
+        print(f"诊断包已生成：{path}")
     return 0
 
 
@@ -947,6 +1086,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_autostart(rest)
         if name == "identity":
             return _cmd_identity(rest)
+        if name == "heartbeat":
+            return _cmd_heartbeat(rest)
+        if name == "bench-encode":
+            from . import benchcodec
+
+            return benchcodec.main(rest)
+        if name == "bench-detect":
+            from . import benchdetect
+
+            return benchdetect.main(rest)
+        if name == "verify":
+            from . import verify
+
+            return verify.main(rest)
 
         spec = COMMANDS[name]
         translated = translate(name, rest)

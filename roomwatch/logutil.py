@@ -6,7 +6,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__all__ = ["rotating_file_handler", "event"]
+__all__ = ["rotating_file_handler", "safe_rotating_file_handler", "event"]
 
 
 def rotating_file_handler(
@@ -23,6 +23,25 @@ def rotating_file_handler(
         backupCount=backups,
         encoding="utf-8",
     )
+
+
+def safe_rotating_file_handler(
+    path: str | Path,
+    *,
+    max_bytes: int = 5 * 1024 * 1024,
+    backups: int = 5,
+) -> logging.Handler | None:
+    """打不开日志文件时返回 None，不让程序在启动阶段直接死掉。
+
+    日志目录可能是只读的、被安全软件锁住、或者路径撞上了一个同名文件。
+    这些都不该阻止监控运行；最差也就是只剩控制台输出。
+    """
+    try:
+        return rotating_file_handler(path, max_bytes=max_bytes, backups=backups)
+    except OSError as exc:
+        logging.getLogger("room-watch").warning(
+            "日志文件打不开，改为只输出到控制台：%s（%s）", path, exc)
+        return None
 
 
 def event(logger: logging.Logger, name: str, **fields) -> None:

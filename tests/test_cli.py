@@ -16,6 +16,7 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,7 @@ class CommandTableTest(unittest.TestCase):
             "say", "say-raw", "ab", "volume-check", "volume-set", "storage",
             "gallery", "guard", "push", "push-video", "setup", "test", "doctor",
             "diag", "update", "version", "gui", "stop", "config", "autostart", "identity",
+            "heartbeat", "bench-encode", "bench-detect", "verify",
         }
         self.assertEqual(set(cli.COMMANDS), expected)
 
@@ -137,6 +139,31 @@ class DoctorTest(unittest.TestCase):
         self.assertFalse(model.ok)
 
 
+class InstallVersionTest(unittest.TestCase):
+    """卸载列表里的版本必须和当前程序一致（0.1.22 真机版本错位的兜底）。"""
+
+    def test_matching_version_is_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(
+                cli._install_version_problem("0.1.22", "0.1.22", str(root), root))
+
+    def test_mismatch_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            problem = cli._install_version_problem("0.1.23", "0.1.22", str(root), root)
+            self.assertIsNotNone(problem)
+            self.assertIn("0.1.22", problem)
+            self.assertIn("0.1.23", problem)
+
+    def test_other_install_location_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "app"
+            other = Path(tmp) / "other"
+            self.assertIsNone(
+                cli._install_version_problem("0.1.23", "0.1.22", str(other), root))
+
+
 class TestFilesTest(unittest.TestCase):
     def test_fast_mode_skips_integration(self) -> None:
         self.assertNotIn("test_integration.py", cli.test_files(fast=True))
@@ -195,6 +222,89 @@ class StartStopSemanticsTest(unittest.TestCase):
 
     def test_command_table_includes_diag(self):
         self.assertIn("diag", cli.COMMANDS)
+
+
+class DiagCommandTest(unittest.TestCase):
+    def test_json_mode_prints_one_json_object(self):
+        fake = Path("var/diag/room-watch-diag-test.zip")
+        with mock.patch("roomwatch.diag.build_bundle", return_value=fake):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli.main(["diag", "--json"])
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue().strip())
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["path"], str(fake))
+
+    def test_unknown_argument_is_rejected(self):
+        with self.assertRaises(cli.UsageError):
+            cli._cmd_diag(["--bundle"])
+
+
+class AutostartHelpTest(unittest.TestCase):
+    def test_help_mentions_scheduled_task_first(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["autostart", "--help"])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("计划任务", out)
+        self.assertIn("回退", out)
+
+
+class UpdateChannelTest(unittest.TestCase):
+    def test_channel_flag_reaches_fetcher_and_json(self):
+        from roomwatch import updater
+
+        release = updater.Release(
+            version=updater.Version(0, 1, 19), tag="v0.1.19-beta",
+            title="", notes="", prerelease=True)
+        buf = io.StringIO()
+        with mock.patch.object(updater, "fetch_channel", return_value=release) as fetch, \
+             mock.patch.object(updater, "save_check_cache"):
+            with redirect_stdout(buf):
+                rc = cli.main(["update", "--json", "--channel", "beta"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(fetch.call_args.args[1], "beta")
+        data = json.loads(buf.getvalue().strip())
+        self.assertEqual(data["channel"], "beta")
+        self.assertEqual(data["tag"], "v0.1.19-beta")
+
+
+class ConfigTestCommandTest(unittest.TestCase):
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"errcode": 0, "code": 1000}
+
+    def test_config_test_uses_all_enabled_channels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.yaml").write_text(
+                "notify:\n"
+                "  channels: [wecom_bot, wxpusher]\n"
+                "  wecom_bot:\n"
+                "    webhook: https://x.test/send?key=K\n"
+                "  wxpusher:\n"
+                "    app_token: AT_real\n"
+                "    uid: UID_real\n",
+                encoding="utf-8",
+            )
+            buffer = io.StringIO()
+            with mock.patch("roomwatch.notifier.requests.post",
+                            return_value=self.FakeResponse()) as post, \
+                    redirect_stdout(buffer):
+                rc = cli._config_test(root, json_mode=True)
+        payload = json.loads(buffer.getvalue().strip().splitlines()[-1])
+        self.assertEqual(rc, 0)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(
+            {name: item["ok"] for name, item in payload["channels"].items()},
+            {"wecom_bot": True, "wxpusher": True},
+        )
+        self.assertEqual(post.call_count, 2)
 
 
 if __name__ == "__main__":

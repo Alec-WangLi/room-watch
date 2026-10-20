@@ -34,6 +34,7 @@ from .autostart import disable as disable_autostart
 from .autostart import enable as enable_autostart
 from .paths import PROJECT_ROOT, bundled_python, find_python
 from .setup_push import normalize_wecom_webhook
+from . import procutil
 
 LOCAL_NAME = "config.local.yaml"
 MAIN_NAME = "config.yaml"
@@ -183,6 +184,7 @@ def probe_camera(config_path: Path) -> tuple[bool, str]:
         proc = subprocess.run(
             [exe, "-m", "roomwatch", "probe", "--config", str(config_path)],
             cwd=str(root), env=env, capture_output=True, text=True, timeout=90,
+            creationflags=procutil.no_window_flags(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"启动探测失败：{exc}"

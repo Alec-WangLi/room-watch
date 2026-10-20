@@ -14,10 +14,13 @@ import sys as _sys
 
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+import io
 import json
+import logging
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -305,6 +308,7 @@ class GuardPausedTest(unittest.TestCase):
                    "__config_path__": str(root / "config.yaml")}
             control.set_desired_state(root, "paused")
             g = G.Guard(cfg, dry_run=True)
+            g._notify = lambda *args, **kwargs: None
             with mock.patch.object(g, "_start_watcher") as sw, \
                  mock.patch.object(g, "_start_gallery") as sg:
                 self.assertEqual(g.check_once(), G.ACT_PAUSED)
@@ -334,6 +338,29 @@ class GuardPausedTest(unittest.TestCase):
             self.assertEqual(len(sent), 1)
 
 
+    def test_paused_clears_pending_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = {"guardian": {
+                       "desired_state": str(root / "var/state/desired_state.json"),
+                       "state": str(root / "var/state/guardian_state.json"),
+                       "lock": str(root / "var/state/guardian.lock"),
+                       "history": str(root / "var/state/h.jsonl"),
+                       "supervise_gallery": False},
+                   "health": {"exit_record": str(root / "var/state/last_exit.json")},
+                   "storage": {"status": str(root / "var/state/status.json")},
+                   "__config_path__": str(root / "config.yaml")}
+            control.set_desired_state(root, "paused")
+            g = G.Guard(cfg, dry_run=True)
+            g._notify = lambda *args, **kwargs: None
+            g.state["pending_recovery"] = {"pid": 123, "at": "2026-10-19T12:00:00"}
+            with mock.patch.object(g, "_start_watcher"), \
+                 mock.patch.object(g, "_start_gallery"):
+                self.assertEqual(g.check_once(), G.ACT_PAUSED)
+            self.assertIsNone(g.state.get("pending_recovery"),
+                              "暂停后不该保留「待恢复」状态")
+
+
 class GuardRecoveryTest(unittest.TestCase):
     def _cfg(self, root):
         return {"guardian": {
@@ -348,6 +375,22 @@ class GuardRecoveryTest(unittest.TestCase):
                            "exit_record": str(root / "var/state/last_exit.json")},
                 "storage": {"status": str(root / "var/state/status.json")},
                 "__config_path__": str(root / "config.yaml")}
+
+    def test_guardian_reload_updates_check_seconds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self._cfg(root)
+            cfg["__config_path__"] = str(root / "config.yaml")
+            (root / "config.yaml").write_text(
+                "guardian:\n  check_seconds: 30\n", encoding="utf-8")
+            g = G.Guard(cfg, dry_run=True)
+            state = root / "var" / "state"
+            state.mkdir(parents=True, exist_ok=True)
+            marker = state / "reload.guardian"
+            marker.write_text("guardian", encoding="utf-8")
+            g.maybe_reload()
+            self.assertFalse(marker.exists())
+            self.assertEqual(g.check_seconds, 30.0)
 
     def test_recovery_notification_sent_once_after_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -367,6 +410,26 @@ class GuardRecoveryTest(unittest.TestCase):
             g.check_once()
             self.assertEqual(len(sent), 1)
 
+    def test_stalled_restart_uses_graceful_stop_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "var/state").mkdir(parents=True)
+            (root / "var/state/status.json").write_text(json.dumps({
+                "pid": os.getpid(),
+                "last_frame_at": (datetime.now() - timedelta(seconds=600))
+                .isoformat(timespec="seconds")}), encoding="utf-8")
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g._notify = lambda *args, **kwargs: None
+            g.state["stall_streak"] = max(0, g.stall_confirmations - 1)
+            with mock.patch("roomwatch.guardian.control.stop_watcher",
+                            return_value={"method": "forced"}) as stop, \
+                 mock.patch.object(g, "_start_watcher", return_value=4242), \
+                 mock.patch.object(g, "_kill") as kill:
+                action = g.check_once()
+        self.assertEqual(action, G.ACT_RESTART_STALLED)
+        stop.assert_called_once()
+        kill.assert_not_called()
+
     def test_selfcheck_failure_notifies_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -383,6 +446,150 @@ class GuardRecoveryTest(unittest.TestCase):
             g._notify = lambda text: sent.append(text)
             g.check_once()
             self.assertTrue(any("自检" in s for s in sent))
+
+
+class GuardStateRefreshTest(unittest.TestCase):
+    """`rw start` 会同时跑常驻 guardian 和 `guard --once`。
+
+    两个进程各自构造 Guard；`--once` 若沿用构造时的旧状态，就看不到常驻
+    guardian 刚拉起的 watcher，会再拉起一个（真机 0.1.22 升级时实测两个 watcher
+    抢同一个摄像头）。拿到检查锁后必须重新读状态。
+    """
+
+    def _cfg(self, root):
+        return {"guardian": {
+                    "desired_state": str(root / "var/state/desired_state.json"),
+                    "state": str(root / "var/state/guardian_state.json"),
+                    "lock": str(root / "var/state/guardian.lock"),
+                    "history": str(root / "var/state/h.jsonl"),
+                    "gallery_pid": str(root / "var/state/gallery.pid"),
+                    "gallery_log": str(root / "var/logs/gallery.log"),
+                    "supervise_gallery": False},
+                "health": {"path": str(root / "var/state/health.json"),
+                           "exit_record": str(root / "var/state/last_exit.json")},
+                "storage": {"status": str(root / "var/state/status.json")},
+                "__config_path__": str(root / "config.yaml")}
+
+    def test_once_sees_spawn_recorded_by_resident_guardian(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "var" / "state"
+            state.mkdir(parents=True)
+            (state / "status.json").write_text(json.dumps({
+                "pid": DEAD_PID,
+                "last_frame_at": (datetime.now() - timedelta(minutes=5))
+                .isoformat(timespec="seconds"),
+            }), encoding="utf-8")
+
+            resident = G.Guard(self._cfg(root), dry_run=True)
+            once = G.Guard(self._cfg(root), dry_run=True)   # 先构造，拿到的是旧状态
+            resident._notify = lambda *args, **kwargs: None
+            once._notify = lambda *args, **kwargs: None
+
+            with mock.patch.object(resident, "_start_watcher", return_value=LIVE_PID):
+                self.assertEqual(resident.check_once(), G.ACT_RESTART_GONE)
+
+            # 拿到检查锁后的刷新动作；没有这一步，once 会再次拉起 watcher。
+            once._reload_state()
+            with mock.patch.object(once, "_start_watcher", return_value=4242) as start:
+                self.assertEqual(once.check_once(), G.ACT_WAIT)
+            start.assert_not_called()
+
+
+class GalleryHealthTest(unittest.TestCase):
+    """相册进程活着但 HTTP 卡死时，guardian 要能发现并重启。"""
+
+    def test_http_ok_against_real_server(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - 标准库命名
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(G.gallery_http_ok(server.server_address[1], timeout=2.0))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_closed_port_is_not_ok(self):
+        import socket
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        self.assertFalse(G.gallery_http_ok(port, timeout=0.3))
+
+    def _cfg(self, root):
+        return {"guardian": {
+                    "desired_state": str(root / "var/state/desired_state.json"),
+                    "state": str(root / "var/state/guardian_state.json"),
+                    "lock": str(root / "var/state/guardian.lock"),
+                    "history": str(root / "var/state/h.jsonl"),
+                    "gallery_pid": str(root / "var/state/gallery.pid"),
+                    "gallery_log": str(root / "var/logs/gallery.log"),
+                    "supervise_gallery": True},
+                "gallery": {"port": 8765, "host": "127.0.0.1"},
+                "health": {"path": str(root / "var/state/health.json"),
+                           "exit_record": str(root / "var/state/last_exit.json")},
+                "storage": {"status": str(root / "var/state/status.json")},
+                "__config_path__": str(root / "config.yaml")}
+
+    def _guard(self, root):
+        state = root / "var" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "gallery.pid").write_text(str(LIVE_PID), encoding="utf-8")
+        g = G.Guard(self._cfg(root), dry_run=True)
+        g._notify = lambda *args, **kwargs: None
+        return g
+
+    def test_two_http_failures_restart_gallery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            g = self._guard(root)
+            now = datetime.now()
+            with mock.patch.object(G, "decide_gallery", return_value=G.ACT_OK), \
+                 mock.patch.object(G, "gallery_http_ok", return_value=False), \
+                 mock.patch("roomwatch.guardian.control.stop_gallery",
+                            return_value={"method": "forced"}) as stop, \
+                 mock.patch.object(g, "_start_gallery", return_value=4242) as start:
+                self.assertEqual(g._check_gallery(now), G.ACT_WAIT)
+                self.assertEqual(g._check_gallery(now), G.ACT_RESTART_STALLED)
+        stop.assert_called_once()
+        start.assert_called_once()
+        self.assertEqual(g.state.get("gallery_http_failures"), 0)
+
+    def test_http_ok_clears_failure_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            g = self._guard(root)
+            g.state["gallery_http_failures"] = 1
+            with mock.patch.object(G, "decide_gallery", return_value=G.ACT_OK), \
+                 mock.patch.object(G, "gallery_http_ok", return_value=True):
+                self.assertEqual(g._check_gallery(datetime.now()), G.ACT_OK)
+        self.assertEqual(g.state.get("gallery_http_failures"), 0)
+
+    def test_uses_actual_port_from_gallery_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            g = self._guard(root)
+            (root / "var" / "state" / "gallery.json").write_text(
+                json.dumps({"pid": LIVE_PID, "port": 9999}), encoding="utf-8")
+            with mock.patch.object(G, "decide_gallery", return_value=G.ACT_OK), \
+                 mock.patch.object(G, "gallery_http_ok", return_value=True) as probe:
+                g._check_gallery(datetime.now())
+        probe.assert_called_once_with(9999, timeout=3.0)
 
 
 class GuardSupervisionTest(unittest.TestCase):
@@ -588,24 +795,96 @@ class HistoryDetailTest(unittest.TestCase):
 
 
 class GalleryBackoffTest(unittest.TestCase):
+    def _cfg(self, root):
+        cfg = ExitAttributionTest()._cfg(root)
+        cfg["guardian"]["supervise_gallery"] = True
+        cfg["guardian"]["gallery_pid"] = str(root / "var/state/gallery.pid")
+        cfg["guardian"]["gallery_log"] = str(root / "var/logs/gallery.log")
+        return cfg
+
+    def _ready_root(self, tmp):
+        root = Path(tmp)
+        (root / "var/state").mkdir(parents=True)
+        (root / "var/state/status.json").write_text(json.dumps({
+            "pid": os.getpid(),
+            "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
+            encoding="utf-8")
+        return root
+
     def test_gallery_failure_backs_off(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "var/state").mkdir(parents=True)
-            (root / "var/state/status.json").write_text(json.dumps({
-                "pid": os.getpid(),
-                "last_frame_at": datetime.now().isoformat(timespec="seconds")}),
-                encoding="utf-8")
-            cfg = ExitAttributionTest()._cfg(root)
-            cfg["guardian"]["supervise_gallery"] = True
-            cfg["guardian"]["gallery_pid"] = str(root / "var/state/gallery.pid")
-            cfg["guardian"]["gallery_log"] = str(root / "var/logs/gallery.log")
-            g = G.Guard(cfg, dry_run=True)
+            root = self._ready_root(tmp)
+            g = G.Guard(self._cfg(root), dry_run=True)
             calls = []
             g._start_gallery = lambda: calls.append(True) or None
             g.check_once()
             g.check_once()
         self.assertEqual(len(calls), 1)
+
+    def test_spawned_but_dead_gallery_counts_as_failure(self):
+        """拉起成功不等于健康：相册 bind 失败后立刻退出，必须累计失败。
+
+        真机事故：guardian 每分钟拉起一次、失败计数每次被清零，
+        永远进不了退避，也永远不告警。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._ready_root(tmp)
+            cfg = self._cfg(root)
+            cfg["guardian"]["crash_threshold"] = 2
+            g = G.Guard(cfg, dry_run=True)
+            g.state["last_gallery_spawn_at"] = (
+                datetime.now() - timedelta(minutes=5)
+            ).isoformat(timespec="seconds")
+            g.state["gallery_failures"] = 1
+            g._start_gallery = lambda: 999      # 进程起来了，但从不写 PID 文件
+            sent = []
+            g._notify = lambda text: sent.append(text)
+            g.check_once()
+        self.assertEqual(g.state["gallery_failures"], 2)
+        self.assertTrue(any("相册" in text or "重启" in text for text in sent))
+
+    def test_healthy_gallery_resets_failure_streak(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._ready_root(tmp)
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g.state["gallery_failures"] = 5
+            with mock.patch.object(G, "decide_gallery", return_value=G.ACT_OK):
+                g._check_gallery(datetime.now())
+        self.assertEqual(g.state["gallery_failures"], 0)
+
+    def test_long_healthy_run_then_death_is_not_crash_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._ready_root(tmp)
+            pid_file = root / "var/state/gallery.pid"
+            pid_file.write_text(str(DEAD_PID), encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(pid_file, (old, old))
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g.state["gallery_failures"] = 5
+            g.state["last_gallery_spawn_at"] = (
+                datetime.now() - timedelta(hours=2)
+            ).isoformat(timespec="seconds")
+            g._start_gallery = lambda: 111
+            g._check_gallery(datetime.now())
+        self.assertEqual(g.state["gallery_failures"], 1)
+
+    def test_stale_pid_file_does_not_hide_crash_loop(self):
+        """上一轮留下的旧 PID 文件不能被当成「刚健康运行过」。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._ready_root(tmp)
+            pid_file = root / "var/state/gallery.pid"
+            pid_file.write_text(str(DEAD_PID), encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(pid_file, (old, old))
+            g = G.Guard(self._cfg(root), dry_run=True)
+            g.state["gallery_failures"] = 2
+            g.state["last_gallery_spawn_at"] = (
+                datetime.now() - timedelta(minutes=1)
+            ).isoformat(timespec="seconds")
+            g._start_gallery = lambda: 111
+            g._notify = lambda *args, **kwargs: None
+            g._check_gallery(datetime.now())
+        self.assertEqual(g.state["gallery_failures"], 3)
 
 
 class OwnerLockValidationTest(unittest.TestCase):
@@ -625,6 +904,29 @@ class OwnerLockValidationTest(unittest.TestCase):
                 f.write(str(os.getpid()))
             lock = G.FileLock(path, validate=lambda pid: True)
             self.assertFalse(lock.acquire())
+
+
+class StructuredEventTest(unittest.TestCase):
+    def test_append_history_emits_structured_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            handler = logging.StreamHandler(buf)
+            logger = logging.getLogger("guardian")
+            old_level = logger.level
+            logger.setLevel(logging.INFO)
+            logger.addHandler(handler)
+            try:
+                G.append_history(Path(tmp) / "h.jsonl", {
+                    "service": "watcher", "action": "restart_gone",
+                    "exit_reason": "camera",
+                })
+            finally:
+                logger.removeHandler(handler)
+                logger.setLevel(old_level)
+        out = buf.getvalue()
+        self.assertIn("event=guardian_restart", out)
+        self.assertIn("service=watcher", out)
+        self.assertIn("exit_reason=camera", out)
 
 
 if __name__ == "__main__":

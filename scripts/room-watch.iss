@@ -45,6 +45,9 @@ SetupIconFile=..\assets\room-watch.ico
 ; 首次装完自动弹向导，不额外显示「是否立即运行」的勾选页
 DisableReadyPage=no
 ShowLanguageDialog=no
+; 安装前由 [Code] 主动停掉旧进程；不让 Inno 去猜哪个应用占着文件。
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "inno\ChineseSimplified.isl"
@@ -60,13 +63,21 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\room-watch.exe"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\room-watch.exe"; Tasks: desktopicon
 
 [Run]
-; 装完直接进配置向导。四问里的第 4 问就是「开机自启」，由向导决定，
-; 安装器这里不传 --autostart，避免「取消勾选仍然自启」的矛盾。
+; 首次安装直接打开界面：摄像头、推送、相册都在「设置」里完成，
+; 不再弹一个黑框配置向导。升级时不重复打开（IsFirstRun 检查配置是否存在）。
+; 命令行用户仍可运行 `rw setup` 或「配置.bat」。
+Filename: "{app}\room-watch.exe"; \
+  Description: "打开配置界面"; \
+  Flags: postinstall nowait skipifsilent; \
+  Check: IsFirstRun
+; 升级时如果原来监控是在跑的，装完自动恢复；升级不该让用户以为监控还在跑，
+; 实际却停在暂停状态。**不能 skipifsilent**：界面触发的自动更新就是静默安装，
+; 跳过这条会让更新后监控一直停着（0.1.23 真机验证发现）。
 Filename: "{app}\runtime\python\python.exe"; \
-  Parameters: "-m roomwatch setup"; \
+  Parameters: "-m roomwatch start --config ""{app}\config.yaml"""; \
   WorkingDir: "{app}"; \
-  Description: "立即配置摄像头与微信推送"; \
-  Flags: postinstall nowait skipifsilent
+  Flags: runhidden nowait postinstall; \
+  Check: ShouldResume
 
 [UninstallRun]
 ; 取消开机自启（reg delete 找不到键会返回非 0，不当作失败）。
@@ -86,12 +97,107 @@ Type: filesandordirs; Name: "{app}\runtime"
 Type: filesandordirs; Name: "{app}\var\logs"
 
 [Code]
+var
+  WasRunning: Boolean;
+
+// 升级前记住「监控本来是否在跑」，装完据此恢复。
+function DesiredIsRunning(): Boolean;
+var
+  Lines: TStringList;
+  I: Integer;
+  Path: String;
+begin
+  Result := False;
+  Path := ExpandConstant('{app}\var\state\desired_state.json');
+  if not FileExists(Path) then
+    exit;
+  Lines := TStringList.Create;
+  try
+    try
+      Lines.LoadFromFile(Path);
+      for I := 0 to Lines.Count - 1 do
+        if Pos('"state"', Lines[I]) > 0 then
+          Result := Pos('running', Lines[I]) > 0;
+    except
+      Result := False;
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+function ShouldResume(): Boolean;
+begin
+  Result := WasRunning;
+end;
+
+// 升级前先停掉旧进程。否则 watcher/guardian 锁着 runtime\python，Inno 会弹
+// 「无法自动关闭所有应用程序」，用户只能手动去任务管理器里找。
+// 顺序：先用程序自己的 stop（让正在写的 mp4/音轨收尾），再按安装目录路径
+// 强停剩余进程（不碰用户自己的 Python）。
+function StopOldProcesses(): Boolean;
+var
+  ResultCode: Integer;
+  Py, Config, ScriptPath, Script, EscapedRoot, Cmd: String;
+begin
+  Result := True;
+  Py := ExpandConstant('{app}\runtime\python\python.exe');
+  Config := ExpandConstant('{app}\config.yaml');
+
+  if FileExists(Py) and FileExists(Config) then
+  begin
+    Cmd := AddQuotes(Py) + ' -m roomwatch stop --config ' + AddQuotes(Config);
+    Exec(ExpandConstant('{cmd}'), '/c ' + Cmd, ExpandConstant('{app}'),
+         SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+
+  EscapedRoot := ExpandConstant('{app}');
+  StringChangeEx(EscapedRoot, '''', '''''', True);
+  ScriptPath := ExpandConstant('{tmp}\roomwatch-stop.ps1');
+  Script :=
+    '$root = ''' + EscapedRoot + '''' + #13#10 +
+    'Get-CimInstance Win32_Process | ForEach-Object {' + #13#10 +
+    '  if ($_.ExecutablePath -and $_.ExecutablePath -like "$root*") {' + #13#10 +
+    '    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue' + #13#10 +
+    '  }' + #13#10 +
+    '}' + #13#10;
+  if SaveStringToFile(ScriptPath, Script, False) then
+  begin
+    Cmd := 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' + AddQuotes(ScriptPath);
+    Exec(ExpandConstant('{cmd}'), '/c ' + Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // 再杀一遍：第一次杀完到 Inno 开始替换文件之间，guardian 可能又拉起
+    // watcher 锁住 runtime\python（0.1.21 真机安装器返回 5 的一个来源）。
+    Sleep(2000);
+    Exec(ExpandConstant('{cmd}'), '/c ' + Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    DeleteFile(ScriptPath);
+  end;
+
+  // 兜底：界面 exe 的路径信息拿不到时也能关掉。
+  Exec(ExpandConstant('{cmd}'), '/c taskkill /F /IM room-watch.exe /T >nul 2>&1',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(800);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  WasRunning := DesiredIsRunning();
+  StopOldProcesses();
+  Result := '';
+end;
+
+// [Run] 的 Check：只有真正没配置过才弹首次向导。
+// config.local.yaml 是用户配置，升级卸载时会被保留。
+function IsFirstRun(): Boolean;
+begin
+  Result := not FileExists(ExpandConstant('{app}\config.local.yaml'));
+end;
+
 // 装完在完成页说清下一步，客户不用猜「然后呢」。
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpFinished then
     WizardForm.FinishedLabel.Caption :=
       '安装完成。' + #13#10 + #13#10 +
-      '如果刚才弹出的配置向导没配完，可以稍后双击桌面上的 room-watch，' + #13#10 +
-      '在界面里点「配置」重跑；或用开始菜单里的快捷方式启动。';
+      '如果刚才打开的界面还没配完，可以稍后双击桌面上的 room-watch，' + #13#10 +
+      '在界面里点「设置」继续；或用开始菜单里的快捷方式启动。';
 end;

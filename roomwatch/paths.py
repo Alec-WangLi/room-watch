@@ -80,6 +80,11 @@ def _runtime_root() -> Path:
 # 项目根 —— 全项目唯一基准。导入期就定下来，后续所有相对路径都挂在它下面。
 PROJECT_ROOT = _runtime_root()
 
+# Inno Setup 卸载项 AppId（与 scripts/room-watch.iss 的 AppId 保持一致）。
+UNINSTALL_APP_ID = "{8A3F1C42-6B7D-4E52-9C1A-7D3E5F2B8A61}_is1"
+UNINSTALL_KEY = ("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+                 + UNINSTALL_APP_ID)
+
 # 运行时目录约定（全部不入库，见 .gitignore）
 DATA_DIR = PROJECT_ROOT / "data"
 VAR_DIR = PROJECT_ROOT / "var"
@@ -211,12 +216,15 @@ def has_module(name: str, python: Optional[str] = None) -> bool:
     """检查某个解释器能否 import 指定模块（给 `rw doctor` 用）。"""
     import subprocess
 
+    from . import procutil
+
     exe = python or find_python()
     try:
         proc = subprocess.run(
             [exe, "-c", f"import {name}"],
             capture_output=True,
             timeout=20,
+            creationflags=procutil.no_window_flags(),
         )
         return proc.returncode == 0
     except Exception:  # noqa: BLE001

@@ -74,6 +74,12 @@ record:
   max_seconds: 300         # 单段 5 分钟，720p 实测约 330MB（按 65.6 MB/分钟折算）
   max_total_seconds: 1800  # 一次在场最多录 30 分钟
 
+  # 本人在电脑前（键鼠有活动）时怎么处理：
+  #   keep 照录照推 / mute 照录不推（默认，与旧版一致）/ skip 不录不推
+  # skip 更省磁盘，但如果你坐在电脑前时有人进来，可能漏录——按需选择。
+  # 旧的 behavior.skip_when_user_active 仍兼容：true=mute，false=keep。
+  owner_at_computer: mute
+
   queue_size: 120          # 编码跟不上时的缓冲。满了宁可丢帧，也不让主循环卡顿
   draw_boxes: false        # 录像里画不画人形框。回看时跳动的框会挡住脸和手部动作
 
@@ -183,6 +189,20 @@ heartbeat:
   interval_minutes: 30      # 每 30 分钟推一条「监控在线」。0 表示关闭
   stale_after_seconds: 120  # 超过 120 秒没读到画面，状态页就显示「已停止」
 
+monitor:
+  # 外部心跳（死手开关）：整机断电/断网/guardian 也死掉时，进程内通知发不出去，
+  # 只能由外部服务发现「心跳停了」。
+  # healthchecks.io 示例：
+  #   成功 https://hc-ping.com/<uuid>
+  #   失败 https://hc-ping.com/<uuid>/fail        （可选）
+  #   启动 https://hc-ping.com/<uuid>/start       （可选）
+  # 留空 = 不启用；URL 里可能含 token，按凭据处理。
+  heartbeat_url: ""
+  heartbeat_fail_url: ""
+  heartbeat_start_url: ""
+  heartbeat_interval_seconds: 300
+  heartbeat_timeout_seconds: 10
+
 storage:
   database: var/db/events.db   # SQLite 事件日志
   status: var/state/status.json   # 运行状态快照，给 rw status 和相册页读取
@@ -195,6 +215,14 @@ storage:
   min_free_gb: 3          # 磁盘剩余低于这个值，就额外逼近清理到上限的一半
   check_minutes: 10       # 多久检查一次容量
   protect_seconds: 300    # 最近 5 分钟内写过的文件不删（可能正在录）
+  warn_days: 7            # 按最近增速预计不足这么多天时，日志/界面给出容量预警
+
+outbox:
+  # 持久化发件箱：通知先落盘，断网/重启后继续投递。
+  database: var/db/outbox.db
+  media_dir: var/outbox          # 压缩后的视频临时文件；投递成功即删
+  max_age_days: 7                # 超过 7 天的待投递项作废
+  max_total_mb: 2048             # 媒体临时文件总上限；超了先淘汰旧视频，不淘汰文字
 
 guardian:
   # 外部守护进程（guardian.py）：负责 watcher 进程死掉/卡死后把它拉起来。
@@ -231,19 +259,30 @@ notify:
   channel: wecom_bot
   title: 房间有人进入
 
+  # 多渠道扇出：列表里的渠道都会收到同一条告警。
+  # null（默认）= 回退上面的 channel；空列表 [] = 明确禁用全部（界面会警告）。
+  # 可选：wecom_bot / wxpusher / serverchan / webhook
+  channels: null
+
   # —— 渠道一：WxPusher（微信）——
   # 1. 微信搜「WxPusher」公众号，或去 wxpusher.zjiecode.com 扫码登录
   # 2. 创建一个应用，拿到 appToken（AT_ 开头）
   # 3. 关注该应用后，在「用户」页面拿到你的 UID（UID_ 开头）
   # 注意：只能发文字。照片留在本机，用 gallery.py 看
+  # events/digest 是每渠道的过滤开关：false = 该渠道不收这类消息；
+  # critical（崩溃/恢复/自检失败/相机失联）不受过滤，只能禁用整个渠道来关掉。
   wxpusher:
     app_token: "AT_xxx_replace_me"
     uid: "UID_xxx_replace_me"
+    events: true            # 人员进入事件（文字/图片/录像）
+    digest: true            # 每日/定时「监控在线」报平安
 
   # —— 渠道二：Server酱（微信服务号）——
   # sct.ftqq.com 登录，复制 SendKey（SCT 开头）
   serverchan:
     sendkey: "SCTxxx_replace_me"
+    events: true
+    digest: true
 
   # —— 渠道三：企业微信群机器人（唯一能把照片直接发到微信的）——
   # 群设置 → 群机器人 → 添加，复制 Webhook 地址
@@ -251,11 +290,23 @@ notify:
   wecom_bot:
     webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_ME"
     send_video: true        # 录像收尾后也发一段（先压缩到 max_mb 以内）
+    events: true            # false 时连录像一起不发
+    digest: true
     video:
       max_mb: 18            # 官方硬上限 20，留 2MB 余量；压不到就只发文字
       width: 854            # 压缩后的宽度，高度按比例（480p）
       fps: 12
       audio: true
+
+  # —— 渠道四：通用 webhook（ntfy / Gotify / Bark / 自建服务）——
+  # JSON POST：event/kind/severity/time/text/owner/has_image/image_base64。
+  # 图片只在小于 max_image_mb 时内联 base64，避免把大图塞进请求体。
+  webhook:
+    url: ""
+    timeout_seconds: 10
+    max_image_mb: 1
+    events: true
+    digest: true
 
 gallery:
   # 本地相册。默认只绑本机，手机看不到——要手机访问就把 host 改成 0.0.0.0，
@@ -264,6 +315,8 @@ gallery:
   # 走公网请套一层 HTTPS（反向代理或 Tailscale），Basic 认证在明文 HTTP 上
   # 只能防「随手点开」，防不了同一网络里抓包的人。
   host: 127.0.0.1
+  # 首选端口。被 Windows 保留（端口排除范围）或已被占用时，相册会自动改用
+  # 系统分配的端口；实际地址见 var/state/gallery.json，界面会读它打开浏览器。
   port: 8765
   token: ""      # 访问密码。留空 = 不加认证（只允许 host 为 127.0.0.1）
 
@@ -277,6 +330,12 @@ update:
   #   远端比本地旧               → 默认拒绝，要回滚得加 --force
   enabled: true
   repo: "Alec-WangLi/room-watch"
+
+  # 更新通道：
+  #   stable 只收正式发布（/releases/latest，稳定优先）
+  #   beta   测试版预发布也收；同一版本同时有稳定版时优先稳定版
+  # 在界面「设置 → 更新」里可随时切换。
+  channel: stable
 
   # 预留：监控进程启动时后台自检的间隔。0 = 不在后台自检。
   check_interval_hours: 24

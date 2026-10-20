@@ -17,6 +17,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)
 
 import contextlib
 import io
+import json
 import os
 import shutil
 import socket
@@ -28,6 +29,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -123,6 +125,65 @@ class TestRenderWithVideo(GalleryFixture):
         open(os.path.join(self.day, "notes.txt"), "w").close()
         days = gallery.collect(self.captures)
         self.assertEqual(len(days[0][1]), 2)
+
+
+class TestTimestampNames(unittest.TestCase):
+    def test_stem_time_label_handles_old_and_new_names(self):
+        self.assertEqual(gallery.stem_time_label("094523"), "09:45:23")
+        self.assertEqual(gallery.stem_time_label("2026-10-20_094523"), "09:45:23")
+        self.assertEqual(gallery.stem_time_label("other"), "other")
+
+    def test_full_timestamp_photo_and_video_pair_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            captures = os.path.join(tmp, "captures")
+            day = os.path.join(captures, "2026-10-20")
+            os.makedirs(day)
+            with open(os.path.join(day, "2026-10-20_094523.jpg"), "wb") as f:
+                f.write(b"\xff\xd8\xff\xe0fake-jpeg")
+            make_video(os.path.join(day, "2026-10-20_094523.mp4"))
+            days = gallery.collect(captures)
+        self.assertEqual(len(days), 1)
+        img, label, vid = days[0][1][0]
+        self.assertEqual(label, "09:45:23")
+        self.assertTrue(img.endswith("2026-10-20_094523.jpg"))
+        self.assertTrue(vid.endswith("2026-10-20_094523.mp4"))
+
+
+class TestHealthz(GalleryFixture):
+    """guardian 的健康探测：/healthz 不需要登录，其它路径仍要。"""
+
+    def setUp(self):
+        super().setUp()
+        gallery.Handler.captures_dir = os.path.abspath(self.captures)
+        gallery.Handler.status_file = os.path.abspath(os.path.join(self.base, "status.json"))
+        self._old_token = getattr(gallery.Handler, "auth_token", "")
+        gallery.Handler.auth_token = "a-long-enough-token"
+        self.server = gallery.GalleryServer(("127.0.0.1", 0), gallery.Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        gallery.Handler.auth_token = self._old_token
+        super().tearDown()
+
+    def _request(self, path):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, b""
+
+    def test_healthz_needs_no_auth(self):
+        status, body = self._request("/healthz")
+        self.assertEqual(status, 200)
+        self.assertIn(b'"ok"', body)
+
+    def test_status_still_requires_auth(self):
+        status, _body = self._request("/status")
+        self.assertEqual(status, 401)
 
 
 class TestRangeRequests(GalleryFixture):
@@ -362,6 +423,102 @@ class GalleryPidTest(unittest.TestCase):
     def test_remove_missing_is_safe(self):
         with tempfile.TemporaryDirectory() as tmp:
             gallery.remove_pid_file(Path(tmp) / "nope.pid", 123)
+
+
+class BindFallbackTest(unittest.TestCase):
+    """Windows 可能把端口段保留给系统（WinError 10013）。
+
+    真机事故：8765 落在保留段 8748–8847 里，相册每次启动都直接崩，
+    guardian 每分钟重启一次。不能让一个被系统占用的端口把相册彻底钉死。
+    """
+
+    def test_preferred_port_used_when_free(self):
+        class FakeServer:
+            def __init__(self, address, handler):
+                self.server_address = address
+
+        with mock.patch.object(gallery, "GalleryServer", FakeServer):
+            server, port, reason = gallery.open_server("127.0.0.1", 8765, object())
+        self.assertEqual(port, 8765)
+        self.assertIsNone(reason)
+
+    def test_reserved_port_falls_back_to_stable_offset(self):
+        calls = []
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                calls.append(address)
+                if address[1] == 8765:
+                    raise PermissionError(10013, "访问权限不允许")
+                self.server_address = address
+
+        with mock.patch.object(gallery, "GalleryServer", FakeServer):
+            server, port, reason = gallery.open_server("127.0.0.1", 8765, object())
+        self.assertEqual(port, 18765)
+        self.assertEqual(calls, [("127.0.0.1", 8765), ("127.0.0.1", 18765)])
+        self.assertIsInstance(reason, OSError)
+
+    def test_all_offsets_blocked_falls_back_to_os_assigned(self):
+        calls = []
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                calls.append(address)
+                if address[1] != 0:
+                    raise PermissionError(10013, "访问权限不允许")
+                self.server_address = ("127.0.0.1", 54321)
+
+        with mock.patch.object(gallery, "GalleryServer", FakeServer):
+            server, port, reason = gallery.open_server("127.0.0.1", 8765, object())
+        self.assertEqual(port, 54321)
+        self.assertEqual(
+            calls,
+            [("127.0.0.1", 8765), ("127.0.0.1", 18765),
+             ("127.0.0.1", 28765), ("127.0.0.1", 0)],
+        )
+        self.assertIsInstance(reason, OSError)
+
+    def test_port_zero_goes_straight_to_os(self):
+        calls = []
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                calls.append(address)
+                self.server_address = ("127.0.0.1", 44000)
+
+        with mock.patch.object(gallery, "GalleryServer", FakeServer):
+            server, port, reason = gallery.open_server("127.0.0.1", 0, object())
+        self.assertEqual(calls, [("127.0.0.1", 0)])
+        self.assertEqual(port, 44000)
+        self.assertIsNone(reason)
+
+
+class GalleryStateTest(unittest.TestCase):
+    def test_state_records_actual_address_and_is_removed_by_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gallery.json"
+            gallery.write_state_file(
+                path, pid=123, host="127.0.0.1", port=54321,
+                started_at="2026-10-19T15:00:00",
+            )
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["pid"], 123)
+            self.assertEqual(data["host"], "127.0.0.1")
+            self.assertEqual(data["port"], 54321)
+            self.assertEqual(data["url"], "http://127.0.0.1:54321/")
+
+            gallery.remove_state_file(path, 999)
+            self.assertTrue(path.exists())
+            gallery.remove_state_file(path, 123)
+            self.assertFalse(path.exists())
+
+    def test_remove_missing_or_corrupt_is_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gallery.json"
+            gallery.remove_state_file(path, 123)
+            path.write_text("not json", encoding="utf-8")
+            gallery.remove_state_file(path, 123)
+            self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":

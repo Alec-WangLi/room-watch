@@ -105,11 +105,31 @@ $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
 ```bash
 # token 需要 repo 权限；只发 Release 不需要 workflow 权限
 export GH_TOKEN=ghp_xxx          # PowerShell: $env:GH_TOKEN="ghp_xxx"
-python scripts/release.py
+
+# 稳定版：取 main 的提交，tag v<版本>，普通 Release
+python scripts/release.py --channel stable
+
+# 测试版：取 beta 的提交，tag v<版本>-beta，勾选 prerelease
+python scripts/release.py --channel beta
 ```
 
-脚本会：读 `VERSION` → 算安装包 SHA256 并写 `.sha256` → 在 `main` 当前提交上建 tag
-→ 建 Release → 上传两个资产。**幂等**：重复执行只补缺失的资产，不会重复建 tag/release。
+脚本会：读 `VERSION` → 算安装包 SHA256 并写 `.sha256` → 在对应分支
+（`main` / `beta`）的当前提交上建 tag → 建 Release → 上传两个资产。
+**幂等**：重复执行只补缺失的资产；若已有 tag/release 指向别的提交或
+prerelease 标志与通道不符，脚本会拒绝复用。可先加 `--dry-run` 预览。
+
+**Release 简介**自动从 `CHANGELOG.md` 里取对应版本的小节。beta 跨版本跳发时
+用 `--notes-include` 合并未发布的中间版本：
+
+```bash
+python scripts/release.py --channel beta --notes-include 0.1.18
+```
+
+补写已有 Release 的简介（不动 tag 与资产）：
+
+```bash
+python scripts/release.py --channel stable --version 0.1.10 --tag v0.1.10 --notes-only
+```
 
 ### 方式 B：手动
 
@@ -124,11 +144,11 @@ git push origin main --tags
 
 | 字段 | 要求 |
 |---|---|
-| Tag | `v0.1.4`（必须以 `v` 开头，自动更新能从 tag 解析版本） |
-| 标题 | 随便写，给人看 |
+| Tag | 稳定版 `v0.1.4`；测试版 `v0.1.4-beta`（自动更新能从 tag 解析版本） |
+| 标题 | 稳定版 / 测试版要写清楚，给人看 |
 | 说明 | 写变更；可选在末尾写 `sha256: <64 位>` 作为第二重保障 |
 | 资产 | `room-watch-0.1.4-setup.exe` + `room-watch-0.1.4-setup.exe.sha256` |
-| 预发布 | 勾了 prerelease 就别指望稳定用户会自动升上来（当前策略不区分，谨慎勾） |
+| 预发布 | 测试版**必须勾**；稳定版**绝不勾**。`/releases/latest` 不返回预发布，所以稳定用户不会被推测试版 |
 
 资产名必须严格是 `room-watch-<版本>-setup.exe`。自动更新用正则
 `room-watch-(\d+\.\d+\.\d+)-setup\.exe$` 匹配，名字不对就找不到包。
@@ -138,6 +158,11 @@ git push origin main --tags
 `rw update`（或 `rw update --check`）：
 
 1. 先请求 `api.github.com/repos/<repo>/releases/latest`；
+   - 客户端默认走 `stable` 通道（即上面这条）。
+   - 设置 → 更新里切到 `beta` 后，改为请求 `/releases?per_page=30`，
+     把预发布也纳入比较；同一版本同时存在稳定版与测试版时优先稳定版。
+     API 被限流时退回 `releases.atom`（不耗配额、包含预发布），
+     安装包地址按固定命名约定拼，SHA256 仍从 `.sha256` 资产校验。
 2. 遇到 403/429（匿名 API 60 次/小时被打满）**自动退回**网页重定向
    `github.com/<repo>/releases/latest`，从 302 的 `Location` 里取 tag，不耗配额；
 3. 版本比对后按纪律处置：

@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -115,14 +114,10 @@ def _psutil_cmdline(pid: int) -> list[str]:
 def request_stop(root: Path | str, pid: int) -> Path:
     """落一份停止请求。原子写，避免 watcher 读到半截 JSON。"""
     path = stop_request_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    health.write_json_atomic(path, {
         "pid": int(pid),
         "requested_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    })
     return path
 
 
@@ -217,16 +212,22 @@ def stop_watcher(
 def stop_gallery(
     root: Path | str,
     *,
+    pid_file: Path | str | None = None,
     alive: Optional[Callable[[int], bool]] = None,
     kill: Optional[Callable[..., bool]] = None,
     cmdline: Optional[Callable[[int], list[str]]] = None,
 ) -> dict:
-    """按 PID 文件停止相册；命令行不匹配视为已停止，绝不误杀复用 PID。"""
+    """按 PID 文件停止相册；命令行不匹配视为已停止，绝不误杀复用 PID。
+
+    `pid_file` 用于 `guardian.gallery_pid` 被改成自定义路径的情况；
+    不传时沿用默认的 var/state/gallery.pid。
+    """
     alive = alive or procutil.pid_alive
     kill = kill or procutil.kill_pid
+    path = Path(pid_file) if pid_file is not None else gallery_pid_path(root)
 
     try:
-        pid = int(gallery_pid_path(root).read_text(encoding="utf-8").strip() or 0)
+        pid = int(path.read_text(encoding="utf-8").strip() or 0)
     except (OSError, ValueError):
         pid = 0
 
