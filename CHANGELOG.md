@@ -14,6 +14,33 @@
 
 ---
 
+## [0.2.2] - 2026-10-21
+
+> M3 收口：录像默认切到 ffmpeg 硬件编码；M4 完成推理引擎基准与决策。
+
+### 变更
+
+- **录像编码器**：`record.encoder: auto` 时按 `h264_mf` → `h264_nvenc` → cv2
+  的顺序选择；每个 watcher 进程在第一次录像前真的编 3 帧验证，失败自动回退。
+  连续两次失败后本进程不再尝试 ffmpeg。`libx264` 不参与 auto，只能显式配置。
+- **录像失败处理**：ffmpeg 中途退出时删除打不开的片段、清空事件库的视频字段、
+  跳过音轨合并与录像推送，并发一条 critical 通知（同一进程只发一次）。
+- **状态文件**：新增 `video_encoder` 与 `video_encoder_error`。
+- **基准工具**：新增 `rw bench`（采样运行中监控的 CPU/RSS）；
+  `bench-detect` 支持 `--engine`、输出 p50/p95；`bench-encode` 增加 libx264 行。
+- **M4 决策**：ONNX Runtime 每帧 CPU 时间约 -40%、p95 延迟约 -45%，
+  检测结果一致；本轮不捆绑（约 +50MB 依赖），默认仍 cv2.dnn，
+  `detector.engine=onnxruntime` 作为可选路径保留。
+
+### 实测
+
+- 编码（720p@10fps，120 帧）：avc1 125.4 MB/分钟 → h264_mf 51.9 MB/分钟（-59%）。
+- 推理（同帧、2 线程）：cv2.dnn 86.6ms/帧、p95 106.2ms、CPU 158.4ms/帧；
+  onnxruntime 47.9ms/帧、p95 58.9ms、CPU 95.2ms/帧。
+- 详见 `docs/bench-2026-10-21-m3-m4.md`；真机事件片段与体积对比在安装后补记。
+
+---
+
 ## [0.2.1] - 2026-10-21
 
 > 资源优化：本人在场时不再每帧推理。

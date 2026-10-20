@@ -31,11 +31,20 @@ from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 # 产品实际会尝试的 cv2 编码器，顺序与 recorder.CODEC_CHAIN 一致。
 CV2_CODECS = ("avc1", "mp4v", "MJPG")
-# 只评估常见的硬件 H.264 编码器；libx264 是软件编码，不在这里比较。
+# 只评估常见的硬件 H.264 编码器；libx264 是软件基线，由 ffmpeg_candidates 追加。
 FFMPEG_HW_CODECS = ("h264_nvenc", "h264_qsv", "h264_amf", "h264_mf")
+# 软件编码基线：只用于基准对比，不进自动选择。
+FFMPEG_EXTRA_CODECS = ("libx264",)
 
 _MB = 1024 ** 2
 _ENCODER_LINE = re.compile(r"^\s*[VAS][A-Z.]{5}\s+(\S+)")
+
+
+def ffmpeg_candidates(available: set[str]) -> list[str]:
+    """要放进基准报告的 ffmpeg 编码器：本机存在的硬件编码器 + libx264。"""
+    names = [name for name in FFMPEG_HW_CODECS if name in available]
+    names.extend(FFMPEG_EXTRA_CODECS)
+    return names
 
 
 def summarize(
@@ -114,9 +123,9 @@ def _synthetic_frames(frames: int, size: Tuple[int, int]) -> Iterable:
 
 
 def _default_writer_factory(path, codec, fps, size):
-    from .recorder import _open_writer
+    from .videoenc import _open_cv2_writer
 
-    return _open_writer(str(path), codec, float(fps), size)
+    return _open_cv2_writer(str(path), codec, float(fps), size)
 
 
 def bench_cv2(
@@ -250,8 +259,10 @@ def run_all(
                                      size_bytes=0, ok=False, error=str(exc)))
 
     if with_ffmpeg:
-        encoders = (list(hw_encoders) if hw_encoders is not None
-                    else available_hw_encoders(ffmpeg))
+        if hw_encoders is not None:
+            encoders = list(hw_encoders)
+        else:
+            encoders = ffmpeg_candidates(set(available_hw_encoders(ffmpeg)))
         for encoder in encoders:
             try:
                 results.append(ffmpeg_bench(
